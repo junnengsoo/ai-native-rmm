@@ -1,0 +1,169 @@
+# Pairing and reachability — slice 2
+
+This slice enrolls a Windows key and reports contact through a local Python
+control plane backed by PostgreSQL. It does not install a service, dispatch
+scripts, recover/revoke devices, or implement the later session/execution API.
+The older `--agent` entry point remains an isolated, manually provisioned mTLS
+execution harness; never deploy it to customer endpoints as an enrollment bypass.
+
+## Local setup and manual smoke
+
+Prerequisites: Docker Desktop running on the Mac; Python 3.13; .NET 8 on Windows;
+`cloudflared` installed from Cloudflare's official distribution. The Mac must stay
+awake and connected. Use only the authorized trial Windows machine. Database
+state persists in a Compose volume; normal `docker compose down` preserves it.
+Do not use `down -v` unless intentionally discarding the isolated trial database.
+
+From the repository worktree on the Mac:
+
+```sh
+python3.13 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+export RMM_POSTGRES_PASSWORD="$(openssl rand -hex 32)"
+docker compose up -d --build
+export RMM_TECHNICIAN_KEY="$(docker compose run --rm control-plane python -m control_plane.setup Trial)"
+export RMM_API_URL=http://127.0.0.1:18080
+.venv/bin/python -m control_plane.client list
+cloudflared tunnel --url http://127.0.0.1:18080
+```
+
+Keep the generated database password in your local secret store for subsequent
+Compose runs; changing the environment value does not rotate an existing database
+password. Setup creates a workspace and its technician key locally, outputs the
+key once, and persists only its SHA-256 verification hash. The command substitution
+above delivers it directly to the shell; save it in your secret store if needed.
+There is no public signup or credential-readback operation. Repeating local setup
+creates a separate workspace, not a recovery of the original credential.
+
+The first list must contain no devices. Cloudflared prints a temporary
+`https://…trycloudflare.com` URL; retain the matching hostname for this run.
+The tunnel exposes only the HTTP/WSS control plane. PostgreSQL has no published
+port. API schema: `http://127.0.0.1:18080/docs`.
+
+In a trusted Windows console under the account that will retain the endpoint key:
+
+```powershell
+dotnet build src/EndpointAgent -c Release
+dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOUR-TUNNEL.trycloudflare.com/agent rmm-trial-device
+```
+
+1. Observe `PAIRING_CODE` on Windows. The endpoint generates a nonexportable CNG
+   P-256 signing key in the launching account's Windows key store. This console
+   output is deliberate one-time delivery; do not collect it as an operational
+   log. While pending, the device list remains empty.
+2. On the Mac run `.venv/bin/python -m control_plane.client approve` and enter the
+   code from that trusted Windows view. Expect `approved` plus a stable device
+   UUID. The approval HTTP request carries the code in its JSON body.
+3. Run `.venv/bin/python -m control_plane.client list`. Within about 15 seconds,
+   Windows prints `online` and the list reports `online` with the same UUID.
+   Repeat after 15–20 seconds; `last_seen` advances. `approved` means technician
+   approval exists but the endpoint has not yet completed a fresh key proof.
+4. Stop the Windows agent with Ctrl+C. After 46 seconds, list again: reachability
+   is `stale`. Staleness describes missing recent evidence, not device power state.
+   Restart with the same account/key name; expect the same UUID and `online`.
+5. Try approving the same code again: expect HTTP 409. Remove/change the
+   technician environment key and list: expect HTTP 401. A copied code alone
+   cannot approve or authenticate a device. A different local key requires new
+   technician approval and cannot claim the original UUID.
+6. Stop the tunnel when finished and run `docker compose down`. Unset the
+   technician environment variable. Keep the endpoint key only if continuing the
+   trial; uninstall and technician recovery belong to later tickets.
+
+An approved key must first activate before the original ten-minute code deadline;
+otherwise it reports `approval_expired` and cannot authenticate. There is no key
+replacement/recovery operation yet. If the one-time code display is lost, allow
+the pending request to expire; reconnect then receives a fresh code. Do not
+silently enroll a replacement key as the same logical device.
+
+## Wire and trust contract
+
+`/agent` accepts an outbound WebSocket. The Windows entry point requires `wss`
+and normal platform certificate-chain, hostname and expiry validation. A fresh
+256-bit nonce starts each connection. The endpoint sends exactly `public_key`
+(base64 DER SubjectPublicKeyInfo, P-256) and `signature` (base64 DER ECDSA/SHA-256)
+over UTF-8 `rmm-reachability-v1\n` followed by the nonce. The proof is accepted only
+on that connection. Canonical public-key encoding is required. No client-provided
+device ID or forwarded certificate header establishes identity.
+
+An unknown proven key receives `pending`, a one-time 12-character base32 code,
+and `expires_in_seconds: 600`. Reconnecting with that key before expiry returns
+`pending` without disclosing the code again. The database binds the code hash
+immutably to that public key. Technician `POST /pairings/approve` atomically
+consumes a live code and assigns a UUID in the technician's workspace. Pending
+keys never appear in device lists and this mode has no execution path.
+
+After approval, a new connection and nonce proof activates the key. `online`
+returns the UUID, `heartbeat_seconds: 15`, and `stale_seconds: 45`. The agent
+sends only `{"type":"heartbeat"}`; the server acknowledges it. Unknown messages,
+including dispatch, are rejected. Reconnect proves the persisted key again;
+there are no reusable bearer tokens on Windows. `GET /devices` scopes every row
+to the authenticated workspace; `limit` is 1–100 and `after` accepts the prior
+`next_cursor` UUID. Reachability is `approved`, `online`, `stale`, or
+`approval_expired`. Times come from PostgreSQL, not endpoint claims.
+
+The new reachability protocol uses application-level possession proof because a
+TLS-terminating development tunnel need not forward client certificates. The
+existing pinned-mTLS harness protocol remains unchanged. Cloudflare is a trusted
+TLS termination boundary and can see proxied data; this is not end-to-end TLS
+to Python. The cloudflared-to-origin hop is loopback HTTP, while cloudflared's
+outbound tunnel is encrypted. Bind the origin only to loopback and keep proxy
+logs metadata-only. Do not add a forwarded-header authentication fallback.
+
+[Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)
+are temporary development routing without uptime guarantees. Their URL changes
+on restart; restart the Windows agent with the new trusted URL and the same key.
+They support WebSockets but **do not support SSE**, so this smoke routing does
+not establish the later streaming/deployment slice's compatibility.
+
+## Bounds and secret handling
+
+- At most 1,000 unexpired pending keys globally, each lasting ten minutes. Expired
+  transient pairing rows are removed on a subsequent initiation; device history
+  is not deleted. Pending creation and key activation serialize in PostgreSQL.
+- At most 120 agent connection attempts/minute globally, including invalid proof
+  attempts; at most 600 technician HTTP requests/minute globally; at most ten
+  approval attempts/minute per authenticated workspace. Fixed-window counters
+  persist across restarts. HTTP 429 includes `Retry-After: 60`; a rejected WS
+  handshake returns 403. Global bounds intentionally trade availability under
+  attack for bounded resource use in this trial, and are not production DDoS
+  protection. No rate identity is taken from spoofable forwarding headers.
+- Proof deadline ten seconds; WS text at most 2,048 bytes; heartbeat read deadline
+  45 seconds; heartbeats faster than one/second rejected. HTTP bodies require
+  Content-Length at most 2,048 bytes and no chunked encoding. Run the documented
+  server command with its transport size/concurrency limits.
+- Technician keys contain 256 random bits. Only their verification hashes and
+  pairing-code hashes are persisted. Endpoint private keys stay in Windows CNG;
+  possession proofs, codes and authorization headers are not routine logs.
+  API validation and database failure responses do not echo request values.
+- The CNG key belongs to the launching Windows account. Same-account/SYSTEM code
+  may use the key; nonexportability is not a sandbox against privileged scripts.
+  Installer/service identity and recovery are deliberately not implemented here.
+
+## Automated verification
+
+With a dedicated local PostgreSQL database and `RMM_DATABASE_URL` configured:
+
+```sh
+.venv/bin/uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 --limit-concurrency 256
+# Another terminal, same RMM_DATABASE_URL:
+RMM_EXPIRY_TEST=1 .venv/bin/pytest -q tests/control_plane/test_pairing.py
+# Actual authorized Azure Windows VM → tunnel → this Mac:
+RMM_WINDOWS_WSS=wss://YOUR-TUNNEL.trycloudflare.com/agent .venv/bin/pytest -q -s tests/control_plane/test_windows.py
+bash scripts/azure-smoke.sh
+```
+
+The expiry gate waits the real ten minutes. The Windows integration uses Azure
+only to deploy/start/stop an isolated test agent and observe its local code; API
+approval stays on the Mac. A temporary SYSTEM scheduled task detaches the agent
+from Run Command and is removed afterward. Code-output files and test keys are
+removed; source/build files may remain under the unique Windows Temp directory.
+The test asserts heartbeat, stale state, and stable UUID after restart. The
+independent peer additionally verifies the actual Windows signature,
+nonexportability, timing, and refusal of execution messages; all prior worker
+contract tests remain in place.
+
+Not covered by manual smoke: replayed nonce proofs, concurrent competing
+approvals, cross-workspace reads, request/attempt limits and real code expiry
+are automated gates; maximum pending-pool bound and hash-only persistence are
+also reviewed in code. Installer/service lifecycle, arbitrary execution,
+recovery/revocation, SSE and production deployment remain later tickets.

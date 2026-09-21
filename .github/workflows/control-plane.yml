@@ -1,0 +1,40 @@
+name: Control plane public contract
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: ['control_plane/**', 'tests/control_plane/**', 'requirements.txt', 'Dockerfile', 'compose.yaml', '.github/workflows/control-plane.yml']
+permissions:
+  contents: read
+jobs:
+  public-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rmm
+          POSTGRES_DB: rmm
+          POSTGRES_PASSWORD: isolated-ci-password
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U rmm -d rmm" --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      RMM_DATABASE_URL: postgresql://rmm:isolated-ci-password@127.0.0.1:5432/rmm
+      RMM_EXPIRY_TEST: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: Start private test control plane
+        run: |
+          python -m uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 &
+          for attempt in $(seq 1 30); do
+            if curl --silent http://127.0.0.1:18080/openapi.json >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Public API, authentication, real expiry and concurrency
+        run: pytest -q tests/control_plane/test_pairing.py
