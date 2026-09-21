@@ -1,0 +1,25 @@
+# Build output
+bin/
+obj/
+dist/
+build/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pfx
+*.key
+*.pem
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and local databases
+*.log
+*.db
+*.db-shm
+*.db-wal
