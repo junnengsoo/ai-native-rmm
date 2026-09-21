@@ -38,4 +38,4 @@ jobs:
           done
           exit 1
       - name: Public API, authentication, real expiry and concurrency
-        run: pytest -q tests/control_plane/test_pairing.py
+        run: pytest -q tests/control_plane/test_logging.py tests/control_plane/test_pairing.py

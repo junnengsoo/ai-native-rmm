@@ -4,7 +4,7 @@ import json
 import secrets
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -170,12 +170,18 @@ async def receive(socket):
     return value
 
 
+async def close(socket, code=1000):
+    if socket.application_state != WebSocketState.DISCONNECTED:
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await socket.close(code=code)
+
+
 @app.websocket("/agent")
 async def agent(socket: WebSocket):
     try:
         await asyncio.to_thread(budget, "agent_connections", 120)
     except HTTPException:
-        await socket.close(code=1008)
+        await close(socket, 1008)
         return
     await socket.accept()
     try:
@@ -186,7 +192,7 @@ async def agent(socket: WebSocket):
         status = await asyncio.to_thread(authenticate_key, public_key)
         await socket.send_json(status)
         if status["state"] != "online":
-            await socket.close()
+            await close(socket)
             return
         last_heartbeat = 0.0
         while True:
@@ -198,15 +204,15 @@ async def agent(socket: WebSocket):
             await asyncio.to_thread(heartbeat, status["device_id"])
             await socket.send_json({"type": "heartbeat_ack"})
     except (InvalidSignature, ValueError, TypeError, KeyError):
-        await socket.send_json({"state": "denied"})
-        await socket.close(code=1008)
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await socket.send_json({"state": "denied"})
+        await close(socket, 1008)
     except (WebSocketDisconnect, TimeoutError):
         pass
     except Exception:
-        await socket.close(code=1011)
+        await close(socket, 1011)
     finally:
-        if socket.application_state == WebSocketState.CONNECTED:
-            await socket.close(code=1000)
+        await close(socket)
 
 
 def heartbeat(device_id):

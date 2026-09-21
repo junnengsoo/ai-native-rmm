@@ -154,7 +154,7 @@ With a dedicated local PostgreSQL database and `RMM_DATABASE_URL` configured:
 ```sh
 .venv/bin/uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 --limit-concurrency 256
 # Another terminal, same RMM_DATABASE_URL:
-RMM_EXPIRY_TEST=1 RMM_RATE_TEST=1 .venv/bin/pytest -q tests/control_plane/test_pairing.py
+RMM_EXPIRY_TEST=1 RMM_RATE_TEST=1 .venv/bin/pytest -q tests/control_plane/test_logging.py tests/control_plane/test_pairing.py
 # The rate test exhausts the global allowance: wait 60 seconds before
 # starting another agent on that test control plane.
 # Actual authorized Azure Windows VM → tunnel → this Mac:
