@@ -9,7 +9,7 @@ import httpx
 
 def main():
     base = os.environ.get("RMM_API_URL", "http://127.0.0.1:18080").rstrip("/")
-    headers = {"Authorization": "Bearer " + os.environ["RMM_TECHNICIAN_KEY"]}
+    headers = {"Authorization": "Bearer " + os.environ["RMM_ADMIN_KEY"]}
     with httpx.Client(base_url=base, headers=headers, timeout=10) as client:
         if sys.argv[1:] == ["list"]:
             response = client.get("/devices")

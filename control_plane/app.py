@@ -64,13 +64,14 @@ def budget(name, limit):
         raise HTTPException(429, "rate_limited", headers={"Retry-After": "60"})
 
 
-def technician(authorization):
+def admin_workspace(authorization):
+    """Resolve the initial admin credential to its authorized workspace."""
     budget("http_auth", 600)
     if not authorization or not authorization.startswith("Bearer ") or len(authorization) > 100:
         raise HTTPException(401, "unauthorized")
     with connect() as db:
         workspace = db.execute(
-            "SELECT id FROM workspaces WHERE technician_hash = %s",
+            "SELECT id FROM workspaces WHERE admin_hash = %s",
             (digest(authorization[7:]),),
         ).fetchone()
     if not workspace:
@@ -81,7 +82,7 @@ def technician(authorization):
 @app.get("/devices")
 def list_devices(authorization: str | None = Header(default=None), after: uuid.UUID | None = None,
                  limit: int = Query(default=100, ge=1, le=100)):
-    workspace = technician(authorization)
+    workspace = admin_workspace(authorization)
     with connect() as db:
         devices = db.execute("""
             SELECT id, approved_at, last_seen,
@@ -102,7 +103,7 @@ class Approval(BaseModel):
 
 @app.post("/pairings/approve")
 def approve(body: Approval, authorization: str | None = Header(default=None)):
-    workspace = technician(authorization)
+    workspace = admin_workspace(authorization)
     budget("approval:" + str(workspace), 10)
     with connect() as db:
         pending = db.execute("""

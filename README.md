@@ -12,7 +12,7 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 
 ## Status
 
-Slices 1–2 provide the Windows execution harness plus PostgreSQL-backed technician
+Slices 1–2 provide the Windows execution harness plus PostgreSQL-backed admin
 pairing and device reachability. Start with [local pairing and smoke test](docs/enrollment.md)
 or the [independent Windows harness](docs/agent-harness.md). Enrollment mode is
 reachability-only; the installer and public session/execution API are later slices.

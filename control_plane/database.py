@@ -19,14 +19,13 @@ def initialize():
         db.execute("""
             CREATE TABLE IF NOT EXISTS workspaces (
                 id uuid PRIMARY KEY, name text NOT NULL,
-                technician_hash text UNIQUE NOT NULL
+                admin_hash text UNIQUE NOT NULL
             );
             CREATE TABLE IF NOT EXISTS devices (
                 id uuid PRIMARY KEY, workspace_id uuid NOT NULL REFERENCES workspaces(id),
                 public_key text UNIQUE NOT NULL, approved_at timestamptz NOT NULL DEFAULT now(),
                 last_seen timestamptz, activate_before timestamptz
             );
-            ALTER TABLE devices ADD COLUMN IF NOT EXISTS activate_before timestamptz;
             CREATE TABLE IF NOT EXISTS pairings (
                 public_key text PRIMARY KEY, code_hash text UNIQUE NOT NULL,
                 expires_at timestamptz NOT NULL

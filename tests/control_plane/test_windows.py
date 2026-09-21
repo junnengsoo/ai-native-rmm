@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from test_pairing import BASE, local_technician
+from test_pairing import BASE, local_admin
 
 
 def windows(script):
@@ -23,7 +23,9 @@ def windows(script):
     ], capture_output=True, text=True, check=True, timeout=240)
     output = "\n".join(json.loads(result.stdout))
     if "RMM_DATA:" not in output:
-        pytest.fail("Windows step failed (details suppressed to protect pairing material)")
+        reasons = ("unexpected_agent_identity", "key_acl_too_broad", "Cannot find path", "build_failed", "unexpected_process")
+        reason = next((reason for reason in reasons if reason in output), "unclassified_fixture_failure")
+        pytest.fail("Windows step failed: " + reason + " (raw output suppressed to protect pairing material)")
     return output.split("RMM_DATA:", 1)[1].splitlines()[0]
 
 
@@ -39,7 +41,7 @@ def test_real_windows_pairing_heartbeat_stop_and_stable_identity():
             if path.is_file():
                 bundle.write(path, str(path))
     payload = base64.b64encode(archive.getvalue()).decode()
-    admin = local_technician()
+    admin = local_admin()
     try:
         windows(f"""New-Item -ItemType Directory '{root}' | Out-Null
 icacls '{root}' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
@@ -68,7 +70,8 @@ $process=Get-CimInstance Win32_Process -Filter "ProcessId=$agentId"
 $owner=Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid
 if ($owner.Sid -ne 'S-1-5-18') {{ throw 'unexpected_agent_identity' }}
 $key=[Security.Cryptography.CngKey]::Open('{key_name}')
-$keyPath=Join-Path ([Environment]::GetFolderPath('ApplicationData')) ('Microsoft\\Crypto\\Keys\\' + $key.UniqueName)
+# SYSTEM has a distinct CNG key directory from ordinary user accounts.
+$keyPath=Join-Path $env:ProgramData ('Microsoft\\Crypto\\SystemKeys\\' + $key.UniqueName)
 $untrusted=@('S-1-1-0','S-1-5-11','S-1-5-32-545')
 foreach ($entry in (Get-Acl $keyPath).Access) {{
     $sid=$entry.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value

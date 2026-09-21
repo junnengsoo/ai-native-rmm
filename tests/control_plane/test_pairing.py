@@ -17,7 +17,7 @@ import pytest
 BASE = os.environ.get("RMM_TEST_URL", "http://127.0.0.1:18080")
 
 
-def local_technician():
+def local_admin():
     result = subprocess.run([sys.executable, "-m", "control_plane.setup", "Trial"], capture_output=True, text=True, check=True)
     return {"Authorization": "Bearer " + result.stdout.strip()}
 
@@ -51,9 +51,9 @@ def test_local_setup_reveals_credential_once_and_protects_device_listing():
     assert response.json() == {"devices": [], "next_cursor": None}
 
 
-def test_pending_key_requires_technician_approval_then_fresh_possession_proof():
-    admin = local_technician()
-    other = local_technician()
+def test_pending_key_requires_admin_approval_then_fresh_possession_proof():
+    admin = local_admin()
+    other = local_admin()
     key, public = endpoint_key()
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         pending = prove(socket, key, public)
@@ -79,8 +79,8 @@ def test_pending_key_requires_technician_approval_then_fresh_possession_proof():
         assert json.loads(socket.recv()) == {"state": "denied"}
 
 
-def test_two_technicians_cannot_bind_one_code_to_two_workspaces():
-    admins = [local_technician(), local_technician()]
+def test_two_admins_cannot_bind_one_code_to_two_workspaces():
+    admins = [local_admin(), local_admin()]
     key, public = endpoint_key()
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         code = prove(socket, key, public)["code"]
@@ -104,8 +104,8 @@ def test_recorded_possession_proof_cannot_be_replayed_on_a_new_connection():
         assert json.loads(socket.recv()) == {"state": "denied"}
 
 
-def test_approval_guesses_are_bounded_even_with_a_valid_technician():
-    admin = local_technician()
+def test_approval_guesses_are_bounded_even_with_a_valid_admin():
+    admin = local_admin()
     for _ in range(10):
         assert httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": "AAAAAAAAAAAA"}).status_code == 409
     denied = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": "AAAAAAAAAAAA"})
@@ -115,7 +115,7 @@ def test_approval_guesses_are_bounded_even_with_a_valid_technician():
 
 
 def test_validation_does_not_echo_secrets_or_accept_key_rebinding():
-    admin = local_technician()
+    admin = local_admin()
     secret = "dummy-secret-must-not-appear"
     invalid = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": secret})
     assert invalid.status_code == 422 and secret not in invalid.text
@@ -130,9 +130,9 @@ def test_validation_does_not_echo_secrets_or_accept_key_rebinding():
     assert httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": code}).status_code == 200
 
 
-def test_device_pagination_stays_inside_the_technicians_workspace():
-    admin = local_technician()
-    other = local_technician()
+def test_device_pagination_stays_inside_the_admins_workspace():
+    admin = local_admin()
+    other = local_admin()
     for _ in range(2):
         key, public = endpoint_key()
         with connect(BASE.replace("http", "ws") + "/agent") as socket:
@@ -148,7 +148,7 @@ def test_device_pagination_stays_inside_the_technicians_workspace():
 
 @pytest.mark.skipif(not os.environ.get("RMM_EXPIRY_TEST"), reason="ten-minute real-time expiry gate")
 def test_expired_code_and_approved_but_unproven_key_cannot_activate():
-    admin = local_technician()
+    admin = local_admin()
     pending_key, pending_public = endpoint_key()
     approved_key, approved_public = endpoint_key()
     with connect(BASE.replace("http", "ws") + "/agent") as socket:

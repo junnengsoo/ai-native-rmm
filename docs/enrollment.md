@@ -6,6 +6,12 @@ scripts, recover/revoke devices, or implement the later session/execution API.
 The older `--agent` entry point remains an isolated, manually provisioned mTLS
 execution harness; never deploy it to customer endpoints as an enrollment bypass.
 
+The caller roles are **admin** and **operator**. This slice creates only the
+initial workspace admin credential and implements its pairing/device-list access.
+Operator credentials and sessions/executions/output permissions arrive with the
+execution API; operators will not receive admin pairing or management authority.
+There is no separate technician or viewer role.
+
 ## Local setup and manual smoke
 
 Prerequisites: Docker Desktop running on the Mac; Python 3.13; .NET 8 on Windows;
@@ -21,7 +27,7 @@ python3.13 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 export RMM_POSTGRES_PASSWORD="$(openssl rand -hex 32)"
 docker compose up -d --build
-export RMM_TECHNICIAN_KEY="$(docker compose run --rm control-plane python -m control_plane.setup Trial)"
+export RMM_ADMIN_KEY="$(docker compose run --rm control-plane python -m control_plane.setup Trial)"
 export RMM_API_URL=http://127.0.0.1:18080
 .venv/bin/python -m control_plane.client list
 cloudflared tunnel --url http://127.0.0.1:18080
@@ -29,7 +35,7 @@ cloudflared tunnel --url http://127.0.0.1:18080
 
 Keep the generated database password in your local secret store for subsequent
 Compose runs; changing the environment value does not rotate an existing database
-password. Setup creates a workspace and its technician key locally, outputs the
+password. Setup creates a workspace and its admin key locally, outputs the
 key once, and persists only its SHA-256 verification hash. The command substitution
 above delivers it directly to the shell; save it in your secret store if needed.
 There is no public signup or credential-readback operation. Repeating local setup
@@ -56,17 +62,17 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOU
    UUID. The approval HTTP request carries the code in its JSON body.
 3. Run `.venv/bin/python -m control_plane.client list`. Within about 15 seconds,
    Windows prints `online` and the list reports `online` with the same UUID.
-   Repeat after 15–20 seconds; `last_seen` advances. `approved` means technician
+   Repeat after 15–20 seconds; `last_seen` advances. `approved` means admin
    approval exists but the endpoint has not yet completed a fresh key proof.
 4. Stop the Windows agent with Ctrl+C. After 46 seconds, list again: reachability
    is `stale`. Staleness describes missing recent evidence, not device power state.
    Restart with the same account/key name; expect the same UUID and `online`.
 5. Try approving the same code again: expect HTTP 409. Remove/change the
-   technician environment key and list: expect HTTP 401. A copied code alone
+   admin environment key and list: expect HTTP 401. A copied code alone
    cannot approve or authenticate a device. A different local key requires new
-   technician approval and cannot claim the original UUID.
+   admin approval and cannot claim the original UUID.
 6. Stop the tunnel when finished and run `docker compose down`. Unset the
-   technician environment variable. Keep the endpoint key only if continuing the
+   admin environment variable. Keep the endpoint key only if continuing the
    trial; uninstall and technician recovery belong to later tickets.
 
 An approved key must first activate before the original ten-minute code deadline;
@@ -88,8 +94,8 @@ device ID or forwarded certificate header establishes identity.
 An unknown proven key receives `pending`, a one-time 12-character base32 code,
 and `expires_in_seconds: 600`. Reconnecting with that key before expiry returns
 `pending` without disclosing the code again. The database binds the code hash
-immutably to that public key. Technician `POST /pairings/approve` atomically
-consumes a live code and assigns a UUID in the technician's workspace. Pending
+immutably to that public key. Admin `POST /pairings/approve` atomically
+consumes a live code and assigns a UUID in the admin's workspace. Pending
 keys never appear in device lists and this mode has no execution path.
 
 After approval, a new connection and nonce proof activates the key. `online`
@@ -121,7 +127,7 @@ not establish the later streaming/deployment slice's compatibility.
   transient pairing rows are removed on a subsequent initiation; device history
   is not deleted. Pending creation and key activation serialize in PostgreSQL.
 - At most 120 agent connection attempts/minute globally, including invalid proof
-  attempts; at most 600 technician HTTP requests/minute globally; at most ten
+  attempts; at most 600 admin HTTP requests/minute globally; at most ten
   approval attempts/minute per authenticated workspace. Fixed-window counters
   persist across restarts. HTTP 429 includes `Retry-After: 60`; a rejected WS
   handshake returns 403. Global bounds intentionally trade availability under
@@ -133,7 +139,7 @@ not establish the later streaming/deployment slice's compatibility.
   server command with its transport size/concurrency limits.
   Database connection/statements are bounded to five seconds and lock waits to
   two seconds; failure returns a sanitized unavailable response.
-- Technician keys contain 256 random bits. Only their verification hashes and
+- Admin keys contain 256 random bits. Only their verification hashes and
   pairing-code hashes are persisted. Endpoint private keys stay in Windows CNG;
   possession proofs, codes and authorization headers are not routine logs.
   API validation and database failure responses do not echo request values.

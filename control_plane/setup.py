@@ -13,7 +13,7 @@ def main():
     credential = "rmm_" + secrets.token_urlsafe(32)
     with connect() as db:
         db.execute(
-            "INSERT INTO workspaces VALUES (%s, %s, %s)",
+            "INSERT INTO workspaces (id, name, admin_hash) VALUES (%s, %s, %s)",
             (uuid.uuid4(), sys.argv[1], digest(credential)),
         )
     print(credential)
