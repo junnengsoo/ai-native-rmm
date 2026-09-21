@@ -31,7 +31,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Start private test control plane
         run: |
-          python -m uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 &
+          python -m uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 > "$RUNNER_TEMP/rmm-control-plane.log" 2>&1 &
           for attempt in $(seq 1 30); do
             if curl --silent http://127.0.0.1:18080/openapi.json >/dev/null; then exit 0; fi
             sleep 1

@@ -16,6 +16,7 @@ def digest(value: str) -> str:
 
 def initialize():
     with connect() as db:
+        db.execute("SELECT pg_advisory_xact_lock(4003)")
         db.execute("""
             CREATE TABLE IF NOT EXISTS workspaces (
                 id uuid PRIMARY KEY, name text NOT NULL,

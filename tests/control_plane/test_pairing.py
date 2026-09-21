@@ -104,6 +104,27 @@ def test_recorded_possession_proof_cannot_be_replayed_on_a_new_connection():
         assert json.loads(socket.recv()) == {"state": "denied"}
 
 
+def test_reconnecting_during_approval_never_issues_a_replacement_code():
+    for _ in range(5):
+        admin = local_admin()
+        key, public = endpoint_key()
+        with connect(BASE.replace("http", "ws") + "/agent") as socket:
+            code = prove(socket, key, public)["code"]
+
+        def reconnect():
+            with connect(BASE.replace("http", "ws") + "/agent") as socket:
+                return prove(socket, key, public)
+
+        with ThreadPoolExecutor(2) as pool:
+            poll = pool.submit(reconnect)
+            approval = pool.submit(httpx.post, BASE + "/pairings/approve", headers=admin, json={"code": code})
+            assert approval.result().status_code == 200
+            status = poll.result()
+        assert "code" not in status
+        assert status["state"] in ("pending", "online")
+        assert reconnect()["device_id"] == approval.result().json()["device_id"]
+
+
 def test_approval_guesses_are_bounded_even_with_a_valid_admin():
     admin = local_admin()
     for _ in range(10):

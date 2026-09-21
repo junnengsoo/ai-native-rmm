@@ -106,6 +106,9 @@ def approve(body: Approval, authorization: str | None = Header(default=None)):
     workspace = admin_workspace(authorization)
     budget("approval:" + str(workspace), 10)
     with connect() as db:
+        # Share the enrollment transition lock so a concurrent reconnect cannot
+        # create another pending code between consumption and device insertion.
+        db.execute("SELECT pg_advisory_xact_lock(4004)")
         pending = db.execute("""
             DELETE FROM pairings WHERE code_hash = %s AND expires_at > now()
             RETURNING public_key, expires_at

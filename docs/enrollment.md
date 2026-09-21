@@ -73,7 +73,7 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOU
    admin approval and cannot claim the original UUID.
 6. Stop the tunnel when finished and run `docker compose down`. Unset the
    admin environment variable. Keep the endpoint key only if continuing the
-   trial; uninstall and technician recovery belong to later tickets.
+   trial; uninstall and recovery approved by an admin belong to later tickets.
 
 An approved key must first activate before the original ten-minute code deadline;
 otherwise it reports `approval_expired` and cannot authenticate. There is no key
@@ -189,8 +189,11 @@ The automated smoke completed successfully in about 4 minutes 22 seconds,
 including Azure orchestration and the real stale wait. This proves cross-machine
 outbound connectivity; it is not a latency, uptime or later SSE claim.
 
-The six public API tests, including a real ten-minute expiry wait, also passed.
+The public API tests, including a real ten-minute expiry wait, also passed.
 The expiry gate rejected both an expired code and an approved key that had not
 proved possession again before its activation deadline. No cloud control plane
 or new VM was provisioned. The local Compose image built successfully; workspace
 authentication also survived a normal restart of both Compose services.
+The independent Windows harness passed all original worker scenarios plus fresh
+key proofs, nonexportability, 15-second heartbeats, same-key reconnect after a
+server Close frame, and refusal of execution messages in enrollment mode.
