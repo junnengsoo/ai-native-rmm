@@ -13,7 +13,7 @@ try {
     if ($LASTEXITCODE) { throw 'Agent build failed' }
     dotnet tests/ProtocolHarness/bin/Release/net8.0/ProtocolHarness.dll "$root/src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll" $certs[0].Thumbprint $certs[1].Thumbprint $certs[2].Thumbprint
     if ($LASTEXITCODE) { throw 'External behavior suite failed' }
-    Write-Output 'RMM_SUITE_PASSED'
 } finally {
     foreach ($cert in $certs) { Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -DeleteKey }
 }
+Write-Output 'RMM_SUITE_PASSED'
