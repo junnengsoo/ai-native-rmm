@@ -87,8 +87,9 @@ try {
     Require(explicitExit.GetProperty("invocationOutcome").GetString() == "explicit_exit" && explicitExit.GetProperty("exitCode").GetInt32() == 23, "explicit exit keeps requested code");
     await Rejected(Request("'must-not-run'"), "explicit exit retires the worker until replacement");
     await ReplaceSession();
-    var fresh = await Execute("$null -eq (Get-Variable investigationValue -ErrorAction SilentlyContinue); $null -eq (Get-Command Get-InvestigationValue -ErrorAction SilentlyContinue)", 5000);
-    Require(fresh.GetProperty("stdout").GetString()!.Trim() == "True\nTrue", "replacement session has fresh variable and function state");
+    // Inspect the new runspace, without discovering/autoloading unrelated machine modules.
+    var fresh = await Execute("$null -eq (Get-Variable investigationValue -ErrorAction SilentlyContinue); $null -eq (Get-Command Get-InvestigationValue -ListImported -ErrorAction SilentlyContinue)", 5000);
+    Require(fresh.GetProperty("stdout").GetString()!.Trim() == "True\nTrue", "replacement session has fresh variable and function state: " + fresh.GetRawText());
     var zeroExit = await Execute("exit 0", 5000);
     Require(zeroExit.GetProperty("invocationOutcome").GetString() == "explicit_exit" && zeroExit.GetProperty("exitCode").GetInt32() == 0, "explicit zero is distinguishable from normal completion");
     await ReplaceSession();
