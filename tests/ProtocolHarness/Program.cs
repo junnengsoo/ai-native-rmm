@@ -80,6 +80,9 @@ try {
     Require(fake.GetProperty("invocationOutcome").GetString() == "terminating_error" && fake.GetProperty("stdout").GetString()!.Contains("completed"), "printed lifecycle is only output and pre-error output is retained");
     var bounded = await Execute("'x' * 100000", 5000);
     Require(bounded.GetProperty("captureTruncated").GetBoolean() && bounded.GetProperty("stdout").GetString()!.Length <= 32768, "output capture is bounded and disclosed");
+    var escaped = await Execute("[Console]::Out.Write(([string][char]1) * 40000); [Console]::Error.Write(([string][char]2) * 40000)", 5000);
+    Require(escaped.GetProperty("captureTruncated").GetBoolean() && escaped.GetProperty("stdout").GetString()!.Length == 32768
+        && escaped.GetProperty("stderr").GetString()!.Length == 32768, "both bounded streams survive JSON escaping without protocol loss");
     var explicitExit = await Execute("exit 23", 5000);
     Require(explicitExit.GetProperty("invocationOutcome").GetString() == "explicit_exit" && explicitExit.GetProperty("exitCode").GetInt32() == 23, "explicit exit keeps requested code");
     await Rejected(Request("'must-not-run'"), "explicit exit retires the worker until replacement");
@@ -150,8 +153,10 @@ try {
 
     async Task<JsonElement> Execute(string script, int timeoutMs, string? executionId = null) {
         string execution = executionId ?? Guid.NewGuid().ToString();
-        await Send(socket, new { type = "execute", deviceId = device, sessionId = session,
-            executionId = execution, script, scriptSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), timeoutMs });
+        var request = Request(script);
+        request["executionId"] = execution;
+        request["timeoutMs"] = timeoutMs;
+        await Send(socket, request);
         var running = await Receive(socket);
         Require(running.GetProperty("type").GetString() == "running" && running.GetProperty("executionId").GetString() == execution, "correlated running signal");
         var completion = await Receive(socket);
@@ -198,7 +203,8 @@ static async Task<JsonElement> Receive(WebSocket socket) {
         frame = await socket.ReceiveAsync(buffer, deadline.Token);
         if (frame.MessageType != WebSocketMessageType.Text) throw new InvalidOperationException("Unexpected connection close");
         content.Write(buffer, 0, frame.Count);
-        if (content.Length > 300_000) throw new InvalidOperationException("Oversize result");
+        // Two 32,768-code-unit streams can expand to six JSON bytes per unit.
+        if (content.Length > 500_000) throw new InvalidOperationException("Oversize result");
     } while (!frame.EndOfMessage);
     return JsonDocument.Parse(content.ToArray()).RootElement.Clone();
 }
