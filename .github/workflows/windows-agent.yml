@@ -1,0 +1,20 @@
+name: Windows agent contract
+on:
+  push:
+    branches: [main, codex/issue-3-windows-agent]
+  pull_request:
+    paths: ['src/EndpointAgent/**', 'tests/ProtocolHarness/**', 'scripts/windows-smoke.ps1', '.github/workflows/windows-agent.yml']
+permissions:
+  contents: read
+jobs:
+  real-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Real agent and independent authenticated peer
+        shell: powershell
+        run: .\scripts\windows-smoke.ps1
