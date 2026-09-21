@@ -3,6 +3,7 @@ bin/
 obj/
 dist/
 build/
+.artifacts/
 
 # Local configuration and secrets
 .env

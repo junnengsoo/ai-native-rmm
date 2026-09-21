@@ -9,4 +9,6 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 
 ## Status
 
-Planning and implementation have not started yet.
+Slice 1 provides a manually launched Windows endpoint agent and independent
+authenticated test harness. See [Windows agent smoke test and contract](docs/agent-harness.md).
+The control plane, enrollment, installer, and customer deployment are not included.
