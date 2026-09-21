@@ -131,6 +131,8 @@ not establish the later streaming/deployment slice's compatibility.
   45 seconds; heartbeats faster than one/second rejected. HTTP bodies require
   Content-Length at most 2,048 bytes and no chunked encoding. Run the documented
   server command with its transport size/concurrency limits.
+  Database connection/statements are bounded to five seconds and lock waits to
+  two seconds; failure returns a sanitized unavailable response.
 - Technician keys contain 256 random bits. Only their verification hashes and
   pairing-code hashes are persisted. Endpoint private keys stay in Windows CNG;
   possession proofs, codes and authorization headers are not routine logs.
@@ -146,7 +148,9 @@ With a dedicated local PostgreSQL database and `RMM_DATABASE_URL` configured:
 ```sh
 .venv/bin/uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 --limit-concurrency 256
 # Another terminal, same RMM_DATABASE_URL:
-RMM_EXPIRY_TEST=1 .venv/bin/pytest -q tests/control_plane/test_pairing.py
+RMM_EXPIRY_TEST=1 RMM_RATE_TEST=1 .venv/bin/pytest -q tests/control_plane/test_pairing.py
+# The rate test exhausts the global allowance: wait 60 seconds before
+# starting another agent on that test control plane.
 # Actual authorized Azure Windows VM → tunnel → this Mac:
 RMM_WINDOWS_WSS=wss://YOUR-TUNNEL.trycloudflare.com/agent .venv/bin/pytest -q -s tests/control_plane/test_windows.py
 bash scripts/azure-smoke.sh
@@ -167,3 +171,20 @@ approvals, cross-workspace reads, request/attempt limits and real code expiry
 are automated gates; maximum pending-pool bound and hash-only persistence are
 also reviewed in code. Installer/service lifecycle, arbitrary execution,
 recovery/revocation, SSE and production deployment remain later tickets.
+
+## Recorded results
+
+On 2026-09-21 the actual Windows 11 trial VM used its generated CNG key to connect
+outbound through a free Cloudflare Quick Tunnel to FastAPI on the Mac, backed by
+local PostgreSQL. The Mac approved the code observed from the Windows process;
+the API reported the device online, its heartbeat advanced, stopping the process
+produced stale reachability, and restarting with the same key retained its UUID.
+The automated smoke completed successfully in about 4 minutes 22 seconds,
+including Azure orchestration and the real stale wait. This proves cross-machine
+outbound connectivity; it is not a latency, uptime or later SSE claim.
+
+The six public API tests, including a real ten-minute expiry wait, also passed.
+The expiry gate rejected both an expired code and an approved key that had not
+proved possession again before its activation deadline. No cloud control plane
+or new VM was provisioned. The local Compose image built successfully; workspace
+authentication also survived a normal restart of both Compose services.

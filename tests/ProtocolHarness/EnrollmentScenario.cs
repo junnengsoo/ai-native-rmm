@@ -11,9 +11,8 @@ internal static class EnrollmentScenario {
     public static async Task Run(string agentPath, X509Certificate2 serverCertificate) {
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
         string keyName = "rmm-harness-" + Guid.NewGuid().ToString("N");
-        using var roots = new X509Store(StoreName.Root, StoreLocation.CurrentUser);
+        using var roots = new X509Store(StoreName.Root, StoreLocation.LocalMachine);
         roots.Open(OpenFlags.ReadWrite);
-        roots.Add(new X509Certificate2(serverCertificate.RawData));
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 18444,
@@ -48,6 +47,10 @@ internal static class EnrollmentScenario {
                     var timer = Stopwatch.StartNew();
                     Require((await Receive(socket)).GetProperty("type").GetString() == "heartbeat", "heartbeat only");
                     Require(timer.Elapsed >= TimeSpan.FromSeconds(14) && timer.Elapsed < TimeSpan.FromSeconds(20), "15 second cadence");
+                    if (connections == 2) {
+                        await socket.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable, null, CancellationToken.None);
+                        return;
+                    }
                     // A reachability peer must never be able to turn this mode into execution.
                     await Send(socket, new { type = "execute", script = "'must-not-run'" });
                     completed.TrySetResult();
@@ -56,11 +59,12 @@ internal static class EnrollmentScenario {
         });
         Process? agent = null;
         try {
+            roots.Add(new X509Certificate2(serverCertificate.RawData));
             await app.StartAsync();
             var start = new ProcessStartInfo("dotnet") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
             foreach (var argument in new[] { agentPath, "--enroll", "wss://localhost:18444/agent", keyName }) start.ArgumentList.Add(argument);
             agent = Process.Start(start)!;
-            await completed.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            await completed.Task.WaitAsync(TimeSpan.FromSeconds(90));
             await agent.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
             Require(agent.ExitCode == 1, "execution message rejected by enrollment-only mode");
             using var persisted = CngKey.Open(keyName);

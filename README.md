@@ -12,8 +12,9 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 
 ## Status
 
-Slice 1 provides a manually launched Windows endpoint agent and independent
-authenticated test harness. See [Windows agent smoke test and contract](docs/agent-harness.md).
-The control plane, enrollment, installer, and customer deployment are not included.
+Slices 1–2 provide the Windows execution harness plus PostgreSQL-backed technician
+pairing and device reachability. Start with [local pairing and smoke test](docs/enrollment.md)
+or the [independent Windows harness](docs/agent-harness.md). Enrollment mode is
+reachability-only; the installer and public session/execution API are later slices.
 
-The default planned control-plane setup is local Python/PostgreSQL with Docker Compose and a development HTTPS/WSS tunnel. Cloud control-plane hosting is optional. Current implementation status is tracked in GitHub, not duplicate local planning notes.
+The default control-plane setup is local Python/PostgreSQL with Docker Compose and a development HTTPS/WSS tunnel. Cloud control-plane hosting is optional. Current implementation status is tracked in GitHub, not duplicate local planning notes.

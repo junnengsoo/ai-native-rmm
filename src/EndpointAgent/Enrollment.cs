@@ -43,6 +43,9 @@ internal static class Enrollment {
                         Console.WriteLine("PAIRING_CODE " + value);
                     } else Console.WriteLine("pending");
                 } else if (state == "online") {
+                    // These are fixed v1 requirements, not server-controlled scheduling.
+                    if (status.GetProperty("heartbeat_seconds").GetInt32() != 15
+                        || status.GetProperty("stale_seconds").GetInt32() != 45) throw new InvalidDataException();
                     if (!Guid.TryParse(status.GetProperty("device_id").GetString(), out var device))
                         throw new InvalidDataException();
                     Console.WriteLine("online " + device);
@@ -73,6 +76,7 @@ internal static class Enrollment {
         WebSocketReceiveResult part;
         do {
             part = await socket.ReceiveAsync(buffer, timeout.Token);
+            if (part.MessageType == WebSocketMessageType.Close) throw new WebSocketException();
             if (part.MessageType != WebSocketMessageType.Text || data.Length + part.Count > 2048)
                 throw new InvalidDataException();
             data.Write(buffer, 0, part.Count);

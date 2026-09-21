@@ -94,7 +94,13 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         time.sleep(17)
         row = httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]
         assert row["last_seen"] > first_seen
-        windows(f"Stop-Process -Id (Get-Content '{root}\\pid.txt'); Write-Output 'RMM_DATA:stopped'")
+        windows(f"""
+$agentId=Get-Content '{root}\\pid.txt'
+$process=Get-CimInstance Win32_Process -Filter "ProcessId=$agentId"
+if ($process.CommandLine -notlike '*{key_name}*') {{ throw 'unexpected_process' }}
+Stop-Process -Id $agentId
+Write-Output 'RMM_DATA:stopped'
+""")
         time.sleep(46)
         assert httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]["reachability"] == "stale"
         start()
@@ -103,7 +109,11 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         print("Windows: observed code → approved → online → heartbeat → stopped/stale → same device on restart")
     finally:
         windows(f"""
-if (Test-Path '{root}\\pid.txt') {{ Stop-Process -Id (Get-Content '{root}\\pid.txt') -ErrorAction SilentlyContinue }}
+if (Test-Path '{root}\\pid.txt') {{
+    $agentId=Get-Content '{root}\\pid.txt'
+    $process=Get-CimInstance Win32_Process -Filter "ProcessId=$agentId" -ErrorAction SilentlyContinue
+    if ($process.CommandLine -like '*{key_name}*') {{ Stop-Process -Id $agentId -ErrorAction SilentlyContinue }}
+}}
 Unregister-ScheduledTask -TaskName '{key_name}' -Confirm:$false -ErrorAction SilentlyContinue
 if ([Security.Cryptography.CngKey]::Exists('{key_name}')) {{ $key=[Security.Cryptography.CngKey]::Open('{key_name}'); $key.Delete(); $key.Dispose() }}
 Remove-Item '{root}\\out.txt','{root}\\err.txt' -ErrorAction SilentlyContinue

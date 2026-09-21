@@ -85,9 +85,16 @@ From a Windows checkout with .NET 8 on PATH:
 .\scripts\windows-smoke.ps1
 ```
 
+The suite also runs an independent reachability peer for [slice 2](enrollment.md).
+Run it elevated on the isolated test Windows machine: it temporarily trusts its
+unique test server certificate in the machine Root store, checks actual CNG
+signing/nonexportability, pending reconnect,
+heartbeat cadence and refusal of execution, then removes that trust and test key.
+The original mTLS worker scenarios and their trust policy remain unchanged.
+
 Expected: `SMOKE` shows a correlated `completed_normally`, exit 0 result with
 `hello from Windows` in stdout. `SMOKE_ERROR` shows `terminating_error`, exit 1,
-and `expected-smoke-error` in stderr. The three scenario PASS lines and final
+and `expected-smoke-error` in stderr. The four scenario PASS lines and final
 `RMM_SUITE_PASSED` mean the full suite passed. The shell wrapper exits nonzero
 if that marker is absent, even if Azure reports the extension invocation itself
 succeeded. Expected negative-authentication attempts print only sanitized

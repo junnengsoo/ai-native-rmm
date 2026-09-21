@@ -11,6 +11,7 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes, serialization
 from websockets.sync.client import connect
+from websockets.exceptions import InvalidStatus
 import pytest
 
 BASE = os.environ.get("RMM_TEST_URL", "http://127.0.0.1:18080")
@@ -113,6 +114,38 @@ def test_approval_guesses_are_bounded_even_with_a_valid_technician():
     assert httpx.get(BASE + "/devices", headers=admin).json()["devices"] == []
 
 
+def test_validation_does_not_echo_secrets_or_accept_key_rebinding():
+    admin = local_technician()
+    secret = "dummy-secret-must-not-appear"
+    invalid = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": secret})
+    assert invalid.status_code == 422 and secret not in invalid.text
+    oversized = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": secret * 100})
+    assert oversized.status_code == 413 and secret not in oversized.text
+    key, public = endpoint_key()
+    with connect(BASE.replace("http", "ws") + "/agent") as socket:
+        code = prove(socket, key, public)["code"]
+    with connect(BASE.replace("http", "ws") + "/agent") as socket:
+        assert prove(socket, key, public) == {"state": "pending"}
+    assert httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": code, "public_key": "replacement"}).status_code == 422
+    assert httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": code}).status_code == 200
+
+
+def test_device_pagination_stays_inside_the_technicians_workspace():
+    admin = local_technician()
+    other = local_technician()
+    for _ in range(2):
+        key, public = endpoint_key()
+        with connect(BASE.replace("http", "ws") + "/agent") as socket:
+            code = prove(socket, key, public)["code"]
+        assert httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": code}).status_code == 200
+    first = httpx.get(BASE + "/devices?limit=1", headers=admin).json()
+    assert len(first["devices"]) == 1 and first["next_cursor"]
+    second = httpx.get(BASE + "/devices", headers=admin, params={"after": first["next_cursor"], "limit": 1}).json()
+    assert len(second["devices"]) == 1 and second["next_cursor"] is None
+    assert first["devices"][0]["id"] != second["devices"][0]["id"]
+    assert httpx.get(BASE + "/devices", headers=other, params={"after": first["next_cursor"]}).json()["devices"] == []
+
+
 @pytest.mark.skipif(not os.environ.get("RMM_EXPIRY_TEST"), reason="ten-minute real-time expiry gate")
 def test_expired_code_and_approved_but_unproven_key_cannot_activate():
     admin = local_technician()
@@ -130,3 +163,17 @@ def test_expired_code_and_approved_but_unproven_key_cannot_activate():
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         assert prove(socket, approved_key, approved_public)["state"] == "denied"
     assert httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]["reachability"] == "approval_expired"
+
+
+@pytest.mark.skipif(not os.environ.get("RMM_RATE_TEST"), reason="intentionally consumes global connection allowance")
+def test_excessive_unauthenticated_connections_are_bounded():
+    rejected = False
+    for _ in range(121):
+        try:
+            with connect(BASE.replace("http", "ws") + "/agent") as socket:
+                assert json.loads(socket.recv())["type"] == "challenge"
+        except InvalidStatus as error:
+            assert error.response.status_code == 403
+            rejected = True
+            break
+    assert rejected
