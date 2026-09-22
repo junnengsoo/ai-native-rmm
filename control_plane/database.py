@@ -49,7 +49,14 @@ devices = Table("devices", metadata,
     Column("workspace_id", UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=False),
     Column("public_key", Text, nullable=False, unique=True),
     Column("approved_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-    Column("last_seen", DateTime(timezone=True)), Column("activate_before", DateTime(timezone=True)))
+    Column("last_seen", DateTime(timezone=True)), Column("activate_before", DateTime(timezone=True)),
+    Column("authorization_status", String(16), nullable=False, server_default="active"),
+    Column("revoked_at", DateTime(timezone=True)),
+    Column("revoked_by", UUID(as_uuid=True), ForeignKey("callers.id")),
+    CheckConstraint("authorization_status IN ('active', 'revoked')", name="devices_authorization_status_valid"),
+    CheckConstraint("(authorization_status = 'active' AND revoked_at IS NULL AND revoked_by IS NULL) OR "
+                    "(authorization_status = 'revoked' AND revoked_at IS NOT NULL AND revoked_by IS NOT NULL)",
+                    name="devices_revocation_fields_consistent"))
 pairings = Table("pairings", metadata, Column("public_key", Text, primary_key=True),
     Column("code_hash", Text, nullable=False, unique=True),
     Column("expires_at", DateTime(timezone=True), nullable=False))
@@ -166,7 +173,9 @@ def authenticate_credential(credential_hash: str) -> RowMapping | None:
 
 def list_workspace_devices(workspace_id: uuid.UUID, after: uuid.UUID | None, limit: int) -> list[RowMapping]:
     statement = select(devices.c.id, devices.c.approved_at, devices.c.last_seen,
-                       devices.c.activate_before).where(devices.c.workspace_id == workspace_id)
+                       devices.c.activate_before, devices.c.authorization_status,
+                       devices.c.revoked_at, devices.c.revoked_by).where(
+                           devices.c.workspace_id == workspace_id)
     if after is not None:
         statement = statement.where(devices.c.id > after)
     with transaction() as connection:
@@ -191,7 +200,10 @@ def authenticate_device(public_key: str, pairing_code: str) -> dict[str, object]
         device = connection.execute(select(devices).where(
             devices.c.public_key == public_key).with_for_update()).mappings().one_or_none()
         if device is not None:
+            if device["authorization_status"] == "revoked":
+                return {"state": "denied"}
             activated = connection.execute(update(devices).where(devices.c.id == device["id"],
+                devices.c.authorization_status == "active",
                 or_(devices.c.last_seen.is_not(None), devices.c.activate_before > func.now()))
                 .values(last_seen=func.now()).returning(devices.c.id)).scalar_one_or_none()
             if activated is None:
@@ -207,9 +219,74 @@ def authenticate_device(public_key: str, pairing_code: str) -> dict[str, object]
             expires_at=func.now() + text("interval '10 minutes'")))
         return {"state": "pending", "code": pairing_code, "expires_in_seconds": 600}
 
-def record_heartbeat(device_id: uuid.UUID | str) -> None:
+def record_heartbeat(device_id: uuid.UUID | str) -> bool:
     with transaction() as connection:
-        connection.execute(update(devices).where(devices.c.id == device_id).values(last_seen=func.now()))
+        return connection.execute(update(devices).where(
+            devices.c.id == device_id, devices.c.authorization_status == "active"
+        ).values(last_seen=func.now())).rowcount == 1
+
+def get_workspace_device(workspace_id: uuid.UUID, device_id: uuid.UUID) -> RowMapping | None:
+    with transaction() as connection:
+        return connection.execute(select(devices).where(
+            devices.c.id == device_id, devices.c.workspace_id == workspace_id
+        )).mappings().one_or_none()
+
+def revoke_workspace_device(workspace_id: uuid.UUID, actor_id: uuid.UUID,
+                            device_id: uuid.UUID) -> tuple[RowMapping, bool] | None:
+    """Persist revocation exactly once before any best-effort remote cleanup."""
+    with transaction() as connection:
+        device = connection.execute(select(devices).where(
+            devices.c.id == device_id, devices.c.workspace_id == workspace_id
+        ).with_for_update()).mappings().one_or_none()
+        if device is None:
+            return None
+        changed = device["authorization_status"] == "active"
+        if changed:
+            device = connection.execute(update(devices).where(
+                devices.c.id == device_id, devices.c.authorization_status == "active"
+            ).values(authorization_status="revoked", revoked_at=func.now(), revoked_by=actor_id)
+             .returning(devices)).mappings().one()
+            connection.execute(insert(audit_records).values(
+                id=uuid.uuid4(), workspace_id=workspace_id, caller_id=actor_id,
+                action="device.revoked", resource_type="device", resource_id=device_id))
+        return device, changed
+
+def get_live_device_session(workspace_id: uuid.UUID, device_id: uuid.UUID) -> RowMapping | None:
+    with transaction() as connection:
+        return connection.execute(select(sessions).where(
+            sessions.c.workspace_id == workspace_id, sessions.c.device_id == device_id,
+            sessions.c.state.in_(("starting", "active", "closing"))
+        ).order_by(sessions.c.created_at.desc()).limit(1)).mappings().one_or_none()
+
+def mark_device_revocation_cleanup_unknown(device_id: uuid.UUID) -> list[uuid.UUID]:
+    """Finalize live work conservatively when endpoint cleanup cannot be proven."""
+    with transaction() as connection:
+        live_sessions = select(sessions.c.id).where(
+            sessions.c.device_id == device_id,
+            sessions.c.state.in_(("starting", "active", "closing")))
+        uncertain = or_(
+            executions.c.status.in_(("queued", "running")),
+            (executions.c.status == "outcome_unknown") & executions.c.outcome_reason.in_((
+                "endpoint_disconnected", "dispatch_confirmation_lost")),
+        )
+        affected = list(connection.execute(select(executions.c.id).where(
+            executions.c.session_id.in_(live_sessions), uncertain)).scalars())
+        connection.execute(update(executions).where(
+            executions.c.session_id.in_(live_sessions),
+            uncertain).values(
+                status="outcome_unknown", outcome_reason="device_revoked_cleanup_unconfirmed",
+                last_confirmed_status=case(
+                    (executions.c.status == "outcome_unknown", executions.c.last_confirmed_status),
+                    else_=executions.c.status),
+                finished_at=func.now()))
+        connection.execute(update(sessions).where(
+            sessions.c.device_id == device_id,
+            sessions.c.state == "starting").values(state="failed", closed_at=func.now()))
+        connection.execute(update(sessions).where(
+            sessions.c.device_id == device_id,
+            sessions.c.state.in_(("active", "closing"))).values(
+                state="cleanup_unknown", closed_at=func.now()))
+        return affected
 
 def create_workspace_with_admin(name: str, credential_hash: str) -> tuple[uuid.UUID, uuid.UUID]:
     workspace_id, caller_id = uuid.uuid4(), uuid.uuid4()
@@ -241,6 +318,7 @@ def create_starting_session(workspace_id: uuid.UUID, caller_id: uuid.UUID,
         with transaction() as connection:
             owned = connection.execute(select(devices.c.id).where(
                 devices.c.id == device_id, devices.c.workspace_id == workspace_id,
+                devices.c.authorization_status == "active",
                 devices.c.last_seen > func.now() - text("interval '45 seconds'")
             ).with_for_update()).scalar_one_or_none()
             if owned is None:
@@ -325,9 +403,11 @@ def create_or_get_execution(workspace_id: uuid.UUID, caller_id: uuid.UUID,
             if not same:
                 raise RuntimeError("idempotency_conflict")
             return existing, False
-        session = connection.execute(select(sessions).where(
+        session = connection.execute(select(sessions).join(
+            devices, devices.c.id == sessions.c.device_id).where(
             sessions.c.id == session_id, sessions.c.workspace_id == workspace_id,
-            sessions.c.state == "active").with_for_update()).mappings().one_or_none()
+            sessions.c.state == "active", devices.c.authorization_status == "active"
+        ).with_for_update()).mappings().one_or_none()
         if session is None:
             raise LookupError("active_session_not_found")
         execution_id = uuid.uuid4()
@@ -530,6 +610,10 @@ def recover_interrupted_work() -> None:
 
 def fail_device_investigations(device_id: uuid.UUID | str) -> list[uuid.UUID]:
     with transaction() as connection:
+        authorization_status = connection.execute(select(devices.c.authorization_status).where(
+            devices.c.id == device_id)).scalar_one_or_none()
+        reason = ("device_revoked_cleanup_unconfirmed"
+                  if authorization_status == "revoked" else "endpoint_disconnected")
         live_sessions = select(sessions.c.id).where(
             sessions.c.device_id == device_id,
             sessions.c.state.in_(("starting", "active", "closing")))
@@ -539,7 +623,7 @@ def fail_device_investigations(device_id: uuid.UUID | str) -> list[uuid.UUID]:
         connection.execute(update(executions).where(
             executions.c.session_id.in_(live_sessions),
             executions.c.status.in_(("queued", "running"))).values(
-            status="outcome_unknown", outcome_reason="endpoint_disconnected",
+            status="outcome_unknown", outcome_reason=reason,
             last_confirmed_status=executions.c.status, finished_at=func.now()))
         connection.execute(update(sessions).where(
             sessions.c.device_id == device_id,

@@ -18,6 +18,7 @@ outcomes, retained-output search/tail/range inspection, and a caller-side OpenAI
 Agents SDK diagnostic driver prototype. This branch also provides a candidate
 Windows service MSI for the trial agent.
 Start with [local pairing](docs/enrollment.md),
+[device revocation](docs/device-revocation.md),
 [persistent investigations](docs/investigations.md),
 [the OpenAI diagnostic driver](docs/openai-driver.md), or the
 [independent Windows harness](docs/agent-harness.md), or the
