@@ -70,7 +70,9 @@ try {
     Require(error.Result.GetProperty("state").GetString() == "completed"
         && error.Result.GetProperty("invocationOutcome").GetString() == "terminating_error"
         && error.Result.GetProperty("exitCode").GetInt32() == 1 && error.Result.GetProperty("hadErrors").GetBoolean()
-        && error.Stderr.Contains("expected-smoke-error"), "terminating error has definitive invocation evidence");
+        && error.Stderr.Contains("expected-smoke-error"), "terminating error has definitive invocation evidence: stdout="
+        + JsonSerializer.Serialize(error.Stdout) + " stderr=" + JsonSerializer.Serialize(error.Stderr)
+        + " result=" + error.Result.GetRawText());
     Console.WriteLine("SMOKE_ERROR " + error.Result.GetRawText());
     // One persistent-session investigation, including its replacement boundary.
     var native = await Execute("cmd /c exit 7", 5000);
