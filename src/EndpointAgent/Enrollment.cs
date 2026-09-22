@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace EndpointAgent;
 
-// Reachability only. This mode never starts a worker or accepts script dispatch.
+// Enrollment and the authenticated long-lived device channel.
 internal static class Enrollment {
     public static async Task Run(Uri endpoint, string keyName) {
         if (endpoint.Scheme != "wss" || endpoint.AbsolutePath != "/agent"
@@ -49,13 +49,7 @@ internal static class Enrollment {
                     if (!Guid.TryParse(status.GetProperty("device_id").GetString(), out var device))
                         throw new InvalidDataException();
                     Console.WriteLine("online " + device);
-                    while (socket.State == WebSocketState.Open) {
-                        await Task.Delay(TimeSpan.FromSeconds(15));
-                        await Send(socket, new { type = "heartbeat" });
-                        var ack = await Receive(socket);
-                        if (ack.GetProperty("type").GetString() != "heartbeat_ack")
-                            throw new InvalidDataException();
-                    }
+                    await AgentRuntime.Run(socket, device.ToString(), sendHeartbeats: true);
                 } else if (state == "denied") throw new UnauthorizedAccessException();
                 else if (state != "rate_limited") throw new InvalidDataException();
             } catch (WebSocketException) { Console.Error.WriteLine("connection_unavailable"); }

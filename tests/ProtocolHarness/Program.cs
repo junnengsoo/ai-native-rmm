@@ -53,6 +53,7 @@ try {
     Require(result.GetProperty("state").GetString() == "completed"
         && result.GetProperty("invocationOutcome").GetString() == "completed_normally"
         && result.GetProperty("exitCode").GetInt32() == 0
+        && result.GetProperty("exitCodeSource").GetString() == "normalized_invocation"
         && result.GetProperty("stdout").GetString()!.Contains("hello from Windows")
         && result.GetProperty("durationMs").GetDouble() >= 0, "harmless command has correlated structured evidence");
     Console.WriteLine("SMOKE " + result.GetRawText());
@@ -84,7 +85,8 @@ try {
     Require(escaped.GetProperty("captureTruncated").GetBoolean() && escaped.GetProperty("stdout").GetString()!.Length == 32768
         && escaped.GetProperty("stderr").GetString()!.Length == 32768, "both bounded streams survive JSON escaping without protocol loss");
     var explicitExit = await Execute("exit 23", 5000);
-    Require(explicitExit.GetProperty("invocationOutcome").GetString() == "explicit_exit" && explicitExit.GetProperty("exitCode").GetInt32() == 23, "explicit exit keeps requested code");
+    Require(explicitExit.GetProperty("invocationOutcome").GetString() == "explicit_exit" && explicitExit.GetProperty("exitCode").GetInt32() == 23
+        && explicitExit.GetProperty("exitCodeSource").GetString() == "explicit_script_exit", "explicit exit keeps requested code and provenance");
     await Rejected(Request("'must-not-run'"), "explicit exit retires the worker until replacement");
     await ReplaceSession();
     // Inspect runspace functions directly; Get-Command also searches installed applications.

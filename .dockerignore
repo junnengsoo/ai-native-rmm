@@ -2,4 +2,9 @@
 !requirements.txt
 !control_plane/
 !control_plane/*.py
+!alembic.ini
+!migrations/
+!migrations/*.py
+!migrations/versions/
+!migrations/versions/*.py
 **/__pycache__/

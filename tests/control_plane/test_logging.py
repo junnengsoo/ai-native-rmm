@@ -60,5 +60,5 @@ def test_unexpected_database_failure_returns_sanitized_503():
         assert response.json() == {"detail": "temporarily_unavailable"}
         assert secret not in response.text
         # Body rejection remains independent of database availability.
-        oversized = httpx.post(base + "/pairings/approve", content="x" * 2049)
+        oversized = httpx.post(base + "/pairings/approve", content="x" * 1_048_577)
         assert oversized.status_code == 413

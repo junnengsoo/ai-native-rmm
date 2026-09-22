@@ -3,7 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    paths: ['control_plane/**', 'tests/control_plane/**', 'requirements.txt', 'Dockerfile', 'compose.yaml', '.github/workflows/control-plane.yml']
+    paths: ['control_plane/**', 'migrations/**', 'alembic.ini', 'tests/control_plane/**', 'requirements.txt', 'Dockerfile', 'compose.yaml', '.github/workflows/control-plane.yml']
 permissions:
   contents: read
 jobs:
@@ -31,11 +31,11 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Start private test control plane
         run: |
-          python -m uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 > "$RUNNER_TEMP/rmm-control-plane.log" 2>&1 &
+          python -m uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 300000 > "$RUNNER_TEMP/rmm-control-plane.log" 2>&1 &
           for attempt in $(seq 1 30); do
             if curl --silent http://127.0.0.1:18080/openapi.json >/dev/null; then exit 0; fi
             sleep 1
           done
           exit 1
       - name: Public API, authentication, real expiry and concurrency
-        run: python -m pytest -q tests/control_plane/test_logging.py tests/control_plane/test_pairing.py tests/control_plane/test_reachability.py
+        run: python -m pytest -q tests/control_plane/test_investigations.py tests/control_plane/test_logging.py tests/control_plane/test_pairing.py tests/control_plane/test_reachability.py

@@ -37,6 +37,11 @@ def test_real_windows_pairing_heartbeat_stop_and_stable_identity():
     assert credential, "Set RMM_ADMIN_KEY to the workspace admin credential from local setup"
     admin = {"Authorization": "Bearer " + credential}
     assert httpx.get(BASE + "/devices", headers=admin).status_code == 200, "Check RMM_API_URL and RMM_ADMIN_KEY"
+    caller = httpx.post(BASE + "/callers", headers=admin, json={
+        "name": "windows-smoke-" + uuid.uuid4().hex, "role": "operator",
+    })
+    caller.raise_for_status()
+    operator = {"Authorization": "Bearer " + caller.json()["api_key"]}
     key_name = "rmm-test-" + uuid.uuid4().hex
     root = "C:\\Windows\\Temp\\" + key_name
     archive = io.BytesIO()
@@ -112,6 +117,47 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
             time.sleep(1)
         assert row["reachability"] == "online"
         first_seen = row["last_seen"]
+
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device}, timeout=30)
+        opened.raise_for_status()
+        session = opened.json()["session_id"]
+
+        def execute(script, idempotency_key):
+            submitted = httpx.post(BASE + f"/sessions/{session}/executions", headers={
+                **operator, "Idempotency-Key": idempotency_key,
+            }, json={"script": script, "timeout_ms": 5000})
+            submitted.raise_for_status()
+            execution = submitted.json()["execution_id"]
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                result = httpx.get(BASE + f"/executions/{execution}", headers=operator)
+                result.raise_for_status()
+                if result.json()["status"] not in ("queued", "running"):
+                    return submitted, result.json()
+                time.sleep(.2)
+            pytest.fail("Windows execution did not finish")
+
+        _, set_result = execute("$global:trialValue = 41", "set-variable")
+        assert set_result["status"] == "completed"
+        _, read_result = execute("$global:trialValue + 1", "read-variable")
+        assert read_result["stdout"].strip() == "42"
+        marker = root + "\\marker.txt"
+        marker_script = f"Add-Content -LiteralPath '{marker}' -Value marker; (Get-Content -LiteralPath '{marker}').Count"
+        first_submit, marker_result = execute(marker_script, "marker-once")
+        retry = httpx.post(BASE + f"/sessions/{session}/executions", headers={
+            **operator, "Idempotency-Key": "marker-once",
+        }, json={"script": marker_script, "timeout_ms": 5000})
+        assert retry.status_code == 202 and retry.json()["execution_id"] == first_submit.json()["execution_id"]
+        assert marker_result["stdout"].strip() == "1"
+        closed = httpx.post(BASE + f"/sessions/{session}/close", headers=operator, timeout=30)
+        assert closed.status_code == 200 and closed.json()["status"] == "closed"
+        fresh = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device}, timeout=30)
+        fresh.raise_for_status()
+        session = fresh.json()["session_id"]
+        _, fresh_result = execute("$null -eq $global:trialValue", "fresh-variable")
+        assert fresh_result["stdout"].strip().lower() == "true"
+        assert httpx.post(BASE + f"/sessions/{session}/close", headers=operator, timeout=30).status_code == 200
+
         time.sleep(17)
         row = enrolled_device()
         assert row["last_seen"] > first_seen
@@ -127,7 +173,7 @@ Write-Output 'RMM_DATA:stopped'
         start()
         row = enrolled_device()
         assert row["id"] == device and row["reachability"] == "online"
-        print("Windows: observed code → approved → online → heartbeat → stopped/stale → same device on restart")
+        print("Windows: paired → persistent session → idempotent execution → fresh session → stale/restart identity")
     finally:
         windows(f"""
 if (Test-Path '{root}\\pid.txt') {{

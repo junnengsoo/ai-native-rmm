@@ -12,9 +12,9 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 
 ## Status
 
-Slices 1–2 provide the Windows execution harness plus PostgreSQL-backed admin
-pairing and device reachability. Start with [local pairing and smoke test](docs/enrollment.md)
-or the [independent Windows harness](docs/agent-harness.md). Enrollment mode is
-reachability-only; the installer and public session/execution API are later slices.
+Slices 1–3 provide the Windows execution harness, PostgreSQL-backed enrollment,
+and the public persistent-investigation API. Start with [local pairing](docs/enrollment.md),
+[persistent investigations](docs/investigations.md), or the
+[independent Windows harness](docs/agent-harness.md). The installer remains a later slice.
 
 The default control-plane setup is local Python/PostgreSQL with Docker Compose and a development HTTPS/WSS tunnel. Cloud control-plane hosting is optional. Current implementation status is tracked in GitHub, not duplicate local planning notes.

@@ -1,6 +1,8 @@
 fastapi==0.141.1
 uvicorn[standard]==0.53.0
 psycopg[binary]==3.3.6
+SQLAlchemy==2.0.43
+alembic==1.16.5
 cryptography==50.0.1
 httpx==0.28.1
 pytest==9.1.1
