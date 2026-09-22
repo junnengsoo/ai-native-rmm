@@ -64,7 +64,8 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             job.Dispose(); pipe.Dispose(); throw;
         }
         _ = Drain(process.StandardOutput);
-        _ = DrainDiagnostics(process.StandardError);
+        using var startupDiagnostics = new CancellationTokenSource();
+        _ = DrainDiagnostics(process.StandardError, startupDiagnostics.Token);
         WorkerProcess? worker = null;
         try {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -76,6 +77,7 @@ internal sealed class WorkerProcess : IAsyncDisposable {
                     Console.Error.WriteLine(ready);
                 throw new InvalidDataException();
             }
+            startupDiagnostics.Cancel();
             return worker;
         } catch {
             if (worker is not null) await worker.DisposeAsync();
@@ -132,9 +134,11 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         }
     }
 
-    private static async Task DrainDiagnostics(StreamReader stream) {
+    private static async Task DrainDiagnostics(StreamReader stream, CancellationToken startup) {
         while (await stream.ReadLineAsync() is { } line) {
-            if (line.StartsWith("startup_failed:", StringComparison.Ordinal) && line.Length < 100)
+            if (!startup.IsCancellationRequested && line.Length < 500)
+                Console.Error.WriteLine("worker_startup: " + line);
+            else if (line.StartsWith("startup_failed:", StringComparison.Ordinal) && line.Length < 100)
                 Console.Error.WriteLine(line);
         }
     }
