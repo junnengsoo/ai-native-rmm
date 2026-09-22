@@ -1,7 +1,7 @@
 # Device revocation
 
-Device revocation permanently removes one device credential's execution
-authority without deleting the device identity or its investigation history.
+Device revocation permanently removes a Device's execution authority without
+deleting its logical identity, credential history, or investigation history.
 Only an authenticated administrator in the device's workspace can revoke it.
 
 ## API
@@ -53,10 +53,8 @@ endpoint's non-exportable private key is its standing credential, and retaining
 the revoked public-key record ensures that credential cannot enroll again.
 
 Revocation does not uninstall the endpoint agent, erase its local key, delete
-device/session/execution/output history, revoke caller API credentials, or
-recover identity after reinstall. A clean reinstall creates a new endpoint key
-and uses ordinary pairing as a new device until technician recovery is
-implemented separately.
+device/session/execution/output history, or revoke caller API credentials. A
+revoked Device cannot use technician recovery; unrevocation is unsupported.
 
 ## Manual smoke test
 

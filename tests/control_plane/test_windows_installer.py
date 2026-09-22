@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import httpx
 
 
 def windows(script: str, timeout: int = 600) -> dict:
@@ -24,7 +25,7 @@ def windows(script: str, timeout: int = 600) -> dict:
             "status_missing", "unexpected_status", "pairing_code_not_preserved",
             "restart_failed", "uninstall_failed",
             "service_remaining", "files_remaining", "status_remaining", "local_credential_remaining",
-            "missing_endpoint_accepted",
+            "missing_endpoint_accepted", "online_timeout", "device_identity_changed",
         ) if marker in output), "unclassified_fixture_failure")
         pytest.fail("Windows installer smoke failed: " + reason + " (raw output suppressed)")
     return json.loads(output.split("RMM_DATA:", 1)[1].splitlines()[0])
@@ -45,9 +46,18 @@ def bundle_source() -> str:
     not os.environ.get("RMM_WINDOWS_INSTALLER_WSS"),
     reason="requires authorized Windows VM, tunnel, and reduced installer smoke opt-in",
 )
-def test_real_msi_service_restart_and_uninstall_cleanup():
+def test_real_msi_clean_reinstall_recovers_stable_device_identity():
     endpoint = os.environ["RMM_WINDOWS_INSTALLER_WSS"]
     assert endpoint.startswith("wss://") and endpoint.endswith("/agent") and "'" not in endpoint
+    api = os.environ.get("RMM_API_URL", "http://127.0.0.1:18080")
+    credential = os.environ.get("RMM_ADMIN_KEY")
+    assert credential, "Set RMM_ADMIN_KEY for the workspace served through RMM_WINDOWS_INSTALLER_WSS"
+    admin = {"Authorization": "Bearer " + credential}
+    caller = httpx.post(api + "/callers", headers=admin, json={
+        "name": "windows-recovery-" + uuid.uuid4().hex, "role": "operator",
+    })
+    caller.raise_for_status()
+    operator = {"Authorization": "Bearer " + caller.json()["api_key"]}
 
     key_name = "rmm-msi-" + uuid.uuid4().hex
     root = "C:\\Windows\\Temp\\" + key_name
@@ -112,11 +122,11 @@ if ($status.state -ne 'pending' -or $status.ready -ne $false -or $status.pairing
 $key=[Security.Cryptography.CngKey]::Open('{key_name}')
 $unique=$key.UniqueName
 $key.Dispose()
-Write-Output ('RMM_DATA:' + (@{{state=$status.state;ready=$status.ready;pairing_code_length=$status.pairing_code.Length;start_mode=$svc.StartMode;identity=$svc.StartName;key_unique_name=$unique}} | ConvertTo-Json -Compress))
+Write-Output ('RMM_DATA:' + (@{{state=$status.state;ready=$status.ready;pairing_code=$status.pairing_code;start_mode=$svc.StartMode;identity=$svc.StartName;key_unique_name=$unique}} | ConvertTo-Json -Compress))
 """)
         assert installed["state"] == "pending"
         assert installed["ready"] is False
-        assert installed["pairing_code_length"] == 12
+        assert len(installed["pairing_code"]) == 12
         assert installed["start_mode"] == "Auto"
         assert installed["identity"] == "LocalSystem"
 
@@ -155,6 +165,40 @@ Write-Output ('RMM_DATA:' + (@{{state=$status.state;ready=$status.ready;service=
         assert restarted["state"] == "pending"
         assert restarted["pairing_code_length"] == 12
 
+        approved = httpx.post(api + "/pairings/approve", headers=admin, json={
+            "code": installed["pairing_code"], "device_name": "Windows Reinstall PC " + key_name[-8:],
+        })
+        approved.raise_for_status()
+        device_id = approved.json()["device_id"]
+        online = windows(f"""
+$deadline=(Get-Date).AddSeconds(60)
+do {{
+  Start-Sleep -Seconds 1
+  $status=Get-Content '{status_path}' -Raw | ConvertFrom-Json
+}} until ($status.state -eq 'online' -or (Get-Date) -gt $deadline)
+if ($status.state -ne 'online' -or $status.device_id -ne '{device_id}') {{ throw 'online_timeout' }}
+Write-Output ('RMM_DATA:' + (@{{device_id=$status.device_id}} | ConvertTo-Json -Compress))
+""")
+        assert online["device_id"] == device_id
+
+        opened = httpx.post(api + "/sessions", headers=operator, json={"device_id": device_id}, timeout=30)
+        opened.raise_for_status()
+        session_id = opened.json()["session_id"]
+        submitted = httpx.post(
+            api + f"/sessions/{session_id}/executions",
+            headers={**operator, "Idempotency-Key": "before-clean-reinstall"},
+            json={"script": "'retained across reinstall'", "timeout_ms": 5000},
+        )
+        submitted.raise_for_status()
+        execution_id = submitted.json()["execution_id"]
+        result = httpx.get(
+            api + f"/executions/{execution_id}/wait", headers=operator,
+            params={"timeout_seconds": 20}, timeout=25,
+        )
+        result.raise_for_status()
+        assert result.json()["status"] == "completed"
+        httpx.post(api + f"/sessions/{session_id}/close", headers=operator, timeout=30).raise_for_status()
+
         removed = windows(f"""
 $msi='{built["msi"]}'
 $args=@('/x',$msi,'/qn','/l*v','{root}\\uninstall.log')
@@ -167,6 +211,46 @@ if ([Security.Cryptography.CngKey]::Exists('{key_name}')) {{ throw 'local_creden
 Write-Output ('RMM_DATA:' + (@{{removed=$true}} | ConvertTo-Json -Compress))
 """)
         assert removed["removed"] is True
+
+        retained = httpx.get(api + f"/executions/{execution_id}/wait", headers=operator)
+        retained.raise_for_status()
+        assert retained.json()["output_preview"]["stdout"]["text"].strip() == "retained across reinstall"
+
+        reinstalled = windows(f"""
+$msi='{built["msi"]}'
+$args=@('/i',$msi,'/qn','/l*v','{root}\\reinstall.log','RMM_ENDPOINT={endpoint}','RMM_KEY_NAME={key_name}')
+$process=Start-Process msiexec.exe -ArgumentList $args -Wait -PassThru
+if ($process.ExitCode -ne 0) {{ throw 'install_failed' }}
+$deadline=(Get-Date).AddSeconds(60)
+do {{
+  Start-Sleep -Seconds 1
+  $status=Get-Content '{status_path}' -Raw | ConvertFrom-Json
+}} until ($status.state -eq 'pending' -and $status.pairing_code -match '^[A-Z2-7]{{12}}$' -or (Get-Date) -gt $deadline)
+if ($status.state -ne 'pending') {{ throw 'unexpected_status' }}
+$key=[Security.Cryptography.CngKey]::Open('{key_name}')
+$unique=$key.UniqueName
+$key.Dispose()
+Write-Output ('RMM_DATA:' + (@{{pairing_code=$status.pairing_code;key_unique_name=$unique}} | ConvertTo-Json -Compress))
+""")
+        assert reinstalled["key_unique_name"] != installed["key_unique_name"]
+        recovery = httpx.post(
+            api + f"/devices/{device_id}/recover", headers=admin,
+            json={"code": reinstalled["pairing_code"]},
+        )
+        recovery.raise_for_status()
+        assert recovery.json()["state"] == "awaiting_activation"
+        recovered = windows(f"""
+$deadline=(Get-Date).AddSeconds(60)
+do {{
+  Start-Sleep -Seconds 1
+  $status=Get-Content '{status_path}' -Raw | ConvertFrom-Json
+}} until ($status.state -eq 'online' -or (Get-Date) -gt $deadline)
+if ($status.state -ne 'online') {{ throw 'online_timeout' }}
+if ($status.device_id -ne '{device_id}') {{ throw 'device_identity_changed' }}
+Write-Output ('RMM_DATA:' + (@{{device_id=$status.device_id}} | ConvertTo-Json -Compress))
+""")
+        assert recovered["device_id"] == device_id
+        assert httpx.get(api + f"/executions/{execution_id}/wait", headers=operator).status_code == 200
     finally:
         windows(f"""
 $svc=Get-CimInstance Win32_Service -Filter "Name='{service}'" -ErrorAction SilentlyContinue

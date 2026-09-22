@@ -64,7 +64,9 @@ def enroll(admin):
     key, public = endpoint_key()
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         pending = prove(socket, key, public)
-    approved = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": pending["code"]})
+    approved = httpx.post(BASE + "/pairings/approve", headers=admin, json={
+        "code": pending["code"], "device_name": "Investigation PC " + pending["code"],
+    })
     assert approved.status_code == 200
     return key, public, approved.json()["device_id"]
 

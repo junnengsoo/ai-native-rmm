@@ -91,7 +91,9 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         observed = start()
         assert observed.startswith("PAIRING_CODE "), "Windows must display a one-time pairing code"
         code = observed.split()[1]
-        response = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": code})
+        response = httpx.post(BASE + "/pairings/approve", headers=admin, json={
+            "code": code, "device_name": "Windows Smoke PC",
+        })
         assert response.status_code == 200
         device = response.json()["device_id"]
 
