@@ -1,11 +1,11 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="Prosper Endpoint Agent"
+  <Package Name="Squash Endpoint Agent"
            Manufacturer="Prosper"
            Version="0.1.0.0"
            UpgradeCode="8e27e3d5-2ad2-4f45-b15d-f3d63cf45619"
            Scope="perMachine"
            InstallerVersion="500">
-    <MajorUpgrade DowngradeErrorMessage="A newer Prosper Endpoint Agent is already installed." />
+    <MajorUpgrade DowngradeErrorMessage="A newer Squash Endpoint Agent is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="RMM_ENDPOINT" Secure="yes" />
@@ -17,10 +17,10 @@
                       Name="KeyName"
                       Type="raw" />
     </Property>
-    <Launch Condition="Installed OR RMM_ENDPOINT" Message="RMM_ENDPOINT is required. Run msiexec /qn /i ProsperEndpointAgent.msi RMM_ENDPOINT=wss://host/agent." />
+    <Launch Condition="Installed OR RMM_ENDPOINT" Message="RMM_ENDPOINT is required. Run msiexec /qn /i SquashEndpointAgent.msi RMM_ENDPOINT=wss://host/agent." />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="Prosper Endpoint Agent">
+      <Directory Id="INSTALLFOLDER" Name="Squash Endpoint Agent">
         <Component Id="AgentService" Guid="b02f18da-1bea-4cc2-9c24-517d04880794" Bitness="always64">
           <File Id="AgentExe" Source="$(var.PublishDir)\EndpointAgent.exe" KeyPath="yes" />
           <RegistryValue Root="HKLM" Key="SOFTWARE\Prosper\AiNativeRmm" Name="Endpoint" Value="[RMM_ENDPOINT]" Type="string" />

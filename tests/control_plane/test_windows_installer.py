@@ -53,7 +53,7 @@ def test_real_msi_service_restart_and_uninstall_cleanup():
     payload = bundle_source()
     service = "SquashEndpointAgent"
     status_path = "C:\\ProgramData\\Prosper\\AiNativeRmm\\status.json"
-    install_folder = "C:\\Program Files\\Prosper Endpoint Agent"
+    install_folder = "C:\\Program Files\\Squash Endpoint Agent"
 
     try:
         built = windows(f"""

@@ -1,6 +1,6 @@
 <Project Sdk="WixToolset.Sdk/5.0.2">
   <PropertyGroup>
-    <OutputName>ProsperEndpointAgent</OutputName>
+    <OutputName>SquashEndpointAgent</OutputName>
     <OutputType>Package</OutputType>
     <Platform>x64</Platform>
     <DefineConstants>PublishDir=$(PublishDir)</DefineConstants>

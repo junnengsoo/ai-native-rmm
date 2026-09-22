@@ -41,16 +41,22 @@ From a Windows checkout with the .NET SDK available:
 ```
 
 The script publishes a self-contained `win-x64` agent payload and builds
-`ProsperEndpointAgent.msi` under `artifacts\windows-agent`. Build output is
+`SquashEndpointAgent.msi` under `artifacts\windows-agent`. Build output is
 ignored by Git; do not commit generated MSI files, logs, credentials, or local
 status files.
+
+For pull requests, the `Windows agent contract` GitHub Actions workflow also
+builds this MSI on a GitHub-hosted Windows runner and uploads it for seven days
+as the `squash-endpoint-agent-msi` artifact. Download it from the workflow run's
+Artifacts section. This is an unsigned trial artifact; production distribution
+requires Authenticode signing and an approved release channel.
 
 ## Silent install and uninstall
 
 Install with an elevated console:
 
 ```powershell
-msiexec /i .\artifacts\windows-agent\ProsperEndpointAgent.msi /qn /l*v install.log RMM_ENDPOINT=wss://YOUR-TUNNEL.trycloudflare.com/agent
+msiexec /i .\artifacts\windows-agent\SquashEndpointAgent.msi /qn /l*v install.log RMM_ENDPOINT=wss://YOUR-TUNNEL.trycloudflare.com/agent
 ```
 
 Optional:
@@ -70,7 +76,7 @@ Expected installation outcome:
 Uninstall with:
 
 ```powershell
-msiexec /x .\artifacts\windows-agent\ProsperEndpointAgent.msi /qn /l*v uninstall.log
+msiexec /x .\artifacts\windows-agent\SquashEndpointAgent.msi /qn /l*v uninstall.log
 ```
 
 Expected uninstall outcome:
