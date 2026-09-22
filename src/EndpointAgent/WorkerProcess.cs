@@ -47,7 +47,12 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         start.ArgumentList.Add(workerScript);
         start.ArgumentList.Add("-PipeName");
         start.ArgumentList.Add(name);
-        var allowed = new[] { "SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT", "ComSpec", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)", "ProgramData" };
+        // Keep the standard Windows account environment that the inbox engine
+        // needs for profile and module discovery, without forwarding arbitrary
+        // agent configuration or secrets to remotely supplied scripts.
+        var allowed = new[] { "SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT", "ComSpec", "SystemDrive",
+            "ProgramFiles", "ProgramFiles(x86)", "ProgramData", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
+            "LOCALAPPDATA", "PSModulePath" };
         var environment = allowed.ToDictionary(key => key, Environment.GetEnvironmentVariable);
         start.Environment.Clear();
         foreach (var (key, value) in environment) if (value is not null) start.Environment[key] = value;
