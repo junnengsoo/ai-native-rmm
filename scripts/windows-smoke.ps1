@@ -23,18 +23,31 @@ try {
         [IO.Pipes.PipeTransmissionMode]::Byte,
         ([IO.Pipes.PipeOptions]::Asynchronous -bor [IO.Pipes.PipeOptions]::CurrentUserOnly)
     )
-    $probeError = Join-Path $env:TEMP ($probeName + '.err')
-    $probeOutput = Join-Path $env:TEMP ($probeName + '.out')
     $nativePowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
     $probeArguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -PipeName $probeName"
-    $probeProcess = Start-Process $nativePowerShell -ArgumentList $probeArguments -PassThru -NoNewWindow `
-        -RedirectStandardError $probeError -RedirectStandardOutput $probeOutput
+    $probeStart = New-Object Diagnostics.ProcessStartInfo
+    $probeStart.FileName = $nativePowerShell
+    $probeStart.Arguments = $probeArguments
+    $probeStart.UseShellExecute = $false
+    $probeStart.CreateNoWindow = $true
+    $probeStart.RedirectStandardError = $true
+    $probeStart.RedirectStandardOutput = $true
+    $allowedEnvironment = @('SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'PATH', 'PATHEXT', 'ComSpec', 'SystemDrive',
+        'ProgramFiles', 'ProgramFiles(x86)', 'ProgramData', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA',
+        'LOCALAPPDATA', 'PSModulePath')
+    $savedEnvironment = @{}
+    foreach ($key in $allowedEnvironment) { $savedEnvironment[$key] = [Environment]::GetEnvironmentVariable($key) }
+    $probeStart.EnvironmentVariables.Clear()
+    foreach ($key in $allowedEnvironment) {
+        if ($null -ne $savedEnvironment[$key]) { $probeStart.EnvironmentVariables[$key] = $savedEnvironment[$key] }
+    }
+    $probeProcess = [Diagnostics.Process]::Start($probeStart)
     $probeReader = $null
     try {
         $connected = $probePipe.WaitForConnectionAsync()
         if (-not $connected.Wait(20000)) {
             if (-not $probeProcess.HasExited) { $probeProcess.Kill() }
-            $diagnostic = Get-Content $probeError -Raw -ErrorAction SilentlyContinue
+            $diagnostic = $probeProcess.StandardError.ReadToEnd()
             throw "Native PowerShell worker did not connect: $diagnostic"
         }
         $probeReader = New-Object IO.StreamReader($probePipe, (New-Object Text.UTF8Encoding($false)), $false, 4096, $true)
@@ -47,7 +60,7 @@ try {
         $probeProcess.WaitForExit()
         if ($null -ne $probeReader) { $probeReader.Dispose() }
         $probePipe.Dispose()
-        Remove-Item $probeError, $probeOutput -Force -ErrorAction SilentlyContinue
+        $probeProcess.Dispose()
     }
     dotnet tests/ProtocolHarness/bin/Release/net8.0/ProtocolHarness.dll "$root/src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll" $certs[0].Thumbprint $certs[1].Thumbprint $certs[2].Thumbprint
     if ($LASTEXITCODE) { throw 'External behavior suite failed' }
