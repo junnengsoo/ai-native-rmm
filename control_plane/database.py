@@ -72,7 +72,7 @@ device_credentials = Table("device_credentials", metadata,
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("activated_at", DateTime(timezone=True)),
     Column("invalidated_at", DateTime(timezone=True)),
-    Column("replacement", Boolean, nullable=False, server_default="false"),
+    Column("replaces_credential_id", UUID(as_uuid=True), ForeignKey("device_credentials.id")),
     CheckConstraint("state IN ('pending', 'active', 'replaced', 'expired')",
                     name="device_credentials_state_valid"))
 Index("device_credentials_one_active", device_credentials.c.device_id, unique=True,
@@ -263,10 +263,17 @@ def recover_device(code_hash: str, workspace_id: uuid.UUID, actor_id: uuid.UUID,
         ).returning(pairings.c.public_key, pairings.c.expires_at)).mappings().one_or_none()
         if pending is None:
             return "invalid_code", device
+        predecessor_id = connection.execute(select(device_credentials.c.id).where(
+            device_credentials.c.device_id == device_id
+        ).order_by(
+            (device_credentials.c.state == "active").desc(),
+            device_credentials.c.created_at.desc(),
+            device_credentials.c.id.desc(),
+        ).limit(1).with_for_update()).scalar_one()
         connection.execute(insert(device_credentials).values(
             id=uuid.uuid4(), device_id=device_id, public_key=pending["public_key"],
             state="pending", activate_before=pending["expires_at"], approved_by=actor_id,
-            approval_code_hash=code_hash, replacement=True))
+            approval_code_hash=code_hash, replaces_credential_id=predecessor_id))
         connection.execute(insert(audit_records).values(
             id=uuid.uuid4(), workspace_id=workspace_id, caller_id=actor_id,
             action="device.recovery_approved", resource_type="device", resource_id=device_id))
@@ -303,7 +310,7 @@ def authenticate_device(public_key: str, pairing_code: str) -> dict[str, object]
                         device_credentials.c.id == credential["id"]
                     ).values(state="expired", invalidated_at=func.now()))
                     return {"state": "denied"}
-                if credential["replacement"]:
+                if credential["replaces_credential_id"] is not None:
                     if connection.execute(select(sessions.c.id).where(
                         sessions.c.device_id == device_id,
                         sessions.c.state.in_(UNRESOLVED_SESSION_STATES)
@@ -445,7 +452,7 @@ def create_starting_session(workspace_id: uuid.UUID, caller_id: uuid.UUID,
                 ~select(device_credentials.c.id).where(
                     device_credentials.c.device_id == devices.c.id,
                     device_credentials.c.state == "pending",
-                    device_credentials.c.replacement.is_(True)).exists()
+                    device_credentials.c.replaces_credential_id.is_not(None)).exists()
             ).with_for_update()).scalar_one_or_none()
             if owned is None:
                 return None
