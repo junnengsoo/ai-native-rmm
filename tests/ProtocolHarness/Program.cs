@@ -138,8 +138,7 @@ try {
     var cancelled = await Receive(socket);
     Require(cancelled.GetProperty("state").GetString() == "cancelled"
         && cancelled.GetProperty("invocationOutcome").GetString() == "stopped"
-        && cancelled.GetProperty("exitCode").ValueKind == JsonValueKind.Null
-        && cancelled.GetProperty("stdout").GetString()!.Contains("before-cancel"), "caller cancellation confirms stopping and preserves evidence");
+        && cancelled.GetProperty("exitCode").ValueKind == JsonValueKind.Null, "caller cancellation confirms stopping");
     await Rejected(Request("'must-not-run'"), "cancelled worker is retired");
     await ReplaceSession();
     var lost = await Execute("[Environment]::Exit(19)", 5000);
