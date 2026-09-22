@@ -2,7 +2,8 @@
 
 This document covers enrollment and reachability. The next implemented slice
 adds authenticated script dispatch; see [persistent investigations](investigations.md).
-The project does not yet install a service or recover/revoke devices.
+The [Windows service installer](windows-service-installer.md) now covers the
+trial service packaging path. Recovery/revocation remain later work.
 The older `--agent` entry point remains an isolated, manually provisioned mTLS
 execution harness; never deploy it to customer endpoints as an enrollment bypass.
 
@@ -222,8 +223,8 @@ contract tests remain in place.
 Not covered by manual smoke: replayed nonce proofs, concurrent competing
 approvals, cross-workspace reads, request/attempt limits and real code expiry
 are automated gates; maximum pending-pool bound and hash-only persistence are
-also reviewed in code. Installer/service lifecycle, output streaming,
-recovery/revocation, SSE and production deployment remain later tickets.
+ also reviewed in code. Output streaming, recovery/revocation, SSE and
+ production deployment remain later tickets.
 
 ## Recorded results
 

@@ -7,7 +7,10 @@ namespace EndpointAgent;
 
 // Enrollment and the authenticated long-lived device channel.
 internal static class Enrollment {
-    public static async Task Run(Uri endpoint, string keyName) {
+    public static Task Run(Uri endpoint, string keyName) =>
+        Run(endpoint, keyName, EnrollmentStatus.Console, CancellationToken.None);
+
+    public static async Task Run(Uri endpoint, string keyName, IEnrollmentStatus statusSink, CancellationToken cancellation) {
         if (endpoint.Scheme != "wss" || endpoint.AbsolutePath != "/agent"
             || endpoint.UserInfo.Length != 0 || endpoint.Query.Length != 0 || endpoint.Fragment.Length != 0
             || keyName.Length is < 1 or > 100 || keyName.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-'))
@@ -19,11 +22,12 @@ internal static class Enrollment {
             throw new CryptographicException();
         using var signer = new ECDsaCng(key);
         string publicKey = Convert.ToBase64String(signer.ExportSubjectPublicKeyInfo());
-        while (true) {
+        while (!cancellation.IsCancellationRequested) {
             try {
                 using var socket = new ClientWebSocket();
                 // Platform certificate-chain, hostname and validity checks remain enabled.
-                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                deadline.CancelAfter(TimeSpan.FromSeconds(15));
                 await socket.ConnectAsync(endpoint, deadline.Token);
                 var challenge = await Receive(socket);
                 string nonce = challenge.GetProperty("nonce").GetString()!;
@@ -40,21 +44,22 @@ internal static class Enrollment {
                         string value = code.GetString()!;
                         if (value.Length != 12 || value.Any(c => !(c is >= 'A' and <= 'Z' or >= '2' and <= '7')))
                             throw new InvalidDataException();
-                        Console.WriteLine("PAIRING_CODE " + value);
-                    } else Console.WriteLine("pending");
+                        statusSink.Pending(value);
+                    } else statusSink.Pending(null);
                 } else if (state == "online") {
                     // These are fixed v1 requirements, not server-controlled scheduling.
                     if (status.GetProperty("heartbeat_seconds").GetInt32() != 15
                         || status.GetProperty("stale_seconds").GetInt32() != 45) throw new InvalidDataException();
                     if (!Guid.TryParse(status.GetProperty("device_id").GetString(), out var device))
                         throw new InvalidDataException();
-                    Console.WriteLine("online " + device);
-                    await AgentRuntime.Run(socket, device.ToString(), sendHeartbeats: true);
+                    statusSink.Online(device);
+                    await AgentRuntime.Run(socket, device.ToString(), sendHeartbeats: true, cancellation);
                 } else if (state == "denied") throw new UnauthorizedAccessException();
-                else if (state != "rate_limited") throw new InvalidDataException();
-            } catch (WebSocketException) { Console.Error.WriteLine("connection_unavailable"); }
-            catch (OperationCanceledException) { Console.Error.WriteLine("connection_timeout"); }
-            await Task.Delay(TimeSpan.FromSeconds(15));
+                else if (state == "rate_limited") statusSink.Unavailable("rate_limited");
+                else throw new InvalidDataException();
+            } catch (WebSocketException) { statusSink.Unavailable("connection_unavailable"); }
+            catch (OperationCanceledException) when (!cancellation.IsCancellationRequested) { statusSink.Unavailable("connection_timeout"); }
+            await Task.Delay(TimeSpan.FromSeconds(15), cancellation);
         }
     }
 

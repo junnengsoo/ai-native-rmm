@@ -9,7 +9,7 @@ namespace EndpointAgent;
 internal static class AgentRuntime {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
-    public static async Task Run(WebSocket socket, string device, bool sendHeartbeats) {
+    public static async Task Run(WebSocket socket, string device, bool sendHeartbeats, CancellationToken cancellation = default) {
         WorkerProcess? worker = null;
         string? session = null;
         var sessions = new HashSet<string>(StringComparer.Ordinal);
@@ -21,12 +21,14 @@ internal static class AgentRuntime {
         Task<JsonElement>? incoming = null;
         using var stopped = new CancellationTokenSource();
         using var sendLock = new SemaphoreSlim(1, 1);
+        var cancelled = Task.Delay(Timeout.InfiniteTimeSpan, cancellation);
         Task heartbeats = sendHeartbeats ? Heartbeats(socket, sendLock, stopped.Token) : Task.CompletedTask;
         try {
-            while (socket.State == WebSocketState.Open) {
+            while (socket.State == WebSocketState.Open && !cancellation.IsCancellationRequested) {
                 if (invocation is not null) {
-                    incoming ??= Receive(socket, TimeSpan.FromMinutes(2));
-                    var ready = await Task.WhenAny(incoming, invocation);
+                    incoming ??= Receive(socket, TimeSpan.FromMinutes(2), cancellation);
+                    var ready = await Task.WhenAny(incoming, invocation, cancelled);
+                    if (ready == cancelled) break;
                     if (ready == invocation) {
                         var completed = await invocation;
                         invocation = null;
@@ -76,7 +78,7 @@ internal static class AgentRuntime {
                     continue;
                 }
                 JsonElement message;
-                incoming ??= Receive(socket, TimeSpan.FromMinutes(2));
+                incoming ??= Receive(socket, TimeSpan.FromMinutes(2), cancellation);
                 try { message = await incoming; }
                 catch (JsonException) {
                     incoming = null;
@@ -155,8 +157,9 @@ internal static class AgentRuntime {
         } finally { sendLock.Release(); }
     }
 
-    private static async Task<JsonElement> Receive(WebSocket socket, TimeSpan wait) {
-        using var timeout = new CancellationTokenSource(wait);
+    private static async Task<JsonElement> Receive(WebSocket socket, TimeSpan wait, CancellationToken cancellation) {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        timeout.CancelAfter(wait);
         using var data = new MemoryStream();
         var buffer = new byte[8192];
         WebSocketReceiveResult part;

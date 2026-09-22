@@ -3,6 +3,7 @@ bin/
 obj/
 dist/
 build/
+artifacts/
 .artifacts/
 
 # Local configuration and secrets

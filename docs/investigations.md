@@ -143,6 +143,8 @@ previously running work `outcome_unknown` and live sessions `failed` rather than
 relaunching uncertain work. The prototype does not include configurable session
 idle/absolute lifetime, start-deadline clock coordination, offline command
 queueing, or restart reconciliation. Multi-process connection routing, full
-output search, caller revocation, installer/service lifecycle, and configurable
-execution profiles belong to later tickets. Nothing in this slice claims that
+output search, caller revocation, recovery/revocation, and configurable
+execution profiles belong to later tickets. The candidate
+[Windows service installer](windows-service-installer.md) deliberately keeps the
+same `LocalSystem` execution identity. Nothing in this slice claims that
 arbitrary scripts are sandboxed from the managed Windows host.

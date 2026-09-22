@@ -13,10 +13,11 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 ## Status
 
 Slices 1–4 provide the Windows execution harness, PostgreSQL-backed enrollment,
-the public persistent-investigation API, and truthful timeout, cancellation, and
-offline outcomes.
+the public persistent-investigation API with truthful timeout, cancellation, and
+offline outcomes, and a candidate Windows service MSI for the trial agent.
 Start with [local pairing](docs/enrollment.md),
-[persistent investigations](docs/investigations.md), or the
-[independent Windows harness](docs/agent-harness.md). The installer remains a later slice.
+[persistent investigations](docs/investigations.md), the
+[independent Windows harness](docs/agent-harness.md), or the
+[Windows service installer](docs/windows-service-installer.md).
 
 The default control-plane setup is local Python/PostgreSQL with Docker Compose and a development HTTPS/WSS tunnel. Cloud control-plane hosting is optional. Current implementation status is tracked in GitHub, not duplicate local planning notes.
