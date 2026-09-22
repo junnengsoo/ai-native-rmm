@@ -1,0 +1,64 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Squash Endpoint Agent"
+           Manufacturer="Prosper"
+           Version="0.1.0.0"
+           UpgradeCode="8e27e3d5-2ad2-4f45-b15d-f3d63cf45619"
+           Scope="perMachine"
+           InstallerVersion="500">
+    <MajorUpgrade DowngradeErrorMessage="A newer Squash Endpoint Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="RMM_ENDPOINT" Secure="yes" />
+    <Property Id="RMM_KEY_NAME" Secure="yes" Value="SquashEndpointAgent" />
+    <Property Id="INSTALLED_RMM_KEY_NAME" Secure="yes">
+      <RegistrySearch Id="InstalledKeyName"
+                      Root="HKLM"
+                      Key="SOFTWARE\Prosper\AiNativeRmm"
+                      Name="KeyName"
+                      Type="raw" />
+    </Property>
+    <Launch Condition="Installed OR RMM_ENDPOINT" Message="RMM_ENDPOINT is required. Run msiexec /qn /i SquashEndpointAgent.msi RMM_ENDPOINT=wss://host/agent." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Squash Endpoint Agent">
+        <Component Id="AgentService" Guid="b02f18da-1bea-4cc2-9c24-517d04880794" Bitness="always64">
+          <File Id="AgentExe" Source="$(var.PublishDir)\EndpointAgent.exe" KeyPath="yes" />
+          <RegistryValue Root="HKLM" Key="SOFTWARE\Prosper\AiNativeRmm" Name="Endpoint" Value="[RMM_ENDPOINT]" Type="string" />
+          <RegistryValue Root="HKLM" Key="SOFTWARE\Prosper\AiNativeRmm" Name="KeyName" Value="[RMM_KEY_NAME]" Type="string" />
+          <ServiceInstall Id="InstallService"
+                          Name="SquashEndpointAgent"
+                          DisplayName="Squash Endpoint Agent"
+                          Description="Outbound endpoint agent for the AI-native RMM trial."
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Account="LocalSystem"
+                          Arguments="--service" />
+          <ServiceControl Id="ControlService"
+                          Name="SquashEndpointAgent"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+        <Files Include="$(var.PublishDir)\**\*.*">
+          <Exclude Files="$(var.PublishDir)\EndpointAgent.exe" />
+        </Files>
+      </Directory>
+    </StandardDirectory>
+
+    <SetProperty Id="CleanupAgentState"
+                 Value="&quot;[#AgentExe]&quot; --service-uninstall-cleanup &quot;[INSTALLED_RMM_KEY_NAME]&quot;"
+                 Before="CleanupAgentState"
+                 Sequence="execute" />
+    <CustomAction Id="CleanupAgentState"
+                  BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Return="check"
+                  Impersonate="no" />
+    <InstallExecuteSequence>
+      <Custom Action="CleanupAgentState" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

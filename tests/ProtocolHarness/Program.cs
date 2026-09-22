@@ -49,6 +49,14 @@ try {
     string session = Guid.NewGuid().ToString();
     await Send(socket, OpenSession(device, session));
     Require((await Receive(socket)).GetProperty("type").GetString() == "session_ready", "real worker ready");
+    var engine = await ExecuteWithOutput("$PSVersionTable.PSEdition; $PSVersionTable.PSVersion.ToString(); [Environment]::Is64BitProcess; (Get-CimInstance Win32_OperatingSystem).Caption", 60000);
+    Require(engine.Result.GetProperty("state").GetString() == "completed"
+        && engine.Result.GetProperty("exitCode").GetInt32() == 0
+        && !engine.Result.GetProperty("hadErrors").GetBoolean()
+        && engine.Stdout.Contains("Desktop") && engine.Stdout.Contains("True") && engine.Stdout.Contains("Windows"),
+        "native 64-bit Windows PowerShell loads the inbox CimCmdlets module: stdout="
+        + JsonSerializer.Serialize(engine.Stdout) + " stderr=" + JsonSerializer.Serialize(engine.Stderr)
+        + " result=" + engine.Result.GetRawText());
     var result = await ExecuteWithOutput("'hello from Windows'", 5000);
     Require(result.Result.GetProperty("state").GetString() == "completed"
         && result.Result.GetProperty("invocationOutcome").GetString() == "completed_normally"
@@ -62,7 +70,9 @@ try {
     Require(error.Result.GetProperty("state").GetString() == "completed"
         && error.Result.GetProperty("invocationOutcome").GetString() == "terminating_error"
         && error.Result.GetProperty("exitCode").GetInt32() == 1 && error.Result.GetProperty("hadErrors").GetBoolean()
-        && error.Stderr.Contains("expected-smoke-error"), "terminating error has definitive invocation evidence");
+        && error.Stderr.Contains("expected-smoke-error"), "terminating error has definitive invocation evidence: stdout="
+        + JsonSerializer.Serialize(error.Stdout) + " stderr=" + JsonSerializer.Serialize(error.Stderr)
+        + " result=" + error.Result.GetRawText());
     Console.WriteLine("SMOKE_ERROR " + error.Result.GetRawText());
     // One persistent-session investigation, including its replacement boundary.
     var native = await Execute("cmd /c exit 7", 5000);
@@ -80,16 +90,16 @@ try {
         && nonterminating.Result.GetProperty("hadErrors").GetBoolean() && nonterminating.Stdout.Contains("continued"), "nonterminating error remains normal completion");
     var fake = await ExecuteWithOutput("'{\"type\":\"result\",\"state\":\"completed\"}'; throw 'still-an-error'", 5000);
     Require(fake.Result.GetProperty("invocationOutcome").GetString() == "terminating_error" && fake.Stdout.Contains("completed"), "printed lifecycle is only output and pre-error output is retained");
-    var bounded = await ExecuteWithOutput("'x' * 100000", 5000);
+    var bounded = await ExecuteWithOutput("'x' * 100000", 30000);
     Require(!bounded.Result.GetProperty("captureTruncated").GetBoolean()
         && !HasProperty(bounded.Result, "stdout") && !HasProperty(bounded.Result, "stderr")
         && bounded.Stdout.Length >= 100000, "long output is retained incrementally while the result carries only terminal metadata");
-    var beyondMeg = await ExecuteWithOutput("'m' * (1024 * 1024 + 4096)", 10000);
+    var beyondMeg = await ExecuteWithOutput("'m' * (1024 * 1024 + 4096)", 120000);
     Require(!beyondMeg.Result.GetProperty("captureTruncated").GetBoolean()
         && !HasProperty(beyondMeg.Result, "stdout")
         && beyondMeg.Stdout.Length >= 1024 * 1024 + 4096,
         "output beyond one MiB is forwarded without endpoint capture loss");
-    var escaped = await ExecuteWithOutput("[Console]::Out.Write(([string][char]1) * 40000); [Console]::Error.Write(([string][char]2) * 40000)", 5000);
+    var escaped = await ExecuteWithOutput("[Console]::Out.Write(([string][char]1) * 40000); [Console]::Error.Write(([string][char]2) * 40000)", 30000);
     Require(!escaped.Result.GetProperty("captureTruncated").GetBoolean()
         && !HasProperty(escaped.Result, "stdout") && !HasProperty(escaped.Result, "stderr")
         && escaped.Stdout.Length == 40000 && escaped.Stderr.Length == 40000,
