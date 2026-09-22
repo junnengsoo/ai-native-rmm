@@ -58,10 +58,11 @@ public static class RmmProtocol
         {
             var chunk = new StringBuilder();
             int chunkBytes = 0;
+            char[] characters = value.ToCharArray();
             for (int index = 0; index < value.Length;)
             {
                 int charCount = Char.IsHighSurrogate(value[index]) && index + 1 < value.Length ? 2 : 1;
-                int byteCount = Encoding.UTF8.GetByteCount(value.ToCharArray(), index, charCount);
+                int byteCount = Encoding.UTF8.GetByteCount(characters, index, charCount);
                 if (chunk.Length > 0 && chunkBytes + byteCount > ChunkLimit)
                 {
                     WriteOutputLine(writer, stream, chunk.ToString());

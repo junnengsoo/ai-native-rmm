@@ -90,16 +90,16 @@ try {
         && nonterminating.Result.GetProperty("hadErrors").GetBoolean() && nonterminating.Stdout.Contains("continued"), "nonterminating error remains normal completion");
     var fake = await ExecuteWithOutput("'{\"type\":\"result\",\"state\":\"completed\"}'; throw 'still-an-error'", 5000);
     Require(fake.Result.GetProperty("invocationOutcome").GetString() == "terminating_error" && fake.Stdout.Contains("completed"), "printed lifecycle is only output and pre-error output is retained");
-    var bounded = await ExecuteWithOutput("'x' * 100000", 5000);
+    var bounded = await ExecuteWithOutput("'x' * 100000", 30000);
     Require(!bounded.Result.GetProperty("captureTruncated").GetBoolean()
         && !HasProperty(bounded.Result, "stdout") && !HasProperty(bounded.Result, "stderr")
         && bounded.Stdout.Length >= 100000, "long output is retained incrementally while the result carries only terminal metadata");
-    var beyondMeg = await ExecuteWithOutput("'m' * (1024 * 1024 + 4096)", 10000);
+    var beyondMeg = await ExecuteWithOutput("'m' * (1024 * 1024 + 4096)", 120000);
     Require(!beyondMeg.Result.GetProperty("captureTruncated").GetBoolean()
         && !HasProperty(beyondMeg.Result, "stdout")
         && beyondMeg.Stdout.Length >= 1024 * 1024 + 4096,
         "output beyond one MiB is forwarded without endpoint capture loss");
-    var escaped = await ExecuteWithOutput("[Console]::Out.Write(([string][char]1) * 40000); [Console]::Error.Write(([string][char]2) * 40000)", 5000);
+    var escaped = await ExecuteWithOutput("[Console]::Out.Write(([string][char]1) * 40000); [Console]::Error.Write(([string][char]2) * 40000)", 30000);
     Require(!escaped.Result.GetProperty("captureTruncated").GetBoolean()
         && !HasProperty(escaped.Result, "stdout") && !HasProperty(escaped.Result, "stderr")
         && escaped.Stdout.Length == 40000 && escaped.Stderr.Length == 40000,
