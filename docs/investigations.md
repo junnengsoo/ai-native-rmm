@@ -7,6 +7,11 @@ PowerShell worker alive within a session, so variables, functions, modules, and
 the working directory persist between executions. Closing confirms worker and
 owned-child cleanup; a replacement session starts fresh.
 
+The [OpenAI diagnostic driver](openai-driver.md) is an example caller layered on
+this API. It keeps model use on the caller side, enforces explicit step/time
+budgets, and submits only authenticated public API operations to the control
+plane.
+
 For this trial, the endpoint agent and its PowerShell worker run as Windows
 `LocalSystem`; there is no execution-profile choice or permission isolation yet.
 Restricted and current-user workers, plus privileged approval/elevation flows,

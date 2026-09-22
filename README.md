@@ -12,11 +12,12 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 
 ## Status
 
-Slices 1–4 provide the Windows execution harness, PostgreSQL-backed enrollment,
-the public persistent-investigation API, and truthful timeout, cancellation, and
-offline outcomes.
+Slices 1–5 provide the Windows execution harness, PostgreSQL-backed enrollment,
+the public persistent-investigation API, truthful timeout/cancellation/offline
+outcomes, and a caller-side OpenAI diagnostic driver prototype.
 Start with [local pairing](docs/enrollment.md),
-[persistent investigations](docs/investigations.md), or the
+[persistent investigations](docs/investigations.md),
+[the OpenAI diagnostic driver](docs/openai-driver.md), or the
 [independent Windows harness](docs/agent-harness.md). The installer remains a later slice.
 
 The default control-plane setup is local Python/PostgreSQL with Docker Compose and a development HTTPS/WSS tunnel. Cloud control-plane hosting is optional. Current implementation status is tracked in GitHub, not duplicate local planning notes.

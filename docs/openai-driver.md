@@ -1,0 +1,99 @@
+# OpenAI diagnostic driver
+
+The OpenAI driver is a prototype caller, not endpoint intelligence. It uses the
+OpenAI Responses API from the caller process to choose read-only diagnostic
+PowerShell commands, then submits those exact commands through the public
+control-plane session/execution APIs. The endpoint receives only PowerShell
+scripts and normal session metadata. OpenAI keys, admin keys, operator keys, and
+control-plane HTTP access are never exposed to the endpoint or included in model
+tool results.
+
+The default model is `gpt-5-nano`, selected as the lowest-cost currently listed
+OpenAI text model for this smoke path. The driver uses a small default budget:
+five tool steps, three minutes wall-clock, 600 output tokens per model call, and
+20-second execution timeouts unless a tool call selects a smaller bounded value.
+These are deliberately conservative prototype defaults, not the unapproved
+15-command/15-minute budget.
+
+## Local deterministic tests
+
+The tests mock the OpenAI boundary and use fake or mocked control-plane calls:
+
+```sh
+.venv/bin/python -m pytest -q tests/control_plane/test_openai_driver.py
+```
+
+They cover adaptive tool sequencing, bounded output pages, session closure on
+budget exhaustion, separate timing records, OpenAI request shape, token usage
+collection, and the fact that control-plane calls authenticate with the operator
+credential rather than the OpenAI key.
+
+## Manual Windows/OpenAI smoke
+
+Complete the local Compose, tunnel, Windows enrollment, and admin setup in
+[enrollment.md](enrollment.md), keeping these variables in the shell that runs
+the driver:
+
+```sh
+export RMM_API_URL=http://127.0.0.1:18080
+export RMM_ADMIN_KEY=ADMIN_KEY_PLACEHOLDER
+export OPENAI_API_KEY=OPENAI_KEY_PLACEHOLDER
+```
+
+The driver can create its own one-use operator caller with the admin key. If an
+operator key already exists, set `RMM_OPERATOR_KEY=OPERATOR_KEY_PLACEHOLDER`
+instead. When using only an operator key, also set `RMM_DEVICE_ID=DEVICE_UUID`.
+
+Use a reversible test-only host-name fault. This does not affect the tunnel,
+Azure Run Command, RDP, or any management path because it only changes the
+Windows hosts entry for the synthetic file-server name:
+
+```powershell
+$marker = '# rmm-openai-driver-smoke'
+$line = "203.0.113.10 rmm-test-fileserver $marker"
+$hosts = "$env:WINDIR\System32\drivers\etc\hosts"
+$existing = Get-Content -LiteralPath $hosts -ErrorAction Stop
+if ($existing -notcontains $line) {
+    Add-Content -LiteralPath $hosts -Value $line
+}
+```
+
+Do not tell the model that the hosts entry is the hidden cause. Ask only the
+plain-English problem:
+
+```sh
+.venv/bin/python -m control_plane.openai_driver \
+  --model gpt-5-nano \
+  --max-steps 5 \
+  --max-seconds 180 \
+  "Why can this Windows machine not reach \\\\rmm-test-fileserver\\diagnostics?"
+```
+
+Expected behavior:
+
+- The driver opens an authorized debugging session, calls OpenAI from the caller,
+  and adaptively submits dependent read-only PowerShell checks through
+  `POST /sessions/{id}/executions`.
+- Each execution is followed through bounded long-poll output events and final
+  execution records. If a preview is shortened, the model may request one
+  bounded retained output page.
+- The final report names the likely cause and proposed human fixes, but does not
+  apply remediation.
+- The rendered output lists API round-trip time, endpoint execution duration,
+  model latency before each tool step, total model latency, and token usage/cost
+  when the API returns usage.
+- The session is closed even when a budget ends the investigation.
+
+Restore the controlled fault afterward:
+
+```powershell
+$marker = '# rmm-openai-driver-smoke'
+$hosts = "$env:WINDIR\System32\drivers\etc\hosts"
+(Get-Content -LiteralPath $hosts) |
+  Where-Object { $_ -notlike "*$marker*" } |
+  Set-Content -LiteralPath $hosts
+```
+
+The smoke should consume at most one bounded `gpt-5-nano` run. Retry only when
+the first run fails before receiving a usable OpenAI response or before any
+diagnostic command can be submitted.
