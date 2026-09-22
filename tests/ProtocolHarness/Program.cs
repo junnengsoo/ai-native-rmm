@@ -49,7 +49,7 @@ try {
     string session = Guid.NewGuid().ToString();
     await Send(socket, OpenSession(device, session));
     Require((await Receive(socket)).GetProperty("type").GetString() == "session_ready", "real worker ready");
-    var engine = await ExecuteWithOutput("$PSVersionTable.PSEdition; $PSVersionTable.PSVersion.ToString(); [Environment]::Is64BitProcess; (Get-CimInstance Win32_OperatingSystem).Caption", 10000);
+    var engine = await ExecuteWithOutput("$PSVersionTable.PSEdition; $PSVersionTable.PSVersion.ToString(); [Environment]::Is64BitProcess; (Get-CimInstance Win32_OperatingSystem).Caption", 60000);
     Require(engine.Result.GetProperty("state").GetString() == "completed"
         && engine.Result.GetProperty("exitCode").GetInt32() == 0
         && !engine.Result.GetProperty("hadErrors").GetBoolean()

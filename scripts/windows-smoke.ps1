@@ -45,14 +45,14 @@ try {
     $probeReader = $null
     try {
         $connected = $probePipe.WaitForConnectionAsync()
-        if (-not $connected.Wait(20000)) {
+        if (-not $connected.Wait(60000)) {
             if (-not $probeProcess.HasExited) { $probeProcess.Kill() }
             $diagnostic = $probeProcess.StandardError.ReadToEnd()
             throw "Native PowerShell worker did not connect: $diagnostic"
         }
         $probeReader = New-Object IO.StreamReader($probePipe, (New-Object Text.UTF8Encoding($false)), $false, 4096, $true)
         $readyPending = $probeReader.ReadLineAsync()
-        if (-not $readyPending.Wait(20000)) { throw 'Native PowerShell worker connected but did not become ready' }
+        if (-not $readyPending.Wait(60000)) { throw 'Native PowerShell worker connected but did not become ready' }
         $ready = $readyPending.Result
         if ($ready -notlike '{"kind":"ready"*') { throw "Native PowerShell worker was not ready: $ready" }
     } finally {

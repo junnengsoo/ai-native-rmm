@@ -68,7 +68,9 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         _ = DrainDiagnostics(process.StandardError, startupDiagnostics.Token);
         WorkerProcess? worker = null;
         try {
-            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            // Inbox PowerShell can have a slow first launch while endpoint
+            // protection scans it and .NET Framework warms up.
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
             await pipe.WaitForConnectionAsync(deadline.Token);
             worker = new WorkerProcess(pipe, process, job);
             var ready = await worker.reader.ReadLineAsync(deadline.Token);
