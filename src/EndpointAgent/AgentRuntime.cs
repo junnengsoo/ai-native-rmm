@@ -39,10 +39,10 @@ internal static class AgentRuntime {
                             completed.Result.LastNativeExitCode });
                     } else {
                         try {
-                            var message = await incoming;
-                            if (!message.TryGetProperty("type", out var messageType)
-                                || messageType.ValueKind != JsonValueKind.String
-                                || messageType.GetString() != "heartbeat_ack")
+                            var runningMessage = await incoming;
+                            if (!runningMessage.TryGetProperty("type", out var runningMessageType)
+                                || runningMessageType.ValueKind != JsonValueKind.String
+                                || runningMessageType.GetString() != "heartbeat_ack")
                                 await Reject(socket, sendLock, "invalid_state_or_duplicate");
                         } catch (JsonException) {
                             await Reject(socket, sendLock, "invalid_request");
