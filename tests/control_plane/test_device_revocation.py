@@ -60,7 +60,9 @@ def approve(admin):
     key, public = endpoint_key()
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         pending = prove(socket, key, public)
-    response = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": pending["code"]})
+    response = httpx.post(BASE + "/pairings/approve", headers=admin, json={
+        "code": pending["code"], "device_name": "Revocation PC " + pending["code"],
+    })
     response.raise_for_status()
     return response.json()["device_id"], key, public
 

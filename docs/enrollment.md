@@ -81,8 +81,9 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOU
    P-256 signing key in the launching account's Windows key store. This console
    output is deliberate one-time delivery; do not collect it as an operational
    log. While pending, the device list remains empty.
-2. On the Mac run `.venv/bin/python -m control_plane.client approve` and enter the
-   code from that trusted Windows view. Expect `approved` plus a stable device
+2. On the Mac run `.venv/bin/python -m control_plane.client approve`, enter the
+   code from that trusted Windows view, and choose a workspace-unique device
+   name. Expect `approved` plus a stable device
    UUID. The approval HTTP request carries the code in its JSON body.
 3. Run `.venv/bin/python -m control_plane.client list`. Within about 15 seconds,
    Windows prints `online` and the list reports `online` with the same UUID.
@@ -97,11 +98,12 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOU
    admin approval and cannot claim the original UUID.
 6. Stop the tunnel when finished and run `docker compose down`. Unset the
    admin environment variable. Keep the endpoint key only if continuing the
-   trial; uninstall and recovery approved by an admin belong to later tickets.
+   trial. A clean uninstall deliberately removes it; use technician recovery
+   after reinstall as described below.
 
 An approved key must first activate before the original ten-minute code deadline;
-otherwise it reports `activation_expired` and cannot authenticate. There is no key
-replacement/recovery operation yet. If the one-time code display is lost, allow
+otherwise it reports `activation_expired` and cannot authenticate. If the
+one-time code display is lost, allow
 the pending request to expire; reconnect then receives a fresh code. Do not
 silently enroll a replacement key as the same logical device.
 
@@ -118,8 +120,9 @@ device ID or forwarded certificate header establishes identity.
 An unknown proven key receives `pending`, a one-time 12-character base32 code,
 and `expires_in_seconds: 600`. Reconnecting with that key before expiry returns
 `pending` without disclosing the code again. The database binds the code hash
-immutably to that public key. Admin `POST /pairings/approve` atomically
-consumes a live code and assigns a UUID in the admin's workspace. Pending
+immutably to that public key. Admin `POST /pairings/approve` accepts the code
+and `device_name`, atomically consumes a live code, and assigns a UUID in the
+admin's workspace. Pending
 keys never appear in device lists and this mode has no execution path.
 
 After approval, a new connection and nonce proof activates the key. `online`
@@ -138,6 +141,14 @@ contact strictly newer than 45 seconds is online; contact exactly 45 seconds old
 is stale. Without contact, the activation deadline is expired at equality.
 Previously activated devices remain stale/online regardless of that deadline.
 Workspace filtering, ordering and pagination remain in PostgreSQL.
+
+Ordinary authenticated reconnection and technician recovery are distinct.
+A known active credential reconnects without approval. After clean uninstall,
+the replacement installation generates a fresh key and pairing code. An admin
+explicitly selects the existing Device and submits that code to
+`POST /devices/DEVICE_ID/recover`. Fresh proof activates the pending replacement,
+invalidates the old credential, and preserves Device identity and history. See
+[technician recovery](device-recovery.md).
 
 The new reachability protocol uses application-level possession proof because a
 TLS-terminating development tunnel need not forward client certificates. The
