@@ -1,9 +1,7 @@
 """Local administrative operation. stdout is the one-time credential delivery."""
 import secrets
 import sys
-import uuid
-
-from .database import connect, digest, initialize
+from .database import create_workspace_with_admin, digest, initialize
 
 
 def main():
@@ -11,11 +9,7 @@ def main():
         raise ValueError("workspace_name_required")
     initialize()
     credential = "rmm_" + secrets.token_urlsafe(32)
-    with connect() as db:
-        db.execute(
-            "INSERT INTO workspaces (id, name, admin_hash) VALUES (%s, %s, %s)",
-            (uuid.uuid4(), sys.argv[1], digest(credential)),
-        )
+    create_workspace_with_admin(sys.argv[1], digest(credential))
     print(credential)
 
 

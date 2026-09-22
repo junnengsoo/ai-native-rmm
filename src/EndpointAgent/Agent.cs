@@ -48,7 +48,7 @@ internal static class Agent {
                     await Send(socket, new { type = "running", deviceId = device, sessionId = session, executionId = execution });
                     var result = await worker.Execute(request.Script!, request.TimeoutMs);
                     await Send(socket, new { type = "result", deviceId = device, sessionId = session, executionId = execution,
-                        result.State, result.InvocationOutcome, result.ExitCode, result.HadErrors, result.Stdout,
+                        result.State, result.InvocationOutcome, result.ExitCode, result.ExitCodeSource, result.HadErrors, result.Stdout,
                         result.Stderr, result.DurationMs, result.CaptureTruncated, result.LastNativeExitCode });
                 } else await Reject(socket, "invalid_state_or_duplicate");
             }

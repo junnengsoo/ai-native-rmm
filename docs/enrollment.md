@@ -1,15 +1,14 @@
 # Pairing and reachability — slice 2
 
-This slice enrolls a Windows key and reports contact through a local Python
-control plane backed by PostgreSQL. It does not install a service, dispatch
-scripts, recover/revoke devices, or implement the later session/execution API.
+This document covers enrollment and reachability. The next implemented slice
+adds authenticated script dispatch; see [persistent investigations](investigations.md).
+The project does not yet install a service or recover/revoke devices.
 The older `--agent` entry point remains an isolated, manually provisioned mTLS
 execution harness; never deploy it to customer endpoints as an enrollment bypass.
 
-The caller roles are **admin** and **operator**. This slice creates only the
-initial workspace admin credential and implements its pairing/device-list access.
-Operator credentials and sessions/executions/output permissions arrive with the
-execution API; operators will not receive admin pairing or management authority.
+The caller roles are **admin** and **operator**. Local setup creates the initial
+workspace admin credential. Admins create operator credentials; operators use
+the session/execution API and cannot pair or manage devices.
 There is no separate technician or viewer role.
 
 ## Local setup and manual smoke
@@ -124,8 +123,8 @@ keys never appear in device lists and this mode has no execution path.
 
 After approval, a new connection and nonce proof activates the key. `online`
 returns the UUID, `heartbeat_seconds: 15`, and `stale_seconds: 45`. The agent
-sends only `{"type":"heartbeat"}`; the server acknowledges it. Unknown messages,
-including dispatch, are rejected. Reconnect proves the persisted key again;
+sends `{"type":"heartbeat"}` and the server acknowledges it. The same authenticated
+channel also carries strictly bound session/execution dispatch. Reconnect proves the persisted key again;
 there are no reusable bearer tokens on Windows. `GET /devices` scopes every row
 to the authenticated workspace; `limit` is 1–100 and `after` accepts the prior
 `next_cursor` UUID. Reachability is `approved`, `online`, `stale`, or
@@ -164,12 +163,10 @@ not establish the later streaming/deployment slice's compatibility.
   handshake returns 403. Global bounds intentionally trade availability under
   attack for bounded resource use in this trial, and are not production DDoS
   protection. No rate identity is taken from spoofable forwarding headers.
-- Proof deadline ten seconds; WS text at most 2,048 bytes; heartbeat read deadline
+- Proof deadline ten seconds; WS text at most 300,000 bytes; heartbeat read deadline
   45 seconds; heartbeats faster than one/second rejected. HTTP bodies require
-  Content-Length at most 2,048 bytes and no chunked encoding. Run the documented
-  server command with its transport size/concurrency limits.
-  This HTTP ceiling fits only #4's tiny approval API: #5 must introduce a larger
-  global ceiling and an endpoint-specific script limit before accepting scripts.
+  Content-Length at most 1 MiB and no chunked encoding; scripts are independently
+  limited to 32,768 characters. Run the documented server command with its transport limits.
   Request-body-limit middleware and sanitized unexpected-error handling are
   separate responsibilities; unexpected HTTP failures return only a generic 503.
   Database connection/statements are bounded to five seconds and lock waits to
@@ -187,7 +184,7 @@ not establish the later streaming/deployment slice's compatibility.
 With a dedicated local PostgreSQL database and `RMM_DATABASE_URL` configured:
 
 ```sh
-.venv/bin/uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 --limit-concurrency 256
+.venv/bin/uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 300000 --limit-concurrency 256
 # Another terminal, same RMM_DATABASE_URL:
 RMM_EXPIRY_TEST=1 RMM_RATE_TEST=1 .venv/bin/python -m pytest -q tests/control_plane/test_logging.py tests/control_plane/test_pairing.py tests/control_plane/test_reachability.py
 # The rate test exhausts the global allowance: wait 60 seconds before
@@ -209,8 +206,8 @@ bash scripts/azure-smoke.sh
 The smoke creates one retained device record in that workspace and selects its
 UUID, so existing trial devices do not affect its assertions. It removes the test
 key afterward; the retained record becomes stale, not a reusable enrollment.
-The renamed rate-limit schema assumes a fresh disposable database for this
-unmerged slice. Schema migration tooling remains #5 work.
+Alembic upgrades either a fresh database or the retained slice-2 schema without
+requiring the device records to be discarded.
 
 The expiry gate waits the real ten minutes. The Windows integration uses Azure
 only to deploy/start/stop an isolated test agent and observe its local code; API
@@ -219,13 +216,13 @@ from Run Command and is removed afterward. Code-output files and test keys are
 removed; source/build files may remain under the unique Windows Temp directory.
 The test asserts heartbeat, stale state, and stable UUID after restart. The
 independent peer additionally verifies the actual Windows signature,
-nonexportability, timing, and refusal of execution messages; all prior worker
+nonexportability, timing, enrolled dispatch, and worker cleanup; all prior worker
 contract tests remain in place.
 
 Not covered by manual smoke: replayed nonce proofs, concurrent competing
 approvals, cross-workspace reads, request/attempt limits and real code expiry
 are automated gates; maximum pending-pool bound and hash-only persistence are
-also reviewed in code. Installer/service lifecycle, arbitrary execution,
+also reviewed in code. Installer/service lifecycle, output streaming,
 recovery/revocation, SSE and production deployment remain later tickets.
 
 ## Recorded results
@@ -246,4 +243,4 @@ or new VM was provisioned. The local Compose image built successfully; workspace
 authentication also survived a normal restart of both Compose services.
 The independent Windows harness passed all original worker scenarios plus fresh
 key proofs, nonexportability, 15-second heartbeats, same-key reconnect after a
-server Close frame, and refusal of execution messages in enrollment mode.
+server Close frame, and persistent enrolled execution.

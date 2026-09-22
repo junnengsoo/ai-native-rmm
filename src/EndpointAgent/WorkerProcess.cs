@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace EndpointAgent;
 
-internal sealed record WorkerResult(string State, string? InvocationOutcome, int? ExitCode, bool HadErrors,
+internal sealed record WorkerResult(string State, string? InvocationOutcome, int? ExitCode, string? ExitCodeSource, bool HadErrors,
     string Stdout, string Stderr, double? DurationMs, bool CaptureTruncated, int? LastNativeExitCode);
 
 internal sealed class WorkerProcess : IAsyncDisposable {
@@ -93,7 +93,7 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             stopped = await job.Stop();
             bool timeout = error is OperationCanceledException && stopped;
             return new WorkerResult(timeout ? "timed_out" : "outcome_unknown", timeout ? "stopped" : null,
-                null, false, stdout.ToString(), stderr.ToString(), watch.Elapsed.TotalMilliseconds, true, null);
+                null, null, false, stdout.ToString(), stderr.ToString(), watch.Elapsed.TotalMilliseconds, true, null);
         }
     }
     public async ValueTask DisposeAsync() {

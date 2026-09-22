@@ -140,7 +140,7 @@ def test_validation_does_not_echo_secrets_or_accept_key_rebinding():
     secret = "dummy-secret-must-not-appear"
     invalid = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": secret})
     assert invalid.status_code == 422 and secret not in invalid.text
-    oversized = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": secret * 100})
+    oversized = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": secret * 100_000})
     assert oversized.status_code == 413 and secret not in oversized.text
     key, public = endpoint_key()
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
