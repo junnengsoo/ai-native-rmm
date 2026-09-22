@@ -29,7 +29,7 @@ class FakeControlPlane:
         self.close_ok = close_ok
         self.close_raises = False
         self.submitted = []
-        self.events_seen = []
+        self.waits = []
         self.pages = []
 
     async def open_session(self, device_id, *, timeout_seconds):
@@ -53,22 +53,14 @@ class FakeControlPlane:
         self.submitted.append((script, timeout_ms))
         return {"execution_id": "exec-1", "status": "queued"}
 
-    async def output_events(self, execution_id, stream, *, after, wait_ms, timeout_seconds):
+    async def wait_execution(self, execution_id, timeout_seconds):
         assert execution_id == "exec-1"
-        self.events_seen.append((stream, after, wait_ms))
-        if stream == "stdout" and after == "0":
-            return {
-                "events": [{"cursor": "1", "text": "event text", "byte_count": 10, "created_at": "now"}],
-                "next_cursor": "1",
-                "terminal": True,
-                "more_available": False,
-            }
-        return {"events": [], "next_cursor": after, "terminal": True, "more_available": False}
-
-    async def get_execution(self, execution_id, *, timeout_seconds):
-        assert execution_id == "exec-1"
+        self.waits.append(timeout_seconds)
         return {
+            "execution_id": "exec-1",
             "status": "completed",
+            "terminal": True,
+            "wait_timed_out": False,
             "invocation_outcome": "completed_normally",
             "exit_code": 0,
             "duration_ms": 42.0,
@@ -133,7 +125,7 @@ def test_invalid_target_or_port_never_builds_script():
         build_script("tcp_port", "server", 0)
 
 
-def test_run_diagnostic_uses_public_api_long_poll_pages_with_continuation_and_tracks_timing_outside_tool_output():
+def test_run_diagnostic_uses_terminal_wait_pages_with_continuation_and_tracks_timing_outside_tool_output():
     progress = []
     control_plane = FakeControlPlane()
     ctx = DiagnosticContext(control_plane, "session-1", 9999999999.0, 2, progress_callback=progress.append)
@@ -141,6 +133,7 @@ def test_run_diagnostic_uses_public_api_long_poll_pages_with_continuation_and_tr
     output = asyncio.run(_run_diagnostic(ctx, "tcp_port", 5000))
 
     assert output["execution_id"] == "exec-1"
+    assert output["terminal"] is True
     assert output["stdout"]["text"] == "TcpTestSucceeded: False\n"
     assert output["stdout_more_available"] is True
     assert [page["after"] for page in output["stdout_pages"]] == ["0", "2"]
@@ -150,7 +143,8 @@ def test_run_diagnostic_uses_public_api_long_poll_pages_with_continuation_and_tr
     assert [step.tool for step in ctx.steps] == ["run_diagnostic:tcp_port", "output_page:stdout", "output_page:stdout"]
     assert ctx.steps[0].execution_ms == 42.0
     assert ctx.diagnostics_run == 1
-    assert progress[0]["text"]["text"] == "event text"
+    assert control_plane.waits
+    assert progress == []
 
 
 def test_real_agents_sdk_function_tool_invokes_bound_context_and_schema():
@@ -352,8 +346,8 @@ def test_control_plane_client_authenticates_public_api_without_openai_key():
         if request.url.path.endswith("/executions"):
             assert request.headers["Idempotency-Key"].startswith("openai-driver-")
             return httpx.Response(202, json={"execution_id": "exec-1", "status": "queued"})
-        if request.url.path == "/executions/exec-1/output/stdout/events":
-            return httpx.Response(200, json={"events": [], "next_cursor": "0", "terminal": True})
+        if request.url.path == "/executions/exec-1/wait":
+            return httpx.Response(200, json={"execution_id": "exec-1", "status": "completed", "terminal": True, "wait_timed_out": False})
         if request.url.path == "/executions/exec-1/output/stdout":
             assert request.url.params["limit_bytes"] == str(DEFAULT_PAGE_LIMIT_BYTES)
             return httpx.Response(200, json={
@@ -373,7 +367,7 @@ def test_control_plane_client_authenticates_public_api_without_openai_key():
     )
 
     assert asyncio.run(client.submit_execution("session-1", "Get-Date", 1000, timeout_seconds=1))["execution_id"] == "exec-1"
-    assert asyncio.run(client.output_events("exec-1", "stdout", after="0", wait_ms=50, timeout_seconds=1))["terminal"] is True
+    assert asyncio.run(client.wait_execution("exec-1", 1))["terminal"] is True
     assert asyncio.run(client.output_page("exec-1", "stdout", "0", timeout_seconds=1))["text"] == "page"
     assert len(requests) == 3
 

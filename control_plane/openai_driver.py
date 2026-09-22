@@ -22,7 +22,6 @@ DEFAULT_MAX_STEPS = 5
 DEFAULT_MAX_SECONDS = 180
 DEFAULT_CLEANUP_SECONDS = 35
 DEFAULT_EXECUTION_TIMEOUT_MS = 20_000
-DEFAULT_LONG_POLL_MS = 2_000
 DEFAULT_PAGE_LIMIT_BYTES = 8_192
 DEFAULT_TARGET_HOST = "rmm-test-fileserver"
 DEFAULT_TARGET_PORT = 445
@@ -116,15 +115,12 @@ class ControlPlaneClient:
             timeout_seconds=timeout_seconds,
         )
 
-    async def get_execution(self, execution_id: str, *, timeout_seconds: float) -> dict[str, Any]:
-        return await self.request_json("GET", f"/executions/{execution_id}", timeout_seconds=timeout_seconds)
-
-    async def output_events(self, execution_id: str, stream: str, *, after: str, wait_ms: int, timeout_seconds: float) -> dict[str, Any]:
+    async def wait_execution(self, execution_id: str, timeout_seconds: float) -> dict[str, Any]:
         return await self.request_json(
             "GET",
-            f"/executions/{execution_id}/output/{stream}/events",
-            params={"after": after, "wait_ms": wait_ms, "limit": 8},
-            timeout_seconds=timeout_seconds,
+            f"/executions/{execution_id}/wait",
+            params={"timeout_seconds": max(0, min(timeout_seconds, 60))},
+            timeout_seconds=max(MIN_TIMEOUT_SECONDS, timeout_seconds + 1),
         )
 
     async def output_page(self, execution_id: str, stream: str, after: str, *, timeout_seconds: float) -> dict[str, Any]:
@@ -220,39 +216,18 @@ async def _run_diagnostic(ctx: DiagnosticContext, operation: str, timeout_ms: in
     started = time.perf_counter()
     submitted = await ctx.control_plane.submit_execution(ctx.session_id, script, selected_timeout, timeout_seconds=remaining_seconds(ctx))
     execution_id = submitted["execution_id"]
-    cursors = {"stdout": "0", "stderr": "0"}
-    terminal = False
-    drained = {"stdout": False, "stderr": False}
-    while not (terminal and all(drained.values())):
-        for stream in ("stdout", "stderr"):
-            wait_ms = min(DEFAULT_LONG_POLL_MS, max(1, int(remaining_seconds(ctx) * 1000)))
-            events = await ctx.control_plane.output_events(
-                execution_id, stream, after=cursors[stream], wait_ms=wait_ms,
-                timeout_seconds=remaining_seconds(ctx) + 0.5,
-            )
-            terminal = terminal or events["terminal"]
-            more = bool(events.get("more_available") or events.get("has_more"))
-            if events["events"]:
-                cursors[stream] = events["next_cursor"]
-                for event in events["events"]:
-                    if ctx.progress_callback:
-                        ctx.progress_callback({
-                            "execution_id": execution_id,
-                            "stream": stream,
-                            "cursor": event["cursor"],
-                            "text": bounded_text(event["text"]),
-                        })
-            drained[stream] = terminal and not more and not events["events"]
-    result = await ctx.control_plane.get_execution(execution_id, timeout_seconds=remaining_seconds(ctx))
+    result = await ctx.control_plane.wait_execution(execution_id, min(remaining_seconds(ctx), selected_timeout / 1000 + 15))
     api_ms = (time.perf_counter() - started) * 1000
-    stdout = result["output_preview"]["stdout"]
-    stderr = result["output_preview"]["stderr"]
+    stdout = result.get("output_preview", {}).get("stdout", {"text": "", "shortened": False})
+    stderr = result.get("output_preview", {}).get("stderr", {"text": "", "shortened": False})
     ctx.steps.append(StepTiming("run_diagnostic:" + operation, execution_id, api_ms, result.get("duration_ms"), result["status"]))
     ctx.diagnostics_run += 1
     output = {
         "execution_id": execution_id,
         "operation": operation,
         "status": result["status"],
+        "terminal": bool(result.get("terminal")),
+        "wait_timed_out": bool(result.get("wait_timed_out")),
         "invocation_outcome": result.get("invocation_outcome"),
         "exit_code": result.get("exit_code"),
         "stdout": bounded_text(stdout["text"]),

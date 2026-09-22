@@ -21,10 +21,11 @@ Run the driver tests without contacting OpenAI:
 The tests use a scripted local SDK `Model` with the real Agents SDK `Runner` and
 function-tool path, while faking the public control-plane and endpoint evidence.
 They cover dependent diagnostic calls, the single SDK tool surface, fixed
-read-only templates, invalid argument rejection, long-poll result collection,
-bounded retained-output page continuation, terminal-safe rendering of untrusted
-text, lifecycle-hook model timing, session close in the driver `finally` path,
-and operator authentication without OpenAI key leakage.
+read-only templates, invalid argument rejection, terminal-wait result collection,
+terminal-wait completion, bounded retained-output page continuation,
+terminal-safe rendering of untrusted text, lifecycle-hook model timing, session
+close in the driver `finally` path, and operator authentication without OpenAI
+key leakage.
 
 ## Optional paid Windows/OpenAI smoke
 
@@ -69,7 +70,8 @@ Expected behavior:
 - The SDK runner manages model turns and function-tool execution.
 - The model can choose only fixed read-only operations; target host and port are
   caller-bound.
-- The caller follows output through bounded long-poll events.
+- The caller waits for terminal execution state through
+  `GET /executions/{id}/wait`.
 - If a preview is shortened, the tool retrieves bounded retained pages using
   continuation cursors.
 - The final report proposes human fixes but performs no remediation.

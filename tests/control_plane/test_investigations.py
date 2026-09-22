@@ -170,11 +170,12 @@ class EndpointAgentSimulator:
 def wait_for_execution(operator, execution_id):
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        response = httpx.get(BASE + f"/executions/{execution_id}", headers=operator)
+        response = httpx.get(BASE + f"/executions/{execution_id}/wait", headers=operator,
+                             params={"timeout_seconds": 0.2}, timeout=1)
         assert response.status_code == 200
-        if response.json()["status"] not in ("queued", "running"):
-            return response.json()
-        time.sleep(0.05)
+        body = response.json()
+        if body["terminal"]:
+            return body
     raise AssertionError("execution did not finish")
 
 
@@ -227,7 +228,10 @@ def test_caller_can_cancel_running_execution():
         execution = submitted.json()["execution_id"]
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            running = httpx.get(BASE + f"/executions/{execution}", headers=operator).json()
+            running = httpx.get(
+                BASE + f"/executions/{execution}/wait",
+                headers=operator, params={"timeout_seconds": 0},
+            ).json()
             if running["status"] == "running":
                 break
             time.sleep(0.05)
@@ -269,7 +273,7 @@ def test_operator_runs_persistent_investigation_and_idempotent_retry_once():
         assert wait_for_execution(operator, first.json()["execution_id"])["caller_id"] == caller_id
         read = submit(operator, session, "$trialValue", "read-value")
         result = wait_for_execution(operator, read.json()["execution_id"])
-        assert result["stdout"] == "42" and result["exit_code"] == 0
+        assert result["output_preview"]["stdout"]["text"] == "42" and result["exit_code"] == 0
         assert result["exit_code_source"] == "normalized_invocation"
 
         marker = submit(operator, session, "MARK_ONCE", "marker-once")
@@ -285,10 +289,10 @@ def test_operator_runs_persistent_investigation_and_idempotent_retry_once():
         fresh = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
         assert fresh.status_code == 201 and fresh.json()["session_id"] != session
         fresh_read = submit(operator, fresh.json()["session_id"], "$trialValue", "fresh-read")
-        assert wait_for_execution(operator, fresh_read.json()["execution_id"])["stdout"] == "None"
+        assert wait_for_execution(operator, fresh_read.json()["execution_id"])["output_preview"]["stdout"]["text"] == "None"
 
 
-def test_execution_output_preview_pages_and_long_poll_are_bounded_and_scoped():
+def test_execution_output_preview_pages_and_terminal_wait_are_bounded_and_scoped():
     admin = bootstrap_admin()
     other_admin = bootstrap_admin()
     operator, _ = create_operator(admin)
@@ -302,41 +306,36 @@ def test_execution_output_preview_pages_and_long_poll_are_bounded_and_scoped():
         submitted = submit(operator, session, "PROGRESSIVE_OUTPUT", "progressive")
         assert submitted.status_code == 202
         execution = submitted.json()["execution_id"]
-        first_poll = httpx.get(
-            BASE + f"/executions/{execution}/output/stdout/events",
-            headers=operator, params={"after": "0", "wait_ms": 2000}, timeout=5,
+        early_wait = httpx.get(
+            BASE + f"/executions/{execution}/wait",
+            headers=operator, params={"timeout_seconds": 0.05}, timeout=1,
         )
-        assert first_poll.status_code == 200
-        first = first_poll.json()
-        assert first["events"][0]["text"] == "first\n"
-        assert first["next_cursor"] != "0"
-        assert first["gap"] == {"detected": False, "reason": None}
-        assert first["status"] in ("running", "completed")
-        assert first["terminal"] in (False, True)
-        assert first["high_water_cursor"] != "0"
-
-        resumed = httpx.get(
-            BASE + f"/executions/{execution}/output/stdout/events",
-            headers=operator, params={"after": first["next_cursor"], "wait_ms": 2000},
-        )
-        assert resumed.status_code == 200
-        assert resumed.json()["events"][0]["text"] == "snowman ☃\n"
-        assert resumed.json()["unicode"] == {
-            "encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "cursored event text",
-        }
+        assert early_wait.status_code == 200
+        assert early_wait.json()["terminal"] is False
+        assert early_wait.json()["wait_timed_out"] is True
 
         result = wait_for_execution(operator, execution)
         assert result["output_preview"]["stdout"]["text"] == "first\nsnowman ☃\n"
         assert result["output_preview"]["stdout"]["shortened"] is False
         assert result["capture"]["loss_detected"] is False
-        assert result["stdout"] == result["output_preview"]["stdout"]["text"]
-        assert result["stderr"] == result["output_preview"]["stderr"]["text"] == "{\"type\":\"result\"}\n"
+        assert result["terminal"] is True and result["wait_timed_out"] is False
+        assert "stdout" not in result and "stderr" not in result
+        assert result["output_preview"]["stderr"]["text"] == "{\"type\":\"result\"}\n"
 
-        stderr_events = httpx.get(
-            BASE + f"/executions/{execution}/output/stderr/events",
-            headers=operator, params={"after": "0"},
-        ).json()["events"]
-        assert stderr_events[0]["text"] == "{\"type\":\"result\"}\n"
+        stdout_page = httpx.get(
+            BASE + f"/executions/{execution}/output/stdout",
+            headers=operator, params={"after": "0", "limit_bytes": 65536},
+        ).json()
+        assert stdout_page["text"] == "first\nsnowman ☃\n"
+        assert stdout_page["gap"] == {"detected": False, "reason": None}
+        assert stdout_page["unicode"] == {
+            "encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "cursored event text",
+        }
+        stderr_page = httpx.get(
+            BASE + f"/executions/{execution}/output/stderr",
+            headers=operator, params={"after": "0", "limit_bytes": 65536},
+        ).json()
+        assert stderr_page["text"] == "{\"type\":\"result\"}\n"
 
         long = submit(operator, session, "LONG_OUTPUT", "long-output")
         assert long.status_code == 202
@@ -389,29 +388,55 @@ def test_execution_output_preview_pages_and_long_poll_are_bounded_and_scoped():
         assert meg_result["output_preview"]["stdout"]["shortened"] is True
         assert meg_result["capture"]["loss_detected"] is False
         after_meg = httpx.get(
-            BASE + f"/executions/{meg_id}/output/stdout/events",
-            headers=operator, params={"after": "128", "limit": 1},
+            BASE + f"/executions/{meg_id}/output/stdout",
+            headers=operator, params={"after": "128", "limit_bytes": 8192},
         ).json()
-        assert after_meg["events"][0]["text"] == "tail-after-meg"
+        assert after_meg["text"] == "tail-after-meg"
         assert after_meg["gap"]["detected"] is False
 
         assert httpx.get(BASE + f"/executions/{execution}/output/stdout", headers=other_operator).status_code == 404
-        denied = httpx.get(BASE + f"/executions/{execution}/output/stdout/events", headers=other_operator)
-        assert denied.status_code == 404
+        assert httpx.get(BASE + f"/executions/{execution}/wait", headers=other_operator).status_code == 404
 
         empty = submit(operator, session, "EMPTY_OUTPUT", "empty-output")
         assert empty.status_code == 202
         empty_id = empty.json()["execution_id"]
         assert wait_for_execution(operator, empty_id)["output_preview"]["stdout"]["text"] == ""
-        empty_poll = httpx.get(
-            BASE + f"/executions/{empty_id}/output/stdout/events",
-            headers=operator, params={"after": "0", "wait_ms": 50},
+        empty_page = httpx.get(
+            BASE + f"/executions/{empty_id}/output/stdout",
+            headers=operator, params={"after": "0"},
         ).json()
-        assert empty_poll["events"] == []
-        assert empty_poll["status"] == "completed"
-        assert empty_poll["terminal"] is True
-        assert empty_poll["no_change"] is True
-        assert empty_poll["timed_out"] is False
+        assert empty_page["text"] == ""
+        assert empty_page["more_available"] is False
+
+        hanging = submit(operator, session, "WAIT_FOR_CANCEL", "wait-timeout")
+        assert hanging.status_code == 202
+        hanging_id = hanging.json()["execution_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            snapshot = httpx.get(
+                BASE + f"/executions/{hanging_id}/wait",
+                headers=operator, params={"timeout_seconds": 0},
+            ).json()
+            if snapshot["status"] == "running":
+                break
+            time.sleep(0.05)
+        wait_timeout = httpx.get(
+            BASE + f"/executions/{hanging_id}/wait",
+            headers=operator, params={"timeout_seconds": 0.05}, timeout=1,
+        ).json()
+        assert wait_timeout == {
+            "execution_id": hanging_id,
+            "status": "running",
+            "terminal": False,
+            "wait_timed_out": True,
+        }
+        still_running = httpx.get(
+            BASE + f"/executions/{hanging_id}/wait",
+            headers=operator, params={"timeout_seconds": 0},
+        ).json()
+        assert still_running["status"] == "running"
+        assert httpx.post(BASE + f"/executions/{hanging_id}/cancel", headers=operator).status_code == 202
+        assert wait_for_execution(operator, hanging_id)["status"] == "cancelled"
 
 
 def test_operator_cannot_admin_and_resources_are_workspace_scoped():

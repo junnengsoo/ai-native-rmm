@@ -21,8 +21,7 @@ from .database import (
     approve_pairing, authenticate_credential, authenticate_device, begin_session_close,
     append_execution_output,
     claim_execution, create_caller, create_or_get_execution, create_starting_session,
-    digest, fail_device_investigations, finish_execution, get_execution_output_events,
-    get_execution_output_high_water,
+    digest, fail_device_investigations, finish_execution,
     get_execution_output_page, get_execution_output_preview, get_workspace_execution, get_workspace_session, increment_rate_limit,
     initialize, list_workspace_devices, mark_execution_failed_to_start, mark_execution_unknown,
     mark_queued_execution_cancelled, mark_session_cleanup_unknown, mark_session_closed,
@@ -42,7 +41,7 @@ async def lifespan(app):
 
 
 app = FastAPI(title="RMM investigation control plane", lifespan=lifespan)
-output_waiters: dict[tuple[str, str], asyncio.Condition] = {}
+terminal_waiters: dict[str, asyncio.Condition] = {}
 
 MAX_RUNTIME_MS = 3_600_000
 CLEANUP_GRACE_SECONDS = 30
@@ -246,8 +245,8 @@ def execution_view(row):
             "outcome_reason": row["outcome_reason"],
             "last_confirmed_status": row["last_confirmed_status"],
             "exit_code": row["exit_code"], "exit_code_source": row["exit_code_source"],
-            "had_errors": row["had_errors"], "stdout": stdout_preview["text"], "stderr": stderr_preview["text"],
-            "duration_ms": row["duration_ms"], "capture_truncated": row["capture_truncated"],
+            "had_errors": row["had_errors"], "duration_ms": row["duration_ms"],
+            "capture_truncated": row["capture_truncated"],
             "capture": {"loss_detected": capture_lost, "reason": "retention_limit" if capture_lost else None},
             "output_preview": {
                 "stdout": {**stdout_preview, "capture_lost": capture_lost},
@@ -272,8 +271,8 @@ def unicode_contract():
     return {"encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "cursored event text"}
 
 
-async def notify_output(execution_id: uuid.UUID | str, stream: str) -> None:
-    condition = output_waiters.get((str(execution_id), stream))
+async def notify_terminal(execution_id: uuid.UUID | str) -> None:
+    condition = terminal_waiters.get(str(execution_id))
     if condition is not None:
         async with condition:
             condition.notify_all()
@@ -283,19 +282,30 @@ def execution_is_terminal(row) -> bool:
     return row["status"] not in {"queued", "running"}
 
 
-async def wait_for_output(execution_id: uuid.UUID, stream: str, after: int, wait_ms: int) -> bool:
-    if wait_ms <= 0:
-        return True
-    key = (str(execution_id), stream)
-    condition = output_waiters.setdefault(key, asyncio.Condition())
+async def wait_for_terminal(workspace_id: uuid.UUID, execution_id: uuid.UUID, timeout_seconds: float) -> tuple[dict, bool]:
+    row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
+    if row is None:
+        raise HTTPException(404, "execution_not_found")
+    if execution_is_terminal(row) or timeout_seconds <= 0:
+        return row, False
+    condition = terminal_waiters.setdefault(str(execution_id), asyncio.Condition())
     async with condition:
-        if await asyncio.to_thread(lambda: bool(get_execution_output_events(execution_id, stream, after, 1))):
-            return False
+        row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
+        if row is None:
+            raise HTTPException(404, "execution_not_found")
+        if execution_is_terminal(row):
+            return row, False
         try:
-            await asyncio.wait_for(condition.wait(), wait_ms / 1000)
-            return False
+            await asyncio.wait_for(condition.wait(), timeout_seconds)
         except (TimeoutError, asyncio.TimeoutError):
-            return True
+            row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
+            if row is None:
+                raise HTTPException(404, "execution_not_found")
+            return row, not execution_is_terminal(row)
+    row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
+    if row is None:
+        raise HTTPException(404, "execution_not_found")
+    return row, False
 
 
 @app.post("/sessions", status_code=201)
@@ -356,13 +366,11 @@ async def dispatch_execution(execution_id: uuid.UUID, channel, device_id: str) -
         if any(evidence.get(key) != value for key, value in expected.items()):
             raise ValueError("mismatched_result_binding")
         await asyncio.to_thread(finish_execution, execution_id, evidence)
-        await notify_output(execution_id, "stdout")
-        await notify_output(execution_id, "stderr")
+        await notify_terminal(execution_id)
     except Exception:
         await asyncio.to_thread(mark_execution_unknown, execution_id,
                                 "dispatch_confirmation_lost", last_confirmed_status)
-        await notify_output(execution_id, "stdout")
-        await notify_output(execution_id, "stderr")
+        await notify_terminal(execution_id)
 
 
 @app.post("/sessions/{session_id}/executions", status_code=202)
@@ -392,19 +400,24 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
             await asyncio.to_thread(mark_execution_failed_to_start, row["id"],
                                     "device_offline_before_dispatch")
             row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], row["id"])
+            await notify_terminal(row["id"])
         else:
             asyncio.create_task(dispatch_execution(row["id"], channel, str(session["device_id"])))
     return {"execution_id": str(row["id"]), "status": row["status"],
             "script_sha256": row["script_sha256"]}
 
 
-@app.get("/executions/{execution_id}")
-async def get_execution(execution_id: uuid.UUID, authorization: str | None = Header(default=None)):
+@app.get("/executions/{execution_id}/wait")
+async def wait_execution_terminal(execution_id: uuid.UUID,
+                                  authorization: str | None = Header(default=None),
+                                  timeout_seconds: float = Query(default=20.0, ge=0, le=60)):
     caller = authenticated_caller(authorization, "operator")
-    row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
-    if row is None:
-        raise HTTPException(404, "execution_not_found")
-    return await asyncio.to_thread(execution_view, row)
+    row, wait_timed_out = await wait_for_terminal(caller["workspace_id"], execution_id, timeout_seconds)
+    terminal = execution_is_terminal(row)
+    if terminal:
+        return {**execution_view(row), "terminal": True, "wait_timed_out": False}
+    return {"execution_id": str(row["id"]), "status": row["status"],
+            "terminal": False, "wait_timed_out": wait_timed_out}
 
 
 @app.get("/executions/{execution_id}/output/{stream}")
@@ -425,56 +438,12 @@ async def get_execution_output(execution_id: uuid.UUID, stream: str,
             "capture_lost": capture_lost, "gap": output_gap(), "unicode": unicode_contract()}
 
 
-@app.get("/executions/{execution_id}/output/{stream}/events")
-async def long_poll_execution_output(execution_id: uuid.UUID, stream: str,
-                                     authorization: str | None = Header(default=None),
-                                     after: str = "0",
-                                     wait_ms: int = Query(default=0, ge=0, le=30000),
-                                     limit: int = Query(default=8, ge=1, le=8)):
-    if stream not in {"stdout", "stderr"}:
-        raise HTTPException(404, "stream_not_found")
-    caller = authenticated_caller(authorization, "operator")
-    row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
-    if row is None:
-        raise HTTPException(404, "execution_not_found")
-    cursor = parse_output_cursor(after)
-    timed_out = False
-    if (not await asyncio.to_thread(lambda: bool(get_execution_output_events(execution_id, stream, cursor, 1)))
-            and not execution_is_terminal(row)):
-        timed_out = await wait_for_output(execution_id, stream, cursor, wait_ms)
-        row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
-    rows = await asyncio.to_thread(get_execution_output_events, execution_id, stream, cursor, limit + 1)
-    visible = rows[:limit]
-    next_cursor = str(visible[-1]["sequence"]) if visible else after
-    high_water = await asyncio.to_thread(get_execution_output_high_water, execution_id, stream)
-    terminal = execution_is_terminal(row)
-    return {
-        "events": [{"cursor": str(event["sequence"]), "text": event["text"],
-                    "byte_count": event["byte_count"], "created_at": event["created_at"]}
-                   for event in visible],
-        "next_cursor": next_cursor,
-        "high_water_cursor": str(high_water),
-        "more_available": len(rows) > limit,
-        "has_more": len(rows) > limit,
-        "status": row["status"],
-        "terminal": terminal,
-        "timed_out": timed_out and not visible and not terminal,
-        "no_change": not visible,
-        "terminal_metadata": {
-            "status": row["status"], "finished_at": row["finished_at"],
-            "capture_lost": bool(row["capture_truncated"]),
-            "loss_reason": "retention_limit" if row["capture_truncated"] else None,
-        },
-        "gap": output_gap(),
-        "unicode": unicode_contract(),
-    }
-
-
 @app.post("/executions/{execution_id}/cancel", status_code=202)
 async def cancel_execution(execution_id: uuid.UUID, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
     cancelled = await asyncio.to_thread(mark_queued_execution_cancelled, caller["workspace_id"], execution_id)
     if cancelled is not None:
+        await notify_terminal(execution_id)
         return execution_view(cancelled)
     row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
     if row is None:
@@ -488,6 +457,7 @@ async def cancel_execution(execution_id: uuid.UUID, authorization: str | None = 
     if channel is None:
         await asyncio.to_thread(mark_execution_unknown, execution_id,
                                 "cancel_confirmation_lost", "running")
+        await notify_terminal(execution_id)
     else:
         try:
             await channel.send({"type": "cancel_execution", "deviceId": str(session["device_id"]),
@@ -495,6 +465,7 @@ async def cancel_execution(execution_id: uuid.UUID, authorization: str | None = 
         except Exception:
             await asyncio.to_thread(mark_execution_unknown, execution_id,
                                     "cancel_confirmation_lost", "running")
+            await notify_terminal(execution_id)
     return execution_view(await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id))
 
 
@@ -561,7 +532,6 @@ async def endpoint_agent(socket: WebSocket):
                             uuid.UUID(message["deviceId"]))
                     except Exception as error:
                         raise ValueError() from error
-                    await notify_output(message["executionId"], message["stream"])
                     continue
                 if not channel.deliver(message):
                     if message["type"] == "session_closed":
