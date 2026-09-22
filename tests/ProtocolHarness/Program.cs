@@ -47,7 +47,7 @@ try {
     string device = hello.GetProperty("deviceId").GetString()!;
     Require(device == "test-device" && hello.GetProperty("protocolVersion").GetInt32() == 1, "certificate peer is bound to the expected device and version");
     string session = Guid.NewGuid().ToString();
-    await Send(socket, new { type = "open_session", deviceId = device, sessionId = session });
+    await Send(socket, OpenSession(device, session));
     Require((await Receive(socket)).GetProperty("type").GetString() == "session_ready", "real worker ready");
     var result = await Execute("'hello from Windows'", 5000);
     Require(result.GetProperty("state").GetString() == "completed"
@@ -110,6 +110,9 @@ try {
     await Rejected(malformed, "unknown field");
     malformed = Request("'must-not-run'"); malformed["timeoutMs"] = 0;
     await Rejected(malformed, "unbounded or invalid timeout");
+    var stale = Request("'must-not-run'");
+    stale["startDeadlineUnixMs"] = DateTimeOffset.UtcNow.AddSeconds(-1).ToUnixTimeMilliseconds();
+    await Rejected(stale, "stale dispatch after start deadline");
     await socket.SendAsync(Encoding.UTF8.GetBytes("{broken json"), WebSocketMessageType.Text, true, CancellationToken.None);
     Require((await Receive(socket)).GetProperty("type").GetString() == "rejected", "malformed JSON is rejected safely");
     string duplicateId = Guid.NewGuid().ToString();
@@ -138,7 +141,8 @@ try {
     Dictionary<string, object> Request(string script) => new() {
         ["type"] = "execute", ["deviceId"] = device, ["sessionId"] = session,
         ["executionId"] = Guid.NewGuid().ToString(), ["script"] = script,
-        ["scriptSha256"] = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), ["timeoutMs"] = 5000
+        ["scriptSha256"] = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), ["timeoutMs"] = 5000,
+        ["startDeadlineUnixMs"] = DateTimeOffset.UtcNow.AddSeconds(60).ToUnixTimeMilliseconds()
     };
     async Task Rejected(object request, string description) {
         await Send(socket, request);
@@ -150,7 +154,7 @@ try {
         await Send(socket, new { type = "close_session", deviceId = device, sessionId = session });
         Require((await Receive(socket)).GetProperty("type").GetString() == "session_closed", "old worker cleanup acknowledged");
         session = Guid.NewGuid().ToString();
-        await Send(socket, new { type = "open_session", deviceId = device, sessionId = session });
+        await Send(socket, OpenSession(device, session));
         Require((await Receive(socket)).GetProperty("type").GetString() == "session_ready", "replacement worker ready");
     }
 
@@ -190,6 +194,11 @@ Process StartAgent(string thumbprint, string? pin = null) => Process.Start(new P
     Environment = { ["RMM_TEST_SECRET"] = "isolated-dummy-secret" },
     ArgumentList = { args[0], "--agent", "wss://localhost:18443/agent", thumbprint, pin ?? Convert.ToHexString(SHA256.HashData(serverCert.RawData)), "test-device" }
 })!;
+static object OpenSession(string device, string session) => new {
+    type = "open_session", deviceId = device, sessionId = session,
+    idleTimeoutMs = 1800000,
+    absoluteDeadlineUnixMs = DateTimeOffset.UtcNow.AddHours(8).ToUnixTimeMilliseconds()
+};
 static X509Certificate2 Certificate(string thumbprint) {
     using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
     store.Open(OpenFlags.ReadOnly);

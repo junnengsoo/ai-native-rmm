@@ -54,12 +54,11 @@ internal static class EnrollmentScenario {
                         return;
                     }
                     string session = Guid.NewGuid().ToString();
-                    await Send(socket, new { type = "open_session", deviceId = device, sessionId = session });
+                    await Send(socket, OpenSession(device, session));
                     Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "session_ready", "enrolled worker ready");
                     string execution = Guid.NewGuid().ToString();
                     string script = "$global:enrolledValue=41; 'enrolled execution'";
-                    await Send(socket, new { type = "execute", deviceId = device, sessionId = session, executionId = execution,
-                        script, scriptSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), timeoutMs = 5000 });
+                    await Send(socket, ExecuteRequest(device, session, execution, script, 5000));
                     var running = await ReceiveDispatch(socket);
                     Require(running.GetProperty("type").GetString() == "running"
                         && running.GetProperty("executionId").GetString() == execution, "enrolled correlated running");
@@ -69,20 +68,17 @@ internal static class EnrollmentScenario {
                         && result.GetProperty("stdout").GetString()!.Contains("enrolled execution"), "enrolled structured result");
                     string second = Guid.NewGuid().ToString();
                     script = "$global:enrolledValue + 1";
-                    await Send(socket, new { type = "execute", deviceId = device, sessionId = session, executionId = second,
-                        script, scriptSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), timeoutMs = 5000 });
+                    await Send(socket, ExecuteRequest(device, session, second, script, 5000));
                     Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "running", "second invocation running");
                     result = await ReceiveDispatch(socket);
                     Require(result.GetProperty("stdout").GetString()!.Trim() == "42", "enrolled session state persists");
                     string slow = Guid.NewGuid().ToString();
                     script = "Start-Sleep -Seconds 2; 'finished'";
-                    await Send(socket, new { type = "execute", deviceId = device, sessionId = session, executionId = slow,
-                        script, scriptSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), timeoutMs = 5000 });
+                    await Send(socket, ExecuteRequest(device, session, slow, script, 5000));
                     Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "running", "slow invocation running");
                     string busy = Guid.NewGuid().ToString();
                     script = "'must-not-run-while-busy'";
-                    await Send(socket, new { type = "execute", deviceId = device, sessionId = session, executionId = busy,
-                        script, scriptSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), timeoutMs = 5000 });
+                    await Send(socket, ExecuteRequest(device, session, busy, script, 5000));
                     Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "rejected", "concurrent invocation rejected");
                     Require((await ReceiveDispatch(socket)).GetProperty("executionId").GetString() == slow, "original invocation completes once");
                     await Send(socket, new { type = "close_session", deviceId = device, sessionId = session });
@@ -131,6 +127,16 @@ internal static class EnrollmentScenario {
     private static void Require(bool condition, string description) {
         if (!condition) throw new InvalidOperationException(description);
     }
+    private static object OpenSession(string device, string session) => new {
+        type = "open_session", deviceId = device, sessionId = session,
+        idleTimeoutMs = 1800000,
+        absoluteDeadlineUnixMs = DateTimeOffset.UtcNow.AddHours(8).ToUnixTimeMilliseconds()
+    };
+    private static object ExecuteRequest(string device, string session, string execution, string script, int timeoutMs) => new {
+        type = "execute", deviceId = device, sessionId = session, executionId = execution,
+        script, scriptSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))),
+        timeoutMs, startDeadlineUnixMs = DateTimeOffset.UtcNow.AddSeconds(60).ToUnixTimeMilliseconds()
+    };
     private static Task Send(WebSocket socket, object value) => socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(value), WebSocketMessageType.Text, true, CancellationToken.None);
     private static async Task<JsonElement> Receive(WebSocket socket) {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));

@@ -122,13 +122,13 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         opened.raise_for_status()
         session = opened.json()["session_id"]
 
-        def execute(script, idempotency_key):
+        def execute(script, idempotency_key, timeout_ms=5000, wait_seconds=20):
             submitted = httpx.post(BASE + f"/sessions/{session}/executions", headers={
                 **operator, "Idempotency-Key": idempotency_key,
-            }, json={"script": script, "timeout_ms": 5000})
+            }, json={"script": script, "timeout_ms": timeout_ms})
             submitted.raise_for_status()
             execution = submitted.json()["execution_id"]
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
                 result = httpx.get(BASE + f"/executions/{execution}", headers=operator)
                 result.raise_for_status()
@@ -149,11 +149,18 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         }, json={"script": marker_script, "timeout_ms": 5000})
         assert retry.status_code == 202 and retry.json()["execution_id"] == first_submit.json()["execution_id"]
         assert marker_result["stdout"].strip() == "1"
+        child_script = "$p=Start-Process -FilePath $env:ComSpec -ArgumentList '/c ping -n 60 127.0.0.1 > nul' -PassThru; $p.Id; Start-Sleep -Seconds 20"
+        _, timeout_result = execute(child_script, "timeout-child", timeout_ms=500, wait_seconds=30)
+        assert timeout_result["status"] == "timed_out"
+        assert timeout_result["invocation_outcome"] == "stopped"
+        child_id = int(timeout_result["stdout"].strip().splitlines()[0])
         closed = httpx.post(BASE + f"/sessions/{session}/close", headers=operator, timeout=30)
         assert closed.status_code == 200 and closed.json()["status"] == "closed"
         fresh = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device}, timeout=30)
         fresh.raise_for_status()
         session = fresh.json()["session_id"]
+        _, child_cleanup = execute(f"$null -eq (Get-Process -Id {child_id} -ErrorAction SilentlyContinue)", "timeout-child-cleanup")
+        assert child_cleanup["stdout"].strip().lower() == "true"
         _, fresh_result = execute("$null -eq $global:trialValue", "fresh-variable")
         assert fresh_result["stdout"].strip().lower() == "true"
         assert httpx.post(BASE + f"/sessions/{session}/close", headers=operator, timeout=30).status_code == 200
@@ -161,6 +168,9 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         time.sleep(17)
         row = enrolled_device()
         assert row["last_seen"] > first_seen
+        offline_session = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device}, timeout=30)
+        assert offline_session.status_code == 201
+        session = offline_session.json()["session_id"]
         windows(f"""
 $agentId=Get-Content '{root}\\pid.txt'
 $process=Get-CimInstance Win32_Process -Filter "ProcessId=$agentId"
@@ -168,6 +178,18 @@ if ($process.CommandLine -notlike '*{key_name}*') {{ throw 'unexpected_process' 
 Stop-Process -Id $agentId
 Write-Output 'RMM_DATA:stopped'
 """)
+        offline_submit = httpx.post(BASE + f"/sessions/{session}/executions", headers={
+            **operator, "Idempotency-Key": "offline-terminal",
+        }, json={"script": "'must-not-run'", "timeout_ms": 5000})
+        offline_submit.raise_for_status()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            offline_result = httpx.get(BASE + f"/executions/{offline_submit.json()['execution_id']}", headers=operator)
+            offline_result.raise_for_status()
+            if offline_result.json()["status"] == "outcome_unknown":
+                break
+            time.sleep(.2)
+        assert offline_result.json()["outcome_reason"] == "device_offline_before_dispatch"
         time.sleep(46)
         assert enrolled_device()["reachability"] == "stale"
         start()

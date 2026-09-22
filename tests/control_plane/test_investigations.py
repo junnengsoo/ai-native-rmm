@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -94,6 +95,8 @@ class EndpointAgentSimulator:
                     continue
                 common = {"deviceId": device, "sessionId": message["sessionId"]}
                 if message["type"] == "open_session":
+                    assert message["idleTimeoutMs"] <= 7200000
+                    assert message["absoluteDeadlineUnixMs"] > int(time.time() * 1000)
                     variable = None
                     socket.send(json.dumps({"type": "session_ready", **common}))
                 elif message["type"] == "close_session":
@@ -102,6 +105,7 @@ class EndpointAgentSimulator:
                 elif message["type"] == "execute":
                     execution = message["executionId"]
                     assert hashlib.sha256(message["script"].encode()).hexdigest() == message["scriptSha256"]
+                    assert message["startDeadlineUnixMs"] > int(time.time() * 1000)
                     socket.send(json.dumps({"type": "running", **common, "executionId": execution}))
                     if message["script"] == "$trialValue = 42":
                         variable, stdout = 42, ""
@@ -137,6 +141,48 @@ def submit(operator, session, script, key):
         BASE + f"/sessions/{session}/executions", headers={**operator, "Idempotency-Key": key},
         json={"script": script, "timeout_ms": 5000},
     )
+
+
+def test_deadline_defaults_and_offline_outcomes_are_truthful():
+    admin = bootstrap_admin()
+    operator, _ = create_operator(admin, "deadline-agent")
+    key, public, device = enroll(admin)
+    with EndpointAgentSimulator(key, public):
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
+        assert opened.status_code == 201
+        session = opened.json()
+        assert session["idle_timeout_ms"] == 1800000
+        remaining = datetime.fromisoformat(session["absolute_expires_at"]) - datetime.now(timezone.utc)
+        assert timedelta(hours=7, minutes=55) < remaining <= timedelta(hours=8, minutes=1)
+        submitted = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
+            **operator, "Idempotency-Key": "default-runtime",
+        }, json={"script": "'ok'"})
+        assert submitted.status_code == 202
+        result = wait_for_execution(operator, submitted.json()["execution_id"])
+        assert result["status"] == "completed"
+
+    offline = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
+        **operator, "Idempotency-Key": "offline",
+    }, json={"script": "'must-not-run'", "timeout_ms": 5000})
+    assert offline.status_code == 202
+    result = wait_for_execution(operator, offline.json()["execution_id"])
+    assert result["status"] == "outcome_unknown"
+    assert result["outcome_reason"] == "device_offline_before_dispatch"
+    assert result["last_confirmed_status"] == "queued"
+
+
+def test_close_without_endpoint_confirmation_blocks_replacement():
+    admin = bootstrap_admin()
+    operator, _ = create_operator(admin, "cleanup-agent")
+    key, public, device = enroll(admin)
+    with EndpointAgentSimulator(key, public):
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
+        assert opened.status_code == 201
+        session = opened.json()["session_id"]
+    closed = httpx.post(BASE + f"/sessions/{session}/close", headers=operator)
+    assert closed.status_code == 503
+    with EndpointAgentSimulator(key, public):
+        assert httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device}).status_code == 409
 
 
 def test_operator_runs_persistent_investigation_and_idempotent_retry_once():
