@@ -30,6 +30,12 @@ from .database import (
 from .reachability import classify_reachability
 
 
+class TerminalWaiter:
+    def __init__(self):
+        self.condition = asyncio.Condition()
+        self.ref_count = 0
+
+
 @asynccontextmanager
 async def lifespan(app):
     try:
@@ -41,7 +47,8 @@ async def lifespan(app):
 
 
 app = FastAPI(title="RMM investigation control plane", lifespan=lifespan)
-terminal_waiters: dict[str, asyncio.Condition] = {}
+terminal_waiters: dict[str, TerminalWaiter] = {}
+terminal_waiters_lock = asyncio.Lock()
 
 MAX_RUNTIME_MS = 3_600_000
 CLEANUP_GRACE_SECONDS = 30
@@ -272,10 +279,11 @@ def unicode_contract():
 
 
 async def notify_terminal(execution_id: uuid.UUID | str) -> None:
-    condition = terminal_waiters.get(str(execution_id))
-    if condition is not None:
-        async with condition:
-            condition.notify_all()
+    async with terminal_waiters_lock:
+        waiter = terminal_waiters.get(str(execution_id))
+    if waiter is not None:
+        async with waiter.condition:
+            waiter.condition.notify_all()
 
 
 def execution_is_terminal(row) -> bool:
@@ -288,24 +296,42 @@ async def wait_for_terminal(workspace_id: uuid.UUID, execution_id: uuid.UUID, ti
         raise HTTPException(404, "execution_not_found")
     if execution_is_terminal(row) or timeout_seconds <= 0:
         return row, False
-    condition = terminal_waiters.setdefault(str(execution_id), asyncio.Condition())
-    async with condition:
-        row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
-        if row is None:
-            raise HTTPException(404, "execution_not_found")
-        if execution_is_terminal(row):
-            return row, False
-        try:
-            await asyncio.wait_for(condition.wait(), timeout_seconds)
-        except (TimeoutError, asyncio.TimeoutError):
+    key = str(execution_id)
+    async with terminal_waiters_lock:
+        waiter = terminal_waiters.get(key)
+        if waiter is None:
+            waiter = TerminalWaiter()
+            terminal_waiters[key] = waiter
+        waiter.ref_count += 1
+    try:
+        async with waiter.condition:
             row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
             if row is None:
                 raise HTTPException(404, "execution_not_found")
-            return row, not execution_is_terminal(row)
-    row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
-    if row is None:
-        raise HTTPException(404, "execution_not_found")
-    return row, False
+            if execution_is_terminal(row):
+                return row, False
+            try:
+                await asyncio.wait_for(waiter.condition.wait(), timeout_seconds)
+            except (TimeoutError, asyncio.TimeoutError):
+                row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
+                if row is None:
+                    raise HTTPException(404, "execution_not_found")
+                return row, not execution_is_terminal(row)
+        row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
+        if row is None:
+            raise HTTPException(404, "execution_not_found")
+        return row, False
+    finally:
+        async with terminal_waiters_lock:
+            waiter.ref_count -= 1
+            if waiter.ref_count == 0 and terminal_waiters.get(key) is waiter:
+                del terminal_waiters[key]
+
+
+async def fail_device_investigations_and_notify(device_id: uuid.UUID | str) -> None:
+    execution_ids = await asyncio.to_thread(fail_device_investigations, device_id)
+    for execution_id in execution_ids:
+        await notify_terminal(execution_id)
 
 
 @app.post("/sessions", status_code=201)
@@ -541,7 +567,7 @@ async def endpoint_agent(socket: WebSocket):
                     continue
         finally:
             if await endpoint_agents.unregister(channel):
-                await asyncio.to_thread(fail_device_investigations, status["device_id"])
+                await fail_device_investigations_and_notify(status["device_id"])
     except (InvalidSignature, ValueError, TypeError, KeyError):
         with suppress(WebSocketDisconnect, RuntimeError):
             await socket.send_json({"state": "denied"})

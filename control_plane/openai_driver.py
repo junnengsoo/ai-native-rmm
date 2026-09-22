@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import json
 import os
-import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -22,8 +21,6 @@ DEFAULT_MAX_STEPS = 5
 DEFAULT_MAX_SECONDS = 180
 DEFAULT_CLEANUP_SECONDS = 35
 DEFAULT_PAGE_LIMIT_BYTES = 8_192
-DEFAULT_TARGET_HOST = "rmm-test-fileserver"
-DEFAULT_TARGET_PORT = 445
 MAX_MODEL_TEXT_BYTES = 8_192
 MAX_SCRIPT_BYTES = 32_768
 MIN_TIMEOUT_SECONDS = 0.1
@@ -61,9 +58,6 @@ class DiagnosticContext:
     session_id: str
     deadline: float
     max_steps: int
-    target_host: str = DEFAULT_TARGET_HOST
-    target_port: int = DEFAULT_TARGET_PORT
-    progress_callback: Callable[[dict[str, Any]], None] | None = None
     steps: list[StepTiming] = field(default_factory=list)
     scripts_submitted: int = 0
     owned_execution_ids: set[str] = field(default_factory=set)
@@ -160,14 +154,6 @@ def inert_text(text: Any) -> str:
         else:
             safe.append(character)
     return "".join(safe)
-
-
-def validate_target(target_host: str, target_port: int) -> None:
-    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"
-    if not 1 <= len(target_host) <= 253 or any(character not in allowed for character in target_host):
-        raise DriverError("invalid_target_host")
-    if isinstance(target_port, bool) or not 1 <= target_port <= 65535:
-        raise DriverError("invalid_target_port")
 
 
 def validate_script(script: str) -> str:
@@ -370,20 +356,16 @@ async def drive_diagnostic(
     max_steps: int = DEFAULT_MAX_STEPS,
     max_seconds: int | float = DEFAULT_MAX_SECONDS,
     cleanup_seconds: int = DEFAULT_CLEANUP_SECONDS,
-    target_host: str = DEFAULT_TARGET_HOST,
-    target_port: int = DEFAULT_TARGET_PORT,
-    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     runner: Callable[..., Any] = Runner.run,
 ) -> DiagnosticResult:
     if isinstance(max_steps, bool) or not 1 <= max_steps <= 20:
         raise DriverError("invalid_max_steps")
     if isinstance(max_seconds, bool) or not MIN_TIMEOUT_SECONDS <= float(max_seconds) <= 3_600:
         raise DriverError("invalid_max_seconds")
-    validate_target(target_host, target_port)
 
     deadline = time.perf_counter() + float(max_seconds)
     session_id = (await control_plane.open_session(device_id, timeout_seconds=max(MIN_TIMEOUT_SECONDS, max_seconds)))["session_id"]
-    ctx = DiagnosticContext(control_plane, session_id, deadline, max_steps, target_host, target_port, progress_callback)
+    ctx = DiagnosticContext(control_plane, session_id, deadline, max_steps)
     final_report = ""
     completed = False
     usage: dict[str, int] = {}
@@ -392,7 +374,6 @@ async def drive_diagnostic(
     try:
         prompt = (
             f"Problem: {problem}\n"
-            f"Caller-bound target: {target_host}:{target_port}\n"
             f"Budget: at most {max_steps} submitted PowerShell scripts and {max_seconds} seconds. "
             "Use submit_script, wait_for_execution, and read_output as needed. "
             "The control plane allows only one active script in this session: after submit_script, "
@@ -457,11 +438,6 @@ def render_result(result: DiagnosticResult) -> str:
     return "\n".join(lines)
 
 
-def stderr_progress(event: dict[str, Any]) -> None:
-    text = inert_text(event["text"]["text"]).replace("\n", "\\n")
-    print(f"progress execution={event['execution_id']} stream={event['stream']} cursor={event['cursor']} text={text}", file=sys.stderr)
-
-
 async def amain(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the caller-side OpenAI diagnostic driver.")
     parser.add_argument("problem")
@@ -470,8 +446,6 @@ async def amain(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL", DEFAULT_MODEL))
     parser.add_argument("--max-steps", type=int, default=int(os.environ.get("RMM_OPENAI_DRIVER_MAX_STEPS", DEFAULT_MAX_STEPS)))
     parser.add_argument("--max-seconds", type=int, default=int(os.environ.get("RMM_OPENAI_DRIVER_MAX_SECONDS", DEFAULT_MAX_SECONDS)))
-    parser.add_argument("--target-host", default=os.environ.get("RMM_TARGET_HOST", DEFAULT_TARGET_HOST))
-    parser.add_argument("--target-port", type=int, default=int(os.environ.get("RMM_TARGET_PORT", DEFAULT_TARGET_PORT)))
     args = parser.parse_args(argv)
     operator_key = os.environ.get("RMM_OPERATOR_KEY")
     if not operator_key or not args.device_id:
@@ -485,9 +459,6 @@ async def amain(argv: list[str] | None = None) -> int:
             model=args.model,
             max_steps=args.max_steps,
             max_seconds=args.max_seconds,
-            target_host=args.target_host,
-            target_port=args.target_port,
-            progress_callback=stderr_progress,
         )
         print(render_result(result))
         return 0 if result.closed and result.completed else 1

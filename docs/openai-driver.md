@@ -84,8 +84,7 @@ Expected behavior:
 - The SDK runner manages model turns and function-tool execution.
 - The model can author PowerShell, but the prompt policy allows only read-only
   diagnosis. This is not a sandbox; the endpoint currently runs as LocalSystem.
-- Target host and port are caller-bound in the prompt; session/device binding
-  and credentials are never exposed as model tools.
+- Session/device binding and credentials are never exposed as model tools.
 - The caller waits for terminal execution state through
   `GET /executions/{id}/wait`.
 - If a preview is shortened, the tool retrieves bounded retained pages using
