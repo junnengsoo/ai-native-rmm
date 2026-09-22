@@ -165,7 +165,7 @@ try {
         $powershell = [PowerShell]::Create()
         $powershell.Runspace = $runspace
         [RmmProtocol]::ResetTermination()
-        $wrappedScript = "try {`n" + $script + "`n} catch { [RmmProtocol]::MarkTermination(); throw }"
+        $wrappedScript = "try {`n" + $script + "`n} catch { [RmmProtocol]::MarkTermination(); Microsoft.PowerShell.Utility\Write-Error -ErrorRecord `$_ -ErrorAction Continue }"
         [void]$powershell.AddScript($wrappedScript, $false)
         $output = New-Object 'System.Management.Automation.PSDataCollection[System.Management.Automation.PSObject]'
         $pipelineInput = New-Object 'System.Management.Automation.PSDataCollection[System.Management.Automation.PSObject]'
