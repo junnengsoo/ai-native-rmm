@@ -13,9 +13,11 @@ The default model is `gpt-5-nano`, selected as the lowest-cost currently listed
 OpenAI text model for this smoke path. The driver uses a small default budget:
 five tool steps, three minutes wall-clock, 600 output tokens per model call, and
 20-second execution timeouts capped to the remaining wall-clock budget. Session
-closure uses a separate bounded 30-second cleanup allowance, with retry; an
-unconfirmed close is surfaced as command failure. These are deliberately
-conservative prototype defaults, not the unapproved 15-command/15-minute budget.
+closure uses one bounded close request with a separate 30-second cleanup
+allowance, because the current close API moves an active session into a closing
+state and is not idempotent after an unconfirmed cleanup. An unconfirmed close is
+surfaced as command failure. These are deliberately conservative prototype
+defaults, not the unapproved 15-command/15-minute budget.
 
 ## Local deterministic tests
 
@@ -28,9 +30,10 @@ The tests mock the OpenAI boundary and use fake or mocked control-plane calls:
 They cover adaptive tool sequencing, rejection of arbitrary or mutating tool
 requests, bounded output pages without skipped middle output, per-investigation
 execution/cursor restrictions, session closure on budget exhaustion, cleanup
-retry/failure reporting, local argument validation, separate timing records,
-OpenAI request shape, token usage collection, and the fact that control-plane
-calls authenticate with the operator credential rather than the OpenAI key.
+failure reporting, local argument validation, separate progress reporting,
+separate timing records, OpenAI request shape, token usage collection, and the
+fact that control-plane calls authenticate with the operator credential rather
+than the OpenAI key.
 
 ## Manual Windows/OpenAI smoke
 
@@ -87,8 +90,10 @@ Expected behavior:
 - The rendered output lists API round-trip time, endpoint execution duration,
   model latency before each tool step, total model latency, and token usage/cost
   when the API returns usage.
-- The session is closed even when a budget ends the investigation; closure retry
-  is bounded by `--cleanup-seconds`.
+- While commands are running, bounded output progress is emitted separately from
+  model context on stderr.
+- The session is closed even when a budget ends the investigation; the single
+  bounded close attempt is controlled by `--cleanup-seconds`.
 
 Restore the controlled fault afterward:
 

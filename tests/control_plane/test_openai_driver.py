@@ -11,10 +11,13 @@ from control_plane.openai_driver import (
     ModelReply,
     OpenAIResponsesClient,
     build_script,
+    DIAGNOSTIC_OPERATIONS,
     drive_diagnostic,
     parse_arguments,
     render_result,
     summarize_usage,
+    validate_port,
+    validate_timeout_ms,
 )
 
 
@@ -107,7 +110,7 @@ class FakeControlPlane:
         assert execution_id == "exec-1"
         assert stream in {"stdout", "stderr"}
         assert 1 <= wait_ms <= 2000
-        assert timeout_seconds <= wait_ms / 1000
+        assert timeout_seconds > wait_ms / 1000
         self.event_timeouts.append(timeout_seconds)
         return {
             "events": [{"cursor": "1", "text": "event", "byte_count": 5, "created_at": "now"}],
@@ -143,6 +146,25 @@ class FakeControlPlane:
         }
 
 
+class TimeoutOnceControlPlane(FakeControlPlane):
+    def __init__(self):
+        super().__init__()
+        self.timed_out_once = False
+
+    def output_events(self, execution_id, stream, *, after, wait_ms, timeout_seconds, limit=8):
+        if not self.timed_out_once:
+            self.timed_out_once = True
+            raise httpx.ReadTimeout("no change")
+        return super().output_events(
+            execution_id,
+            stream,
+            after=after,
+            wait_ms=wait_ms,
+            timeout_seconds=timeout_seconds,
+            limit=limit,
+        )
+
+
 def test_driver_runs_constrained_diagnostics_closes_session_and_keeps_timings_out_of_tool_context():
     model = FakeModel()
     control_plane = FakeControlPlane()
@@ -164,7 +186,7 @@ def test_driver_runs_constrained_diagnostics_closes_session_and_keeps_timings_ou
     assert "Test-NetConnection" in script
     assert "rmm-test-fileserver" in script
     assert timeout_ms == 5000
-    assert control_plane.pages == [("exec-1", "stdout", "0", 4096)]
+    assert control_plane.pages == [("exec-1", "stdout", "0", 8192)]
     assert [step.tool for step in result.steps] == ["run_diagnostic:tcp_port", "get_output_page"]
     assert result.steps[0].execution_ms == 42.0
     tool_output_message = model.inputs[1][-1]
@@ -173,12 +195,43 @@ def test_driver_runs_constrained_diagnostics_closes_session_and_keeps_timings_ou
     assert "model_ms_before_step" not in tool_output_message["output"]
 
 
+def test_transient_long_poll_timeout_reports_progress_and_continues_within_budget():
+    progress = []
+    control_plane = TimeoutOnceControlPlane()
+
+    result = drive_diagnostic(
+        problem="Diagnose file server access",
+        device_id="device-1",
+        model_client=FakeModel(),
+        control_plane=control_plane,
+        max_steps=1,
+        max_seconds=60,
+        progress_callback=progress.append,
+    )
+
+    assert result.closed is True
+    assert control_plane.timed_out_once is True
+    assert progress[0]["type"] == "long_poll_timeout"
+
+
 def test_build_script_only_uses_fixed_templates_and_quotes_target():
     script = build_script("dns_resolution", "file-server'01", 445)
 
     assert "Resolve-DnsName" in script
     assert "$TargetHost = 'file-server''01'" in script
     assert "Remove-Item" not in script
+
+
+def test_fixed_templates_include_expected_read_only_diagnostics_and_valid_gateway_pipeline_shape():
+    assert {"network_config", "default_gateway_ping", "dns_resolution", "target_ping", "tcp_port"} == set(DIAGNOSTIC_OPERATIONS)
+    gateway_script = build_script("default_gateway_ping", "unused", 445)
+    assert "@(foreach ($gateway in $gateways)" in gateway_script
+    assert "}) | ConvertTo-Json" in gateway_script
+    for operation in DIAGNOSTIC_OPERATIONS:
+        script = build_script(operation, "rmm-test-fileserver", 445)
+        assert "Remove-Item" not in script
+        assert "Set-" not in script
+        assert "New-" not in script
 
 
 def test_arbitrary_raw_powershell_tool_call_is_rejected_without_execution():
@@ -261,7 +314,10 @@ def test_output_page_is_restricted_to_known_execution_and_next_cursor():
     with pytest.raises(DriverError):
         tools.get_output_page(execution_id="other-exec", stream="stdout", after="0")
 
-    tools.executions["exec-1"] = {"page_cursors": {"stdout": "0", "stderr": "0"}}
+    tools.executions["exec-1"] = {
+        "page_cursors": {"stdout": "0", "stderr": "0"},
+        "page_allowed": {"stdout": True, "stderr": False},
+    }
     with pytest.raises(DriverError):
         tools.get_output_page(execution_id="exec-1", stream="stdout", after="999")
 
@@ -272,10 +328,25 @@ def test_output_page_is_restricted_to_known_execution_and_next_cursor():
         tools.get_output_page(execution_id="exec-1", stream="stdout", after="0")
 
 
+def test_output_page_requires_preview_or_prior_page_more_available():
+    control_plane = FakeControlPlane()
+    tools = DiagnosticTools(control_plane, "session-1", deadline_monotonic=time.perf_counter() + 60)
+    tools.executions["exec-1"] = {
+        "page_cursors": {"stdout": "0", "stderr": "0"},
+        "page_allowed": {"stdout": False, "stderr": False},
+    }
+
+    with pytest.raises(DriverError):
+        tools.get_output_page(execution_id="exec-1", stream="stdout", after="0")
+
+
 def test_page_larger_than_model_exposure_limit_is_rejected_to_avoid_skipped_middle_output():
     control_plane = FakeControlPlane(page_text="x" * 7000)
     tools = DiagnosticTools(control_plane, "session-1", deadline_monotonic=time.perf_counter() + 60)
-    tools.executions["exec-1"] = {"page_cursors": {"stdout": "0", "stderr": "0"}}
+    tools.executions["exec-1"] = {
+        "page_cursors": {"stdout": "0", "stderr": "0"},
+        "page_allowed": {"stdout": True, "stderr": False},
+    }
 
     with pytest.raises(DriverError):
         tools.get_output_page(execution_id="exec-1", stream="stdout", after="0")
@@ -322,11 +393,11 @@ def test_driver_caps_execution_timeout_and_api_waits_to_remaining_time_budget():
     assert all(timeout <= 1.1 for timeout in api_timeouts)
 
 
-def test_session_close_retries_within_cleanup_allowance_and_reports_failure():
+def test_session_close_uses_one_bounded_attempt_for_non_idempotent_api():
     model = FakeModel(outputs=[
         [{"type": "message", "content": [{"type": "output_text", "text": "No commands needed."}]}],
     ])
-    control_plane = FakeControlPlane(close_failures=2)
+    control_plane = FakeControlPlane(close_failures=1)
 
     result = drive_diagnostic(
         problem="Diagnose file server access",
@@ -338,9 +409,10 @@ def test_session_close_retries_within_cleanup_allowance_and_reports_failure():
         cleanup_seconds=2,
     )
 
-    assert result.closed is True
-    assert control_plane.close_attempts == 3
+    assert result.closed is False
+    assert control_plane.close_attempts == 1
     assert control_plane.close_timeouts[0] <= 2
+    assert "session closure was not confirmed" in result.final_report
 
 
 def test_unconfirmed_session_close_is_surfaced_as_command_failure():
@@ -362,6 +434,103 @@ def test_unconfirmed_session_close_is_surfaced_as_command_failure():
     assert result.closed is False
     assert "Command failure: session closure was not confirmed" in result.final_report
     assert result.close_error
+
+
+def test_cleanup_seconds_must_be_positive_and_bounded():
+    model = FakeModel(outputs=[
+        [{"type": "message", "content": [{"type": "output_text", "text": "No commands needed."}]}],
+    ])
+    control_plane = FakeControlPlane()
+
+    with pytest.raises(ValueError):
+        drive_diagnostic(
+            problem="Diagnose file server access",
+            device_id="device-1",
+            model_client=model,
+            control_plane=control_plane,
+            cleanup_seconds=0,
+        )
+    with pytest.raises(ValueError):
+        drive_diagnostic(
+            problem="Diagnose file server access",
+            device_id="device-1",
+            model_client=model,
+            control_plane=control_plane,
+            cleanup_seconds=61,
+        )
+
+
+def test_bool_port_and_timeout_are_rejected():
+    with pytest.raises(DriverError):
+        validate_port(True)
+    with pytest.raises(DriverError):
+        validate_timeout_ms(True)
+
+
+def test_late_model_final_reply_becomes_budget_exhaustion():
+    class SlowModel(FakeModel):
+        def create_response(self, input_items, *, timeout_seconds):
+            time.sleep(1.1)
+            return ModelReply(
+                output=[{"type": "message", "content": [{"type": "output_text", "text": "too late"}]}],
+                text="too late",
+                response_id="late",
+                usage=None,
+                latency_ms=1100,
+            )
+
+    result = drive_diagnostic(
+        problem="Diagnose file server access",
+        device_id="device-1",
+        model_client=SlowModel(),
+        control_plane=FakeControlPlane(),
+        max_steps=1,
+        max_seconds=1,
+    )
+
+    assert result.final_report == "Stopped because the configured diagnostic time budget was exhausted."
+
+
+def test_progress_callback_receives_bounded_output_outside_model_context():
+    progress = []
+    model = FakeModel()
+    control_plane = FakeControlPlane()
+
+    result = drive_diagnostic(
+        problem="Diagnose file server access",
+        device_id="device-1",
+        model_client=model,
+        control_plane=control_plane,
+        max_steps=1,
+        max_seconds=60,
+        progress_callback=progress.append,
+    )
+
+    assert result.closed is True
+    assert progress[0]["type"] == "output"
+    assert progress[0]["text"]["text"] == "event"
+    assert "event" not in model.inputs[1][-1]["output"]
+
+
+def test_model_failure_raises_structured_error_with_close_failure():
+    class FailingModel:
+        def create_response(self, input_items, *, timeout_seconds):
+            raise RuntimeError("model exploded")
+
+    with pytest.raises(DriverError) as caught:
+        drive_diagnostic(
+            problem="Diagnose file server access",
+            device_id="device-1",
+            model_client=FailingModel(),
+            control_plane=FakeControlPlane(close_failures=1),
+            max_steps=1,
+            max_seconds=60,
+            cleanup_seconds=1,
+        )
+
+    assert caught.value.code == "driver_failed"
+    assert caught.value.original_error == "RuntimeError"
+    assert caught.value.close_error
 
 
 def test_parse_arguments_raises_controlled_error_for_non_object():
@@ -400,7 +569,7 @@ def test_control_plane_client_authenticates_public_api_without_openai_key():
 
     assert client.submit_execution("session-1", "Get-Date", 1000, "idem-1", timeout_seconds=1)["execution_id"] == "exec-1"
     assert client.output_events("exec-1", "stdout", after="0", wait_ms=50, timeout_seconds=1)["terminal"] is True
-    assert client.output_page("exec-1", "stdout", "0", 4096, timeout_seconds=1)["text"] == "page"
+    assert client.output_page("exec-1", "stdout", "0", 8192, timeout_seconds=1)["text"] == "page"
     assert len(requests) == 3
 
 

@@ -14,6 +14,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from websockets.sync.client import connect
 
+from control_plane.openai_driver import DEFAULT_PAGE_LIMIT_BYTES
+
 
 BASE = os.environ.get("RMM_TEST_URL", "http://127.0.0.1:18080")
 
@@ -356,6 +358,17 @@ def test_execution_output_preview_pages_and_long_poll_are_bounded_and_scoped():
         assert body["has_more"] is True
         assert body["capture_lost"] is False
         assert "α" in body["text"]
+        driver_sized_page = httpx.get(
+            BASE + f"/executions/{long_id}/output/stdout",
+            headers=operator, params={"after": "0", "limit_bytes": DEFAULT_PAGE_LIMIT_BYTES},
+        )
+        assert driver_sized_page.status_code == 200
+        assert 8192 <= DEFAULT_PAGE_LIMIT_BYTES <= 65536
+        too_small_for_api = httpx.get(
+            BASE + f"/executions/{long_id}/output/stdout",
+            headers=operator, params={"after": "0", "limit_bytes": 4096},
+        )
+        assert too_small_for_api.status_code == 422
         invalid = httpx.get(
             BASE + f"/executions/{long_id}/output/stdout",
             headers=operator, params={"after": "not-a-cursor"},

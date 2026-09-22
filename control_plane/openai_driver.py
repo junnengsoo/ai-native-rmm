@@ -4,10 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import httpx
 
@@ -16,9 +17,11 @@ DEFAULT_MODEL = "gpt-5-nano"
 DEFAULT_MAX_STEPS = 5
 DEFAULT_MAX_SECONDS = 180
 DEFAULT_CLEANUP_SECONDS = 30
+MAX_CLEANUP_SECONDS = 60
 DEFAULT_EXECUTION_TIMEOUT_MS = 20_000
 DEFAULT_LONG_POLL_MS = 2_000
-DEFAULT_PAGE_LIMIT_BYTES = 4_096
+LONG_POLL_CLIENT_SLACK_MS = 500
+DEFAULT_PAGE_LIMIT_BYTES = 8_192
 DEFAULT_MAX_OUTPUT_CHARS = 6_000
 DEFAULT_MAX_OUTPUT_TOKENS = 600
 MIN_API_TIMEOUT_SECONDS = 0.1
@@ -38,12 +41,12 @@ $routes = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyConti
         "script": r"""
 $gateways = Get-NetIPConfiguration | ForEach-Object { $_.IPv4DefaultGateway.NextHop } |
     Where-Object { $_ } | Sort-Object -Unique
-foreach ($gateway in $gateways) {
+@(foreach ($gateway in $gateways) {
     [pscustomobject]@{
         Gateway = $gateway
         Reachable = Test-Connection -ComputerName $gateway -Count 2 -Quiet
     }
-} | ConvertTo-Json -Depth 3
+}) | ConvertTo-Json -Depth 3
 """.strip(),
     },
     "dns_resolution": {
@@ -130,7 +133,19 @@ proposed fixes for a human operator to apply."""
 
 
 class DriverError(Exception):
-    """Controlled tool error returned to the model instead of a traceback."""
+    """Structured driver failure suitable for CLI handling."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        close_error: str | None = None,
+        original_error: str | None = None,
+    ):
+        super().__init__(code)
+        self.code = code
+        self.close_error = close_error
+        self.original_error = original_error
 
 
 class ModelClient(Protocol):
@@ -204,14 +219,22 @@ def validate_target_host(value: Any) -> str:
 
 
 def validate_port(value: Any) -> int:
-    if not isinstance(value, int) or not 1 <= value <= 65535:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
         raise DriverError("invalid_port")
     return value
 
 
 def validate_timeout_ms(value: Any) -> int:
-    if not isinstance(value, int) or not 100 <= value <= 60000:
+    if isinstance(value, bool) or not isinstance(value, int) or not 100 <= value <= 60000:
         raise DriverError("invalid_timeout_ms")
+    return value
+
+
+def validate_positive_int(value: Any, code: str, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(code)
+    if maximum is not None and value > maximum:
+        raise ValueError(code)
     return value
 
 
@@ -393,15 +416,21 @@ class DiagnosticTools:
         session_id: str,
         *,
         deadline_monotonic: float,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
         long_poll_ms: int = DEFAULT_LONG_POLL_MS,
         page_limit_bytes: int = DEFAULT_PAGE_LIMIT_BYTES,
     ):
         self.control_plane = control_plane
         self.session_id = session_id
         self.deadline_monotonic = deadline_monotonic
+        self.progress_callback = progress_callback
         self.long_poll_ms = long_poll_ms
         self.page_limit_bytes = page_limit_bytes
         self.executions: dict[str, dict[str, Any]] = {}
+
+    def emit_progress(self, event: dict[str, Any]) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(event)
 
     def run_diagnostic(
         self,
@@ -434,17 +463,35 @@ class DiagnosticTools:
         while not terminal:
             for stream in ("stdout", "stderr"):
                 remaining = require_budget(self.deadline_monotonic)
-                remaining_ms = int(remaining * 1000)
-                wait_ms = min(self.long_poll_ms, remaining_ms)
-                events = self.control_plane.output_events(
-                    execution_id,
-                    stream,
-                    after=stream_cursors[stream],
-                    wait_ms=wait_ms,
-                    timeout_seconds=max(MIN_API_TIMEOUT_SECONDS, min(remaining, wait_ms / 1000)),
-                )
+                client_timeout = max(MIN_API_TIMEOUT_SECONDS, remaining)
+                wait_budget_ms = max(1, int(client_timeout * 1000) - LONG_POLL_CLIENT_SLACK_MS)
+                wait_ms = min(self.long_poll_ms, wait_budget_ms)
+                try:
+                    events = self.control_plane.output_events(
+                        execution_id,
+                        stream,
+                        after=stream_cursors[stream],
+                        wait_ms=wait_ms,
+                        timeout_seconds=client_timeout,
+                    )
+                except httpx.TimeoutException:
+                    require_budget(self.deadline_monotonic)
+                    self.emit_progress({
+                        "type": "long_poll_timeout",
+                        "execution_id": execution_id,
+                        "stream": stream,
+                    })
+                    continue
                 if events["events"]:
                     stream_cursors[stream] = events["next_cursor"]
+                    for event in events["events"]:
+                        self.emit_progress({
+                            "type": "output",
+                            "execution_id": execution_id,
+                            "stream": stream,
+                            "cursor": event["cursor"],
+                            "text": bounded_text(event["text"], 1000),
+                        })
                 terminal = terminal or events["terminal"]
         result = self.control_plane.get_execution(
             execution_id,
@@ -456,6 +503,10 @@ class DiagnosticTools:
         self.executions[execution_id] = {
             "operation": operation,
             "page_cursors": {"stdout": "0", "stderr": "0"},
+            "page_allowed": {
+                "stdout": bool(stdout_preview["shortened"]),
+                "stderr": bool(stderr_preview["shortened"]),
+            },
             "poll_cursors": stream_cursors,
         }
         tool_result = {
@@ -489,6 +540,8 @@ class DiagnosticTools:
             raise DriverError("invalid_stream")
         if execution_id not in self.executions:
             raise DriverError("unknown_execution")
+        if not self.executions[execution_id]["page_allowed"][stream]:
+            raise DriverError("page_not_available")
         expected_cursor = self.executions[execution_id]["page_cursors"][stream]
         if after != expected_cursor:
             raise DriverError("invalid_cursor_progression")
@@ -504,6 +557,7 @@ class DiagnosticTools:
         if exposed["shortened"]:
             raise DriverError("page_exceeds_model_exposure_limit")
         self.executions[execution_id]["page_cursors"][stream] = page["next_cursor"]
+        self.executions[execution_id]["page_allowed"][stream] = bool(page["more_available"])
         api_ms = (time.perf_counter() - started) * 1000
         tool_result = {
             "execution_id": execution_id,
@@ -571,29 +625,22 @@ def append_tool_output(messages: list[dict[str, Any]], call: dict[str, Any], out
     })
 
 
-def close_session_with_retry(
+def close_session_once(
     control_plane: ControlPlaneClient,
     session_id: str,
     *,
     cleanup_seconds: int,
 ) -> tuple[bool, str | None]:
-    deadline = time.perf_counter() + cleanup_seconds
-    last_error: str | None = None
-    while True:
-        remaining = deadline - time.perf_counter()
-        if remaining < MIN_API_TIMEOUT_SECONDS:
-            return False, last_error or "session_close_unconfirmed"
-        try:
-            ok, detail = control_plane.close_session(
-                session_id,
-                timeout_seconds=max(MIN_API_TIMEOUT_SECONDS, remaining),
-            )
-            if ok:
-                return True, None
-            last_error = str(detail)[:200]
-        except Exception as error:
-            last_error = type(error).__name__
-        time.sleep(min(0.2, max(0.0, deadline - time.perf_counter())))
+    try:
+        ok, detail = control_plane.close_session(
+            session_id,
+            timeout_seconds=max(MIN_API_TIMEOUT_SECONDS, cleanup_seconds),
+        )
+        if ok:
+            return True, None
+        return False, str(detail)[:200]
+    except Exception as error:
+        return False, type(error).__name__
 
 
 def drive_diagnostic(
@@ -605,11 +652,11 @@ def drive_diagnostic(
     max_steps: int = DEFAULT_MAX_STEPS,
     max_seconds: int = DEFAULT_MAX_SECONDS,
     cleanup_seconds: int = DEFAULT_CLEANUP_SECONDS,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> DiagnosticResult:
-    if max_steps < 1:
-        raise ValueError("max_steps_must_be_positive")
-    if max_seconds < 1:
-        raise ValueError("max_seconds_must_be_positive")
+    validate_positive_int(max_steps, "max_steps_must_be_positive")
+    validate_positive_int(max_seconds, "max_seconds_must_be_positive")
+    validate_positive_int(cleanup_seconds, "cleanup_seconds_out_of_range", MAX_CLEANUP_SECONDS)
     deadline = time.perf_counter() + max_seconds
     session = control_plane.open_session(
         device_id,
@@ -627,52 +674,68 @@ def drive_diagnostic(
     }]
     result = DiagnosticResult(final_report="", session_id=session_id)
     consumed_steps = 0
-    tools = DiagnosticTools(control_plane, session_id, deadline_monotonic=deadline)
+    tools = DiagnosticTools(
+        control_plane,
+        session_id,
+        deadline_monotonic=deadline,
+        progress_callback=progress_callback,
+    )
+    original_error: Exception | None = None
     try:
-        while True:
-            if time.perf_counter() >= deadline:
-                result.final_report = "Stopped because the configured diagnostic time budget was exhausted."
-                break
-            reply = model_client.create_response(
-                messages,
-                timeout_seconds=bounded_api_timeout(deadline),
-            )
-            result.model_calls.append(reply)
-            messages.extend(reply.output)
-            calls = iter_function_calls(reply.output)
-            if not calls:
-                result.final_report = reply.text or "No final report returned by model."
-                break
-            for call in calls:
-                name = call.get("name")
-                try:
-                    args = parse_arguments(call)
-                    if consumed_steps >= max_steps:
-                        result.final_report = "Stopped because the configured diagnostic step budget was exhausted."
-                        return result
-                    if name == "run_diagnostic":
-                        tool_output, timing = tools.run_diagnostic(**args)
-                    elif name == "get_output_page":
-                        tool_output, timing = tools.get_output_page(**args)
-                    else:
-                        raise DriverError("unknown_tool")
-                except TimeoutError:
+        try:
+            while True:
+                if time.perf_counter() >= deadline:
                     result.final_report = "Stopped because the configured diagnostic time budget was exhausted."
-                    return result
-                except (DriverError, TypeError):
+                    break
+                reply = model_client.create_response(
+                    messages,
+                    timeout_seconds=bounded_api_timeout(deadline),
+                )
+                result.model_calls.append(reply)
+                messages.extend(reply.output)
+                if time.perf_counter() >= deadline:
+                    result.final_report = "Stopped because the configured diagnostic time budget was exhausted."
+                    break
+                calls = iter_function_calls(reply.output)
+                if not calls:
+                    result.final_report = reply.text or "No final report returned by model."
+                    break
+                for call in calls:
+                    if time.perf_counter() >= deadline:
+                        result.final_report = "Stopped because the configured diagnostic time budget was exhausted."
+                        break
+                    name = call.get("name")
+                    try:
+                        args = parse_arguments(call)
+                        if consumed_steps >= max_steps:
+                            result.final_report = "Stopped because the configured diagnostic step budget was exhausted."
+                            return result
+                        if name == "run_diagnostic":
+                            tool_output, timing = tools.run_diagnostic(**args)
+                        elif name == "get_output_page":
+                            tool_output, timing = tools.get_output_page(**args)
+                        else:
+                            raise DriverError("unknown_tool")
+                    except TimeoutError:
+                        result.final_report = "Stopped because the configured diagnostic time budget was exhausted."
+                        return result
+                    except (DriverError, TypeError):
+                        consumed_steps += 1
+                        timing = StepTiming(0, str(name), None, 0, None, reply.latency_ms, "rejected", "tool rejected")
+                        timing.step = consumed_steps
+                        result.steps.append(timing)
+                        append_tool_output(messages, call, tool_error("invalid_tool_request"))
+                        continue
                     consumed_steps += 1
-                    timing = StepTiming(0, str(name), None, 0, None, reply.latency_ms, "rejected", "tool rejected")
                     timing.step = consumed_steps
+                    timing.model_ms_before_step = reply.latency_ms
                     result.steps.append(timing)
-                    append_tool_output(messages, call, tool_error("invalid_tool_request"))
-                    continue
-                consumed_steps += 1
-                timing.step = consumed_steps
-                timing.model_ms_before_step = reply.latency_ms
-                result.steps.append(timing)
-                append_tool_output(messages, call, tool_output)
+                    append_tool_output(messages, call, tool_output)
+        except Exception as error:
+            original_error = error
+            result.final_report = "Command failure: " + type(error).__name__
     finally:
-        result.closed, result.close_error = close_session_with_retry(
+        result.closed, result.close_error = close_session_once(
             control_plane,
             session_id,
             cleanup_seconds=cleanup_seconds,
@@ -681,6 +744,12 @@ def drive_diagnostic(
             result.final_report = (result.final_report + "\n" if result.final_report else "") + (
                 "Command failure: session closure was not confirmed within cleanup allowance."
             )
+    if original_error is not None:
+        raise DriverError(
+            "driver_failed",
+            close_error=result.close_error,
+            original_error=type(original_error).__name__,
+        ) from original_error
     return result
 
 
@@ -730,6 +799,21 @@ def render_result(result: DiagnosticResult) -> str:
     return "\n".join(lines)
 
 
+def stderr_progress(event: dict[str, Any]) -> None:
+    if event["type"] == "output":
+        text = event["text"]["text"].replace("\n", "\\n")
+        print(
+            f"progress execution={event['execution_id']} stream={event['stream']} "
+            f"cursor={event['cursor']} text={text}",
+            file=sys.stderr,
+        )
+    elif event["type"] == "long_poll_timeout":
+        print(
+            f"progress execution={event['execution_id']} stream={event['stream']} no_change=true",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a caller-side OpenAI diagnostic driver.")
     parser.add_argument("problem")
@@ -756,15 +840,24 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("set RMM_DEVICE_ID when using only RMM_OPERATOR_KEY")
         device_id = ControlPlaneClient.first_online_device(args.base_url, admin_key)
     model = OpenAIResponsesClient(openai_key, model=args.model)
-    result = drive_diagnostic(
-        problem=args.problem,
-        device_id=device_id,
-        model_client=model,
-        control_plane=control_plane,
-        max_steps=args.max_steps,
-        max_seconds=args.max_seconds,
-        cleanup_seconds=args.cleanup_seconds,
-    )
+    try:
+        result = drive_diagnostic(
+            problem=args.problem,
+            device_id=device_id,
+            model_client=model,
+            control_plane=control_plane,
+            max_steps=args.max_steps,
+            max_seconds=args.max_seconds,
+            cleanup_seconds=args.cleanup_seconds,
+            progress_callback=stderr_progress,
+        )
+    except DriverError as error:
+        print("Driver failure: " + error.code, file=sys.stderr)
+        if error.original_error:
+            print("Original failure: " + error.original_error, file=sys.stderr)
+        if error.close_error:
+            print("Session close error: " + error.close_error, file=sys.stderr)
+        return 1
     print(render_result(result))
     return 0 if result.closed else 1
 
