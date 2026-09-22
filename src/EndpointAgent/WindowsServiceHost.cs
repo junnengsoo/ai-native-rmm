@@ -72,8 +72,9 @@ internal sealed class WindowsServiceHost : ServiceBase {
 
     public static void CleanupInstalledState(string? configuredKeyName = null) {
         string keyName = configuredKeyName ?? TryReadConfiguredKeyName() ?? DefaultKeyName;
-        TryDeleteFile(StatusPath);
-        TryDeleteDirectory(DataDirectory);
+        if (File.Exists(StatusPath)) File.Delete(StatusPath);
+        if (Directory.Exists(DataDirectory) && !Directory.EnumerateFileSystemEntries(DataDirectory).Any())
+            Directory.Delete(DataDirectory);
         if (OperatingSystem.IsWindows() && CngKey.Exists(keyName)) {
             using var key = CngKey.Open(keyName);
             key.Delete();
@@ -87,15 +88,6 @@ internal sealed class WindowsServiceHost : ServiceBase {
         } catch { return null; }
     }
 
-    private static void TryDeleteFile(string path) {
-        try { if (File.Exists(path)) File.Delete(path); }
-        catch { }
-    }
-
-    private static void TryDeleteDirectory(string path) {
-        try { if (Directory.Exists(path) && !Directory.EnumerateFileSystemEntries(path).Any()) Directory.Delete(path); }
-        catch { }
-    }
 }
 
 internal sealed record ServiceConfig(Uri Endpoint, string KeyName);

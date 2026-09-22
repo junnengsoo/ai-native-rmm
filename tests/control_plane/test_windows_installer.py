@@ -21,7 +21,8 @@ def windows(script: str, timeout: int = 600) -> dict:
     if "RMM_DATA:" not in output:
         reason = next((marker for marker in (
             "installer_missing", "install_failed", "service_missing", "unexpected_service_identity",
-            "status_missing", "unexpected_status", "restart_failed", "uninstall_failed",
+            "status_missing", "unexpected_status", "pairing_code_not_preserved",
+            "restart_failed", "uninstall_failed",
             "service_remaining", "files_remaining", "status_remaining", "local_credential_remaining",
             "missing_endpoint_accepted",
         ) if marker in output), "unclassified_fixture_failure")
@@ -103,6 +104,11 @@ do {{
 if (-not (Test-Path '{status_path}')) {{ throw 'status_missing' }}
 $status=Get-Content '{status_path}' -Raw | ConvertFrom-Json
 if ($status.state -ne 'pending' -or $status.ready -ne $false -or $status.pairing_code -notmatch '^[A-Z2-7]{{12}}$') {{ throw 'unexpected_status' }}
+# The server returns the code only on the first pending response. Wait through
+# a reconnect and ensure the service preserves that one-time local delivery.
+Start-Sleep -Seconds 20
+$status=Get-Content '{status_path}' -Raw | ConvertFrom-Json
+if ($status.state -ne 'pending' -or $status.ready -ne $false -or $status.pairing_code -notmatch '^[A-Z2-7]{{12}}$') {{ throw 'pairing_code_not_preserved' }}
 $key=[Security.Cryptography.CngKey]::Open('{key_name}')
 $unique=$key.UniqueName
 $key.Dispose()
@@ -115,24 +121,39 @@ Write-Output ('RMM_DATA:' + (@{{state=$status.state;ready=$status.ready;pairing_
         assert installed["identity"] == "LocalSystem"
 
         restarted = windows(f"""
-Restart-Service -Name '{service}' -Force
-$deadline=(Get-Date).AddSeconds(30)
-do {{
-  Start-Sleep -Seconds 1
-  $svc=Get-CimInstance Win32_Service -Filter "Name='{service}'"
-}} until ($svc.State -eq 'Running' -or (Get-Date) -gt $deadline)
-if ($svc.State -ne 'Running') {{ throw 'restart_failed' }}
-$deadline=(Get-Date).AddSeconds(40)
-do {{
-  Start-Sleep -Seconds 1
-  $status=Get-Content '{status_path}' -Raw | ConvertFrom-Json
-}} until ($status.state -in @('pending','unavailable') -or (Get-Date) -gt $deadline)
-if ($status.ready -eq $true -or $status.state -notin @('pending','unavailable')) {{ throw 'unexpected_status' }}
-Write-Output ('RMM_DATA:' + (@{{state=$status.state;ready=$status.ready;service=$svc.State}} | ConvertTo-Json -Compress))
+$registry='HKLM:\\SOFTWARE\\Prosper\\AiNativeRmm'
+function Restart-And-Wait([string]$expectedState) {{
+  Restart-Service -Name '{service}' -Force
+  $deadline=(Get-Date).AddSeconds(30)
+  do {{
+    Start-Sleep -Seconds 1
+    $script:svc=Get-CimInstance Win32_Service -Filter "Name='{service}'"
+  }} until ($script:svc.State -eq 'Running' -or (Get-Date) -gt $deadline)
+  if ($script:svc.State -ne 'Running') {{ throw 'restart_failed' }}
+  $deadline=(Get-Date).AddSeconds(40)
+  do {{
+    Start-Sleep -Seconds 1
+    $script:status=Get-Content '{status_path}' -Raw | ConvertFrom-Json
+  }} until ($script:status.state -eq $expectedState -or (Get-Date) -gt $deadline)
+  if ($script:status.state -ne $expectedState -or $script:status.ready -eq $true) {{ throw 'unexpected_status' }}
+  if ($script:status.pairing_code -notmatch '^[A-Z2-7]{{12}}$') {{ throw 'pairing_code_not_preserved' }}
+}}
+try {{
+  Set-ItemProperty $registry Endpoint 'wss://127.0.0.1:1/agent'
+  Restart-And-Wait 'unavailable'
+  # Restart from persisted unavailable state to prove process replacement
+  # cannot discard the server's one-time code delivery.
+  Restart-And-Wait 'unavailable'
+}} finally {{
+  Set-ItemProperty $registry Endpoint '{endpoint}'
+  Restart-And-Wait 'pending'
+}}
+Write-Output ('RMM_DATA:' + (@{{state=$status.state;ready=$status.ready;service=$svc.State;pairing_code_length=$status.pairing_code.Length}} | ConvertTo-Json -Compress))
 """)
         assert restarted["service"] == "Running"
         assert restarted["ready"] is False
-        assert restarted["state"] in {"pending", "unavailable"}
+        assert restarted["state"] == "pending"
+        assert restarted["pairing_code_length"] == 12
 
         removed = windows(f"""
 $msi='{built["msi"]}'

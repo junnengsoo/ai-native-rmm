@@ -55,7 +55,7 @@
                   BinaryRef="Wix4UtilCA_X64"
                   DllEntry="WixQuietExec"
                   Execute="deferred"
-                  Return="ignore"
+                  Return="check"
                   Impersonate="no" />
     <InstallExecuteSequence>
       <Custom Action="CleanupAgentState" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />

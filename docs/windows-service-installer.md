@@ -30,7 +30,10 @@ The service writes local status to
 that file contains `state: "pending"`, `ready: false`, and the one-time
 `pairing_code` when the server first issues it. Once the key is approved and the
 service proves possession again, it contains `state: "online"`, `ready: true`,
-and the stable `device_id`. Pending enrollment is not a ready managed device.
+and the stable `device_id`. If connectivity becomes unavailable while enrollment
+is pending, the protected local status retains the pairing code so an SCM
+restart cannot discard the server's one-time delivery. Pending enrollment is
+not a ready managed device.
 
 ## Build the MSI on Windows
 
@@ -108,6 +111,18 @@ console. Do not add a public IP or use RDP as a test shortcut.
 
 Full pairing, public API execution, reboot recovery, and durable server-history
 verification are covered by the later lifecycle ticket, not this installer slice.
+
+## Latest validation
+
+On September 22, 2026, the PR #23 candidate passed the opt-in real-Windows MSI
+smoke (`tests/control_plane/test_windows_installer.py`) against the authorized
+Azure VM. The run built the actual MSI, verified pending pairing-code persistence
+through reconnects and SCM restarts during a forced outage, restored connectivity,
+and completed strict uninstall and local-state cleanup.
+
+Remaining limitations: the trial MSI is unsigned, the test control plane uses a
+temporary tunnel, and full approval/execution, machine reboot recovery, and
+durable server-history behavior remain deferred to the later lifecycle slice.
 
 ## Automated smoke
 

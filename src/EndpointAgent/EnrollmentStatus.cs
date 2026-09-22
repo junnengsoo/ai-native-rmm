@@ -21,6 +21,7 @@ internal sealed class ConsoleEnrollmentStatus : IEnrollmentStatus {
 internal sealed class FileEnrollmentStatus : IEnrollmentStatus {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { WriteIndented = true };
     private readonly string path;
+    private string? pairingCode;
 
     public FileEnrollmentStatus(string path) {
         this.path = path;
@@ -39,28 +40,49 @@ internal sealed class FileEnrollmentStatus : IEnrollmentStatus {
                 PropagationFlags.None, AccessControlType.Allow));
             new DirectoryInfo(directory).SetAccessControl(security);
         }
+        pairingCode = ExistingPairingCode();
     }
 
-    public void Pending(string? code) => Write(new {
-        state = "pending",
-        pairing_code = code,
-        ready = false,
-        updated_at = DateTimeOffset.UtcNow,
-    });
+    public void Pending(string? code) {
+        pairingCode = code ?? pairingCode;
+        Write(new {
+            state = "pending",
+            pairing_code = pairingCode,
+            ready = false,
+            updated_at = DateTimeOffset.UtcNow,
+        });
+    }
 
-    public void Online(Guid device) => Write(new {
-        state = "online",
-        device_id = device,
-        ready = true,
-        updated_at = DateTimeOffset.UtcNow,
-    });
+    public void Online(Guid device) {
+        pairingCode = null;
+        Write(new {
+            state = "online",
+            device_id = device,
+            ready = true,
+            updated_at = DateTimeOffset.UtcNow,
+        });
+    }
 
     public void Unavailable(string reason) => Write(new {
         state = "unavailable",
         reason,
+        pairing_code = pairingCode,
         ready = false,
         updated_at = DateTimeOffset.UtcNow,
     });
+
+    private string? ExistingPairingCode() {
+        try {
+            if (!File.Exists(path)) return null;
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            var status = document.RootElement;
+            if (status.TryGetProperty("pairing_code", out var code) && code.GetString() is { } value
+                && value.Length == 12
+                && value.All(c => c is >= 'A' and <= 'Z' or >= '2' and <= '7')) return value;
+        } catch (IOException) { }
+        catch (JsonException) { }
+        return null;
+    }
 
     private void Write<T>(T status) {
         var temp = path + ".tmp";
