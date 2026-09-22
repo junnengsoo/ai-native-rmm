@@ -195,6 +195,9 @@ try {
             }
             try { [void]$powershell.EndInvoke($pending) }
             catch { $terminated = $true }
+            if ($powershell.InvocationStateInfo.State -eq [System.Management.Automation.PSInvocationState]::Failed) {
+                $terminated = $true
+            }
         } catch {
             $terminated = $true
             [RmmProtocol]::WriteOutput($writer, 'stderr', ([string]$_ + "`n"))
