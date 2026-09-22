@@ -39,6 +39,10 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         start.ArgumentList.Add("-NoLogo");
         start.ArgumentList.Add("-NoProfile");
         start.ArgumentList.Add("-NonInteractive");
+        // The installed bootstrap is product code under Program Files. Execution
+        // policy is not an authorization boundary; AppLocker/WDAC still apply.
+        start.ArgumentList.Add("-ExecutionPolicy");
+        start.ArgumentList.Add("Bypass");
         start.ArgumentList.Add("-File");
         start.ArgumentList.Add(workerScript);
         start.ArgumentList.Add("-PipeName");

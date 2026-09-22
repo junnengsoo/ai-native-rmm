@@ -52,9 +52,12 @@ The host observes Windows PowerShell's `PSHost.SetShouldExit` callback; it does
 not infer explicit exit from a native command's exit value. The 64-bit agent
 resolves the canonical inbox engine through the Windows system-directory API
 and launches `System32\WindowsPowerShell\v1.0\powershell.exe` directly with
-`-NoLogo -NoProfile -NonInteractive`. It never searches `PATH` or silently
-falls back to another engine. The worker validates a 64-bit `Desktop` engine at
-startup and uses the native LocalSystem module discovery and policy environment.
+`-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass`. The bypass applies
+only to the protected installed worker bootstrap; PowerShell execution policy is
+not an authorization boundary, and AppLocker/WDAC policy still applies. The agent
+never searches `PATH` or silently falls back to another engine. The worker
+validates a 64-bit `Desktop` engine at startup and uses the native LocalSystem
+module discovery environment.
 The Windows contract test requires the inbox `CimCmdlets` module to load through
 `Get-CimInstance` before accepting the worker.
 
