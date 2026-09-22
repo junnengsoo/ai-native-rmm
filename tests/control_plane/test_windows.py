@@ -130,17 +130,19 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
             execution = submitted.json()["execution_id"]
             deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
-                result = httpx.get(BASE + f"/executions/{execution}", headers=operator)
+                result = httpx.get(
+                    BASE + f"/executions/{execution}/wait",
+                    headers=operator, params={"timeout_seconds": 1}, timeout=3,
+                )
                 result.raise_for_status()
-                if result.json()["status"] not in ("queued", "running"):
+                if result.json()["terminal"]:
                     return submitted, result.json()
-                time.sleep(.2)
             pytest.fail("Windows execution did not finish")
 
         _, set_result = execute("$global:trialValue = 41", "set-variable")
         assert set_result["status"] == "completed"
         _, read_result = execute("$global:trialValue + 1", "read-variable")
-        assert read_result["stdout"].strip() == "42"
+        assert read_result["output_preview"]["stdout"]["text"].strip() == "42"
         marker = root + "\\marker.txt"
         marker_script = f"Add-Content -LiteralPath '{marker}' -Value marker; (Get-Content -LiteralPath '{marker}').Count"
         first_submit, marker_result = execute(marker_script, "marker-once")
@@ -148,21 +150,21 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
             **operator, "Idempotency-Key": "marker-once",
         }, json={"script": marker_script, "timeout_ms": 5000})
         assert retry.status_code == 202 and retry.json()["execution_id"] == first_submit.json()["execution_id"]
-        assert marker_result["stdout"].strip() == "1"
+        assert marker_result["output_preview"]["stdout"]["text"].strip() == "1"
         child_script = "$p=Start-Process -FilePath $env:ComSpec -ArgumentList '/c ping -n 60 127.0.0.1 > nul' -PassThru; $p.Id; Start-Sleep -Seconds 20"
         _, timeout_result = execute(child_script, "timeout-child", timeout_ms=500, wait_seconds=30)
         assert timeout_result["status"] == "timed_out"
         assert timeout_result["invocation_outcome"] == "stopped"
-        child_id = int(timeout_result["stdout"].strip().splitlines()[0])
+        child_id = int(timeout_result["output_preview"]["stdout"]["text"].strip().splitlines()[0])
         closed = httpx.post(BASE + f"/sessions/{session}/close", headers=operator, timeout=30)
         assert closed.status_code == 200 and closed.json()["status"] == "closed"
         fresh = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device}, timeout=30)
         fresh.raise_for_status()
         session = fresh.json()["session_id"]
         _, child_cleanup = execute(f"$null -eq (Get-Process -Id {child_id} -ErrorAction SilentlyContinue)", "timeout-child-cleanup")
-        assert child_cleanup["stdout"].strip().lower() == "true"
+        assert child_cleanup["output_preview"]["stdout"]["text"].strip().lower() == "true"
         _, fresh_result = execute("$null -eq $global:trialValue", "fresh-variable")
-        assert fresh_result["stdout"].strip().lower() == "true"
+        assert fresh_result["output_preview"]["stdout"]["text"].strip().lower() == "true"
         assert httpx.post(BASE + f"/sessions/{session}/close", headers=operator, timeout=30).status_code == 200
 
         time.sleep(17)
@@ -184,11 +186,13 @@ Write-Output 'RMM_DATA:stopped'
         offline_submit.raise_for_status()
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            offline_result = httpx.get(BASE + f"/executions/{offline_submit.json()['execution_id']}", headers=operator)
+            offline_result = httpx.get(
+                BASE + f"/executions/{offline_submit.json()['execution_id']}/wait",
+                headers=operator, params={"timeout_seconds": 1}, timeout=3,
+            )
             offline_result.raise_for_status()
-            if offline_result.json()["status"] == "failed_to_start":
+            if offline_result.json()["terminal"]:
                 break
-            time.sleep(.2)
         assert offline_result.json()["status"] == "failed_to_start"
         assert offline_result.json()["outcome_reason"] == "device_offline_before_dispatch"
         time.sleep(46)

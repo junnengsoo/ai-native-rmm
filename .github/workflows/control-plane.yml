@@ -36,5 +36,5 @@ jobs:
             sleep 1
           done
           exit 1
-      - name: Public API, authentication, real expiry and concurrency
-        run: python -m pytest -q tests/control_plane/test_investigations.py tests/control_plane/test_logging.py tests/control_plane/test_pairing.py tests/control_plane/test_reachability.py
+      - name: Public API, authentication, diagnostics and concurrency
+        run: python -m pytest -q tests/control_plane/test_openai_driver.py tests/control_plane/test_execution_wait.py tests/control_plane/test_investigations.py tests/control_plane/test_logging.py tests/control_plane/test_pairing.py tests/control_plane/test_reachability.py

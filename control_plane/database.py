@@ -19,6 +19,13 @@ from sqlalchemy.dialects.postgresql import UUID, insert as postgresql_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
 from sqlalchemy.exc import IntegrityError
 
+from .output_queries import (
+    MAX_QUERY_SCAN_EVENTS,
+    query_retained_output,
+    range_retained_output,
+    tail_retained_output,
+)
+
 metadata = MetaData()
 workspaces = Table("workspaces", metadata,
     Column("id", UUID(as_uuid=True), primary_key=True), Column("name", Text, nullable=False))
@@ -457,6 +464,40 @@ def get_execution_output_high_water(execution_id: uuid.UUID, stream: str) -> int
             execution_output_events.c.execution_id == execution_id,
             execution_output_events.c.stream == stream)).scalar_one()
 
+def get_execution_output_scan_events(execution_id: uuid.UUID, stream: str,
+                                     high_water: int) -> list[RowMapping]:
+    with transaction() as connection:
+        return list(connection.execute(select(
+            execution_output_events.c.sequence, execution_output_events.c.text,
+            execution_output_events.c.byte_count, execution_output_events.c.created_at,
+        ).where(
+            execution_output_events.c.execution_id == execution_id,
+            execution_output_events.c.stream == stream,
+            execution_output_events.c.sequence <= high_water,
+        ).order_by(execution_output_events.c.sequence).limit(MAX_QUERY_SCAN_EVENTS + 1)).mappings())
+
+def get_execution_output_snapshot_events(execution_id: uuid.UUID, stream: str) -> tuple[int, list[RowMapping]]:
+    high_water = get_execution_output_high_water(execution_id, stream)
+    return high_water, get_execution_output_scan_events(execution_id, stream, high_water)
+
+def search_execution_output(execution_id: uuid.UUID, stream: str, query: str, *,
+                            case_sensitive: bool, context_lines: int,
+                            limit_matches: int, after_byte: int) -> dict[str, object]:
+    high_water, rows = get_execution_output_snapshot_events(execution_id, stream)
+    return query_retained_output(rows, query=query, case_sensitive=case_sensitive,
+                                 context_lines=context_lines, limit_matches=limit_matches,
+                                 after_byte=after_byte, high_water_cursor=high_water)
+
+def tail_execution_output(execution_id: uuid.UUID, stream: str, lines: int) -> dict[str, object]:
+    high_water, rows = get_execution_output_snapshot_events(execution_id, stream)
+    return tail_retained_output(rows, lines=lines, high_water_cursor=high_water)
+
+def range_execution_output(execution_id: uuid.UUID, stream: str,
+                           start_byte: int, end_byte: int) -> dict[str, object]:
+    high_water, rows = get_execution_output_snapshot_events(execution_id, stream)
+    return range_retained_output(rows, start_byte=start_byte, end_byte=end_byte,
+                                 high_water_cursor=high_water)
+
 def get_execution_output_page(execution_id: uuid.UUID, stream: str, after: int,
                               limit_bytes: int) -> dict[str, object]:
     rows = get_execution_output_events(execution_id, stream, after, 1000)
@@ -487,11 +528,14 @@ def recover_interrupted_work() -> None:
             sessions.c.state.in_(("starting", "active", "closing"))).values(
             state="failed", closed_at=func.now()))
 
-def fail_device_investigations(device_id: uuid.UUID | str) -> None:
+def fail_device_investigations(device_id: uuid.UUID | str) -> list[uuid.UUID]:
     with transaction() as connection:
         live_sessions = select(sessions.c.id).where(
             sessions.c.device_id == device_id,
             sessions.c.state.in_(("starting", "active", "closing")))
+        affected_execution_ids = list(connection.execute(select(executions.c.id).where(
+            executions.c.session_id.in_(live_sessions),
+            executions.c.status.in_(("queued", "running")))).scalars())
         connection.execute(update(executions).where(
             executions.c.session_id.in_(live_sessions),
             executions.c.status.in_(("queued", "running"))).values(
@@ -505,3 +549,4 @@ def fail_device_investigations(device_id: uuid.UUID | str) -> None:
             sessions.c.device_id == device_id,
             sessions.c.state == "closing").values(
             state="cleanup_unknown", closed_at=func.now()))
+        return affected_execution_ids
