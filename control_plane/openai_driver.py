@@ -22,7 +22,7 @@ DEFAULT_EXECUTION_TIMEOUT_MS = 20_000
 DEFAULT_LONG_POLL_MS = 2_000
 LONG_POLL_CLIENT_SLACK_MS = 500
 DEFAULT_PAGE_LIMIT_BYTES = 8_192
-DEFAULT_MAX_OUTPUT_CHARS = 6_000
+DEFAULT_MAX_OUTPUT_BYTES = 8_192
 DEFAULT_MAX_OUTPUT_TOKENS = 600
 MIN_API_TIMEOUT_SECONDS = 0.1
 
@@ -180,6 +180,7 @@ class DiagnosticResult:
     session_id: str
     steps: list[StepTiming] = field(default_factory=list)
     model_calls: list[ModelReply] = field(default_factory=list)
+    completed: bool = False
     closed: bool = False
     close_error: str | None = None
 
@@ -188,10 +189,12 @@ class DiagnosticResult:
         return sum(call.latency_ms for call in self.model_calls)
 
 
-def bounded_text(value: str, max_chars: int = DEFAULT_MAX_OUTPUT_CHARS) -> dict[str, Any]:
-    if len(value) <= max_chars:
-        return {"text": value, "shortened": False, "omitted_chars": 0}
-    return {"text": value[:max_chars], "shortened": True, "omitted_chars": len(value) - max_chars}
+def bounded_text(value: str, max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES) -> dict[str, Any]:
+    encoded = value.encode()
+    if len(encoded) <= max_bytes:
+        return {"text": value, "shortened": False, "omitted_bytes": 0}
+    visible = encoded[:max_bytes].decode(errors="ignore")
+    return {"text": visible, "shortened": True, "omitted_bytes": len(encoded) - len(visible.encode())}
 
 
 def require_budget(deadline_monotonic: float) -> float:
@@ -309,7 +312,7 @@ class ControlPlaneClient:
         admin_key: str,
         *,
         name: str | None = None,
-        timeout_seconds: float = 30,
+        timeout_seconds: float,
     ) -> tuple["ControlPlaneClient", str]:
         client = httpx.Client(
             base_url=base_url.rstrip("/"),
@@ -325,18 +328,26 @@ class ControlPlaneClient:
         return cls(base_url, body["api_key"]), body["caller_id"]
 
     @staticmethod
-    def first_online_device(base_url: str, admin_key: str) -> str:
-        response = httpx.get(
-            base_url.rstrip("/") + "/devices",
-            headers={"Authorization": "Bearer " + admin_key},
-            params={"limit": 100},
-            timeout=30,
-        )
-        response.raise_for_status()
-        devices = response.json()["devices"]
-        for device in devices:
-            if device["reachability"] == "online":
-                return device["id"]
+    def first_online_device(base_url: str, admin_key: str, *, deadline_monotonic: float) -> str:
+        after = None
+        while True:
+            params = {"limit": 100}
+            if after:
+                params["after"] = after
+            response = httpx.get(
+                base_url.rstrip("/") + "/devices",
+                headers={"Authorization": "Bearer " + admin_key},
+                params=params,
+                timeout=bounded_api_timeout(deadline_monotonic),
+            )
+            response.raise_for_status()
+            body = response.json()
+            for device in body["devices"]:
+                if device["reachability"] == "online":
+                    return device["id"]
+            after = body.get("next_cursor")
+            if not after:
+                break
         raise RuntimeError("no_online_device")
 
     def open_session(self, device_id: str, *, timeout_seconds: float) -> dict[str, Any]:
@@ -427,6 +438,7 @@ class DiagnosticTools:
         self.long_poll_ms = long_poll_ms
         self.page_limit_bytes = page_limit_bytes
         self.executions: dict[str, dict[str, Any]] = {}
+        self.last_quiet_progress: dict[tuple[str, str], float] = {}
 
     def emit_progress(self, event: dict[str, Any]) -> None:
         if self.progress_callback is not None:
@@ -459,13 +471,15 @@ class DiagnosticTools:
         )
         execution_id = submitted["execution_id"]
         stream_cursors = {"stdout": "0", "stderr": "0"}
-        terminal = False
-        while not terminal:
+        terminal_seen = False
+        stream_drained = {"stdout": False, "stderr": False}
+        while not (terminal_seen and all(stream_drained.values())):
             for stream in ("stdout", "stderr"):
                 remaining = require_budget(self.deadline_monotonic)
-                client_timeout = max(MIN_API_TIMEOUT_SECONDS, remaining)
-                wait_budget_ms = max(1, int(client_timeout * 1000) - LONG_POLL_CLIENT_SLACK_MS)
+                slack_seconds = LONG_POLL_CLIENT_SLACK_MS / 1000
+                wait_budget_ms = max(1, int(max(0.001, remaining - slack_seconds) * 1000))
                 wait_ms = min(self.long_poll_ms, wait_budget_ms)
+                client_timeout = max(MIN_API_TIMEOUT_SECONDS, min(remaining, wait_ms / 1000 + slack_seconds))
                 try:
                     events = self.control_plane.output_events(
                         execution_id,
@@ -482,6 +496,8 @@ class DiagnosticTools:
                         "stream": stream,
                     })
                     continue
+                terminal_seen = terminal_seen or events["terminal"]
+                more_available = bool(events.get("more_available") or events.get("has_more"))
                 if events["events"]:
                     stream_cursors[stream] = events["next_cursor"]
                     for event in events["events"]:
@@ -492,7 +508,18 @@ class DiagnosticTools:
                             "cursor": event["cursor"],
                             "text": bounded_text(event["text"], 1000),
                         })
-                terminal = terminal or events["terminal"]
+                else:
+                    now = time.perf_counter()
+                    quiet_key = (execution_id, stream)
+                    if now - self.last_quiet_progress.get(quiet_key, 0) >= 1:
+                        self.last_quiet_progress[quiet_key] = now
+                        self.emit_progress({
+                            "type": "no_change",
+                            "execution_id": execution_id,
+                            "stream": stream,
+                            "timed_out": bool(events.get("timed_out")),
+                        })
+                stream_drained[stream] = terminal_seen and not more_available and not events["events"]
         result = self.control_plane.get_execution(
             execution_id,
             timeout_seconds=bounded_api_timeout(self.deadline_monotonic),
@@ -653,11 +680,12 @@ def drive_diagnostic(
     max_seconds: int = DEFAULT_MAX_SECONDS,
     cleanup_seconds: int = DEFAULT_CLEANUP_SECONDS,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    deadline_monotonic: float | None = None,
 ) -> DiagnosticResult:
     validate_positive_int(max_steps, "max_steps_must_be_positive")
     validate_positive_int(max_seconds, "max_seconds_must_be_positive")
     validate_positive_int(cleanup_seconds, "cleanup_seconds_out_of_range", MAX_CLEANUP_SECONDS)
-    deadline = time.perf_counter() + max_seconds
+    deadline = deadline_monotonic if deadline_monotonic is not None else time.perf_counter() + max_seconds
     session = control_plane.open_session(
         device_id,
         timeout_seconds=bounded_api_timeout(deadline),
@@ -699,6 +727,7 @@ def drive_diagnostic(
                 calls = iter_function_calls(reply.output)
                 if not calls:
                     result.final_report = reply.text or "No final report returned by model."
+                    result.completed = bool(reply.text)
                     break
                 for call in calls:
                     if time.perf_counter() >= deadline:
@@ -793,21 +822,35 @@ def render_result(result: DiagnosticResult) -> str:
         rendered_cost = f"${cost:.6f}" if cost is not None else "unavailable"
         lines.append(f"Model usage: {json.dumps(usage, sort_keys=True)} approximate_cost={rendered_cost}")
     lines.append(f"Model latency total ms: {result.model_latency_ms:.0f}")
+    lines.append(f"Diagnostic completed: {getattr(result, 'completed', False)}")
     lines.append(f"Session closed: {result.closed}")
     if result.close_error:
         lines.append("Session close error: " + result.close_error)
     return "\n".join(lines)
 
 
+def sanitize_progress_text(value: str) -> str:
+    safe = []
+    for character in value:
+        codepoint = ord(character)
+        if character == "\n" or character == "\t":
+            safe.append(character)
+        elif codepoint < 32 or codepoint == 127 or 0x80 <= codepoint <= 0x9F:
+            safe.append("\\x" + format(codepoint, "02x"))
+        else:
+            safe.append(character)
+    return "".join(safe)
+
+
 def stderr_progress(event: dict[str, Any]) -> None:
     if event["type"] == "output":
-        text = event["text"]["text"].replace("\n", "\\n")
+        text = sanitize_progress_text(event["text"]["text"]).replace("\n", "\\n")
         print(
             f"progress execution={event['execution_id']} stream={event['stream']} "
             f"cursor={event['cursor']} text={text}",
             file=sys.stderr,
         )
-    elif event["type"] == "long_poll_timeout":
+    elif event["type"] in {"long_poll_timeout", "no_change"}:
         print(
             f"progress execution={event['execution_id']} stream={event['stream']} no_change=true",
             file=sys.stderr,
@@ -828,17 +871,26 @@ def main(argv: list[str] | None = None) -> int:
     openai_key = os.environ["OPENAI_API_KEY"]
     admin_key = os.environ.get("RMM_ADMIN_KEY")
     operator_key = os.environ.get("RMM_OPERATOR_KEY")
+    deadline = time.perf_counter() + args.max_seconds
     if operator_key:
         control_plane = ControlPlaneClient(args.base_url, operator_key)
     elif admin_key:
-        control_plane, _ = ControlPlaneClient.create_operator(args.base_url, admin_key)
+        control_plane, _ = ControlPlaneClient.create_operator(
+            args.base_url,
+            admin_key,
+            timeout_seconds=bounded_api_timeout(deadline),
+        )
     else:
         raise RuntimeError("set RMM_OPERATOR_KEY or RMM_ADMIN_KEY")
     device_id = args.device_id
     if not device_id:
         if not admin_key:
             raise RuntimeError("set RMM_DEVICE_ID when using only RMM_OPERATOR_KEY")
-        device_id = ControlPlaneClient.first_online_device(args.base_url, admin_key)
+        device_id = ControlPlaneClient.first_online_device(
+            args.base_url,
+            admin_key,
+            deadline_monotonic=deadline,
+        )
     model = OpenAIResponsesClient(openai_key, model=args.model)
     try:
         result = drive_diagnostic(
@@ -850,6 +902,7 @@ def main(argv: list[str] | None = None) -> int:
             max_seconds=args.max_seconds,
             cleanup_seconds=args.cleanup_seconds,
             progress_callback=stderr_progress,
+            deadline_monotonic=deadline,
         )
     except DriverError as error:
         print("Driver failure: " + error.code, file=sys.stderr)
@@ -859,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Session close error: " + error.close_error, file=sys.stderr)
         return 1
     print(render_result(result))
-    return 0 if result.closed else 1
+    return 0 if result.closed and result.completed else 1
 
 
 if __name__ == "__main__":

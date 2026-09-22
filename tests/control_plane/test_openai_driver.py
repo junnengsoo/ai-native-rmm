@@ -15,6 +15,7 @@ from control_plane.openai_driver import (
     drive_diagnostic,
     parse_arguments,
     render_result,
+    sanitize_progress_text,
     summarize_usage,
     validate_port,
     validate_timeout_ms,
@@ -112,10 +113,19 @@ class FakeControlPlane:
         assert 1 <= wait_ms <= 2000
         assert timeout_seconds > wait_ms / 1000
         self.event_timeouts.append(timeout_seconds)
+        if after != "0":
+            return {
+                "events": [],
+                "next_cursor": after,
+                "terminal": True,
+                "more_available": False,
+                "timed_out": False,
+            }
         return {
             "events": [{"cursor": "1", "text": "event", "byte_count": 5, "created_at": "now"}],
             "next_cursor": "1",
             "terminal": True,
+            "more_available": False,
         }
 
     def get_execution(self, execution_id, *, timeout_seconds):
@@ -165,6 +175,27 @@ class TimeoutOnceControlPlane(FakeControlPlane):
         )
 
 
+class ManyEventsControlPlane(FakeControlPlane):
+    def output_events(self, execution_id, stream, *, after, wait_ms, timeout_seconds, limit=8):
+        if stream == "stderr":
+            return {"events": [], "next_cursor": after, "terminal": True, "more_available": False}
+        if after == "0":
+            return {
+                "events": [{"cursor": str(index), "text": f"event-{index}", "byte_count": 7, "created_at": "now"} for index in range(1, 9)],
+                "next_cursor": "8",
+                "terminal": True,
+                "more_available": True,
+            }
+        if after == "8":
+            return {
+                "events": [{"cursor": str(index), "text": f"event-{index}", "byte_count": 8, "created_at": "now"} for index in range(9, 11)],
+                "next_cursor": "10",
+                "terminal": True,
+                "more_available": False,
+            }
+        return {"events": [], "next_cursor": after, "terminal": True, "more_available": False}
+
+
 def test_driver_runs_constrained_diagnostics_closes_session_and_keeps_timings_out_of_tool_context():
     model = FakeModel()
     control_plane = FakeControlPlane()
@@ -179,6 +210,7 @@ def test_driver_runs_constrained_diagnostics_closes_session_and_keeps_timings_ou
     )
 
     assert result.final_report.startswith("Likely host override")
+    assert result.completed is True
     assert result.closed is True
     assert control_plane.closed is True
     assert len(control_plane.submitted) == 1
@@ -212,6 +244,23 @@ def test_transient_long_poll_timeout_reports_progress_and_continues_within_budge
     assert result.closed is True
     assert control_plane.timed_out_once is True
     assert progress[0]["type"] == "long_poll_timeout"
+
+
+def test_long_poll_drains_more_than_eight_events_after_terminal():
+    progress = []
+    result = drive_diagnostic(
+        problem="Diagnose file server access",
+        device_id="device-1",
+        model_client=FakeModel(),
+        control_plane=ManyEventsControlPlane(),
+        max_steps=1,
+        max_seconds=60,
+        progress_callback=progress.append,
+    )
+
+    assert result.closed is True
+    output_events = [event for event in progress if event["type"] == "output" and event["stream"] == "stdout"]
+    assert [event["cursor"] for event in output_events] == [str(index) for index in range(1, 11)]
 
 
 def test_build_script_only_uses_fixed_templates_and_quotes_target():
@@ -340,7 +389,7 @@ def test_output_page_requires_preview_or_prior_page_more_available():
         tools.get_output_page(execution_id="exec-1", stream="stdout", after="0")
 
 
-def test_page_larger_than_model_exposure_limit_is_rejected_to_avoid_skipped_middle_output():
+def test_valid_api_minimum_sized_ascii_page_is_fully_exposed_and_advances_cursor():
     control_plane = FakeControlPlane(page_text="x" * 7000)
     tools = DiagnosticTools(control_plane, "session-1", deadline_monotonic=time.perf_counter() + 60)
     tools.executions["exec-1"] = {
@@ -348,10 +397,11 @@ def test_page_larger_than_model_exposure_limit_is_rejected_to_avoid_skipped_midd
         "page_allowed": {"stdout": True, "stderr": False},
     }
 
-    with pytest.raises(DriverError):
-        tools.get_output_page(execution_id="exec-1", stream="stdout", after="0")
+    page, _ = tools.get_output_page(execution_id="exec-1", stream="stdout", after="0")
 
-    assert tools.executions["exec-1"]["page_cursors"]["stdout"] == "0"
+    assert page["page"]["shortened"] is False
+    assert len(page["page"]["text"]) == 7000
+    assert tools.executions["exec-1"]["page_cursors"]["stdout"] == "2"
 
 
 def test_driver_closes_session_when_step_budget_is_exhausted():
@@ -369,6 +419,7 @@ def test_driver_closes_session_when_step_budget_is_exhausted():
 
     assert result.final_report == "Stopped because the configured diagnostic step budget was exhausted."
     assert result.closed is True
+    assert result.completed is False
     assert len(result.steps) == 1
 
 
@@ -387,6 +438,7 @@ def test_driver_caps_execution_timeout_and_api_waits_to_remaining_time_budget():
 
     assert result.closed is True
     assert len(control_plane.submitted) == 1
+    assert result.completed is False
     assert 100 <= control_plane.submitted[0][1] <= 1000
     assert all(timeout <= 1.1 for timeout in model.timeouts)
     api_timeouts = control_plane.open_timeouts + control_plane.submit_timeouts + control_plane.get_timeouts
@@ -512,6 +564,26 @@ def test_progress_callback_receives_bounded_output_outside_model_context():
     assert "event" not in model.inputs[1][-1]["output"]
 
 
+def test_no_change_progress_is_emitted_for_quiet_polls():
+    progress = []
+    result = drive_diagnostic(
+        problem="Diagnose file server access",
+        device_id="device-1",
+        model_client=FakeModel(),
+        control_plane=FakeControlPlane(),
+        max_steps=1,
+        max_seconds=60,
+        progress_callback=progress.append,
+    )
+
+    assert result.closed is True
+    assert any(event["type"] == "no_change" for event in progress)
+
+
+def test_progress_sanitizes_terminal_control_characters():
+    assert sanitize_progress_text("ok\n\tesc:\x1b[31m\rbad\x85") == "ok\n\tesc:\\x1b[31m\\x0dbad\\x85"
+
+
 def test_model_failure_raises_structured_error_with_close_failure():
     class FailingModel:
         def create_response(self, input_items, *, timeout_seconds):
@@ -571,6 +643,41 @@ def test_control_plane_client_authenticates_public_api_without_openai_key():
     assert client.output_events("exec-1", "stdout", after="0", wait_ms=50, timeout_seconds=1)["terminal"] is True
     assert client.output_page("exec-1", "stdout", "0", 8192, timeout_seconds=1)["text"] == "page"
     assert len(requests) == 3
+
+
+def test_first_online_device_paginates_until_online_device():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            assert "after" not in request.url.params
+            return httpx.Response(200, json={
+                "devices": [{"id": "stale-1", "reachability": "stale"}],
+                "next_cursor": "cursor-1",
+            })
+        assert request.url.params["after"] == "cursor-1"
+        return httpx.Response(200, json={
+            "devices": [{"id": "online-1", "reachability": "online"}],
+            "next_cursor": None,
+        })
+
+    original_get = httpx.get
+    try:
+        httpx.get = httpx.Client(
+            base_url="http://control-plane.test",
+            transport=httpx.MockTransport(handler),
+        ).get
+        device = ControlPlaneClient.first_online_device(
+            "http://control-plane.test",
+            "admin-secret",
+            deadline_monotonic=time.perf_counter() + 60,
+        )
+    finally:
+        httpx.get = original_get
+
+    assert device == "online-1"
+    assert len(requests) == 2
 
 
 def test_openai_responses_client_uses_bounded_model_request_and_reports_usage():

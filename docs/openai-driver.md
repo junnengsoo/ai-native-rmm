@@ -11,13 +11,14 @@ exposed to the endpoint or included in model tool results.
 
 The default model is `gpt-5-nano`, selected as the lowest-cost currently listed
 OpenAI text model for this smoke path. The driver uses a small default budget:
-five tool steps, three minutes wall-clock, 600 output tokens per model call, and
-20-second execution timeouts capped to the remaining wall-clock budget. Session
-closure uses one bounded close request with a separate 30-second cleanup
-allowance, because the current close API moves an active session into a closing
-state and is not idempotent after an unconfirmed cleanup. An unconfirmed close is
-surfaced as command failure. These are deliberately conservative prototype
-defaults, not the unapproved 15-command/15-minute budget.
+five tool steps, three minutes wall-clock shared by preflight and diagnosis,
+600 output tokens per model call, and 20-second execution timeouts capped to the
+remaining wall-clock budget. Session closure uses one bounded close request with
+a separate 30-second cleanup allowance, because the current close API moves an
+active session into a closing state and is not idempotent after an unconfirmed
+cleanup. An unconfirmed close is surfaced as command failure. These are
+deliberately conservative prototype defaults, not the unapproved
+15-command/15-minute budget.
 
 ## Local deterministic tests
 
@@ -31,9 +32,9 @@ They cover adaptive tool sequencing, rejection of arbitrary or mutating tool
 requests, bounded output pages without skipped middle output, per-investigation
 execution/cursor restrictions, session closure on budget exhaustion, cleanup
 failure reporting, local argument validation, separate progress reporting,
-separate timing records, OpenAI request shape, token usage collection, and the
-fact that control-plane calls authenticate with the operator credential rather
-than the OpenAI key.
+separate timing records, paginated device discovery, OpenAI request shape, token
+usage collection, and the fact that control-plane calls authenticate with the
+operator credential rather than the OpenAI key.
 
 ## Manual Windows/OpenAI smoke
 
@@ -82,14 +83,17 @@ Expected behavior:
   and adaptively submits dependent fixed-template diagnostics through
   `POST /sessions/{id}/executions`.
 - Each execution is followed through bounded long-poll output events and final
-  execution records. If a preview is shortened, the model may request one
+  execution records. Both stdout and stderr are drained after terminal status
+  before the driver moves on. If a preview is shortened, the model may request a
   bounded retained output page for an execution created by this investigation,
-  using the next cursor tracked by the caller.
+  using the next cursor tracked by the caller. Driver pages use the control
+  plane's 8 KiB minimum and expose the full returned page before advancing the
+  cursor.
 - The final report names the likely cause and proposed human fixes, but does not
   apply remediation.
 - The rendered output lists API round-trip time, endpoint execution duration,
-  model latency before each tool step, total model latency, and token usage/cost
-  when the API returns usage.
+  model latency before each tool step, total model latency, completion state,
+  and token usage/cost when the API returns usage.
 - While commands are running, bounded output progress is emitted separately from
   model context on stderr.
 - The session is closed even when a budget ends the investigation; the single
