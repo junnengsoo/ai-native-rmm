@@ -54,7 +54,9 @@ try {
         && engine.Result.GetProperty("exitCode").GetInt32() == 0
         && !engine.Result.GetProperty("hadErrors").GetBoolean()
         && engine.Stdout.Contains("Desktop") && engine.Stdout.Contains("True") && engine.Stdout.Contains("Windows"),
-        "native 64-bit Windows PowerShell loads the inbox CimCmdlets module");
+        "native 64-bit Windows PowerShell loads the inbox CimCmdlets module: stdout="
+        + JsonSerializer.Serialize(engine.Stdout) + " stderr=" + JsonSerializer.Serialize(engine.Stderr)
+        + " result=" + engine.Result.GetRawText());
     var result = await ExecuteWithOutput("'hello from Windows'", 5000);
     Require(result.Result.GetProperty("state").GetString() == "completed"
         && result.Result.GetProperty("invocationOutcome").GetString() == "completed_normally"
