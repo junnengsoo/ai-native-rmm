@@ -60,8 +60,8 @@ including after it has lost contact with the control plane. Authenticated
 `cancel_execution` and `close_session` requests also stop the active worker.
 The endpoint continuously drains PowerShell output and forwards UTF-8-safe chunks
 bounded to 8 KiB of text bytes before JSON framing. The control plane derives
-API previews, 64 KiB pages, and long-poll events from durably stored `output`
-frames. Preview shortening is not capture loss. A session worker is owned by a
+terminal API previews and 64 KiB pages from durably stored `output` frames.
+Preview shortening is not capture loss. A session worker is owned by a
 Windows Job Object. Timeout, cancellation, or closure terminates that job,
 including owned child processes and waits up to 30 seconds for confirmation;
 only confirmed zero active processes permits confirmed stopping. Stopping never

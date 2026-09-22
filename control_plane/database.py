@@ -487,11 +487,14 @@ def recover_interrupted_work() -> None:
             sessions.c.state.in_(("starting", "active", "closing"))).values(
             state="failed", closed_at=func.now()))
 
-def fail_device_investigations(device_id: uuid.UUID | str) -> None:
+def fail_device_investigations(device_id: uuid.UUID | str) -> list[uuid.UUID]:
     with transaction() as connection:
         live_sessions = select(sessions.c.id).where(
             sessions.c.device_id == device_id,
             sessions.c.state.in_(("starting", "active", "closing")))
+        affected_execution_ids = list(connection.execute(select(executions.c.id).where(
+            executions.c.session_id.in_(live_sessions),
+            executions.c.status.in_(("queued", "running")))).scalars())
         connection.execute(update(executions).where(
             executions.c.session_id.in_(live_sessions),
             executions.c.status.in_(("queued", "running"))).values(
@@ -505,3 +508,4 @@ def fail_device_investigations(device_id: uuid.UUID | str) -> None:
             sessions.c.device_id == device_id,
             sessions.c.state == "closing").values(
             state="cleanup_unknown", closed_at=func.now()))
+        return affected_execution_ids
