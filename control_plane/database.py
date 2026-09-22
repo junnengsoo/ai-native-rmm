@@ -57,9 +57,9 @@ sessions = Table("sessions", metadata,
     Column("state", String(16), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("ready_at", DateTime(timezone=True)), Column("closed_at", DateTime(timezone=True)),
-    CheckConstraint("state IN ('starting', 'active', 'closing', 'closed', 'failed')", name="sessions_state_valid"))
+    CheckConstraint("state IN ('starting', 'active', 'closing', 'closed', 'failed', 'cleanup_unknown')", name="sessions_state_valid"))
 Index("sessions_one_live_per_device", sessions.c.device_id, unique=True,
-      postgresql_where=sessions.c.state.in_(("starting", "active", "closing")))
+      postgresql_where=sessions.c.state.in_(("starting", "active", "closing", "cleanup_unknown")))
 executions = Table("executions", metadata,
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("workspace_id", UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=False),
@@ -76,7 +76,7 @@ executions = Table("executions", metadata,
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("started_at", DateTime(timezone=True)), Column("finished_at", DateTime(timezone=True)),
     CheckConstraint("timeout_ms > 0", name="executions_timeout_positive"),
-    CheckConstraint("status IN ('queued', 'running', 'completed', 'timed_out', 'outcome_unknown')", name="executions_status_valid"),
+    CheckConstraint("status IN ('queued', 'running', 'completed', 'failed_to_start', 'timed_out', 'cancelled', 'outcome_unknown')", name="executions_status_valid"),
     UniqueConstraint("caller_id", "idempotency_key", name="executions_caller_idempotency_key"))
 Index("executions_one_live_per_session", executions.c.session_id, unique=True,
       postgresql_where=executions.c.status.in_(("queued", "running")))
@@ -264,6 +264,12 @@ def mark_session_failed(session_id: uuid.UUID) -> None:
             sessions.c.id == session_id, sessions.c.state.in_(("starting", "active", "closing"))
         ).values(state="failed", closed_at=func.now()))
 
+def mark_session_cleanup_unknown(session_id: uuid.UUID) -> None:
+    with transaction() as connection:
+        connection.execute(update(sessions).where(
+            sessions.c.id == session_id, sessions.c.state.in_(("active", "closing"))
+        ).values(state="cleanup_unknown", closed_at=func.now()))
+
 def get_workspace_session(workspace_id: uuid.UUID, session_id: uuid.UUID) -> RowMapping | None:
     with transaction() as connection:
         return connection.execute(select(sessions).where(
@@ -283,6 +289,12 @@ def mark_session_closed(session_id: uuid.UUID) -> None:
         ).values(state="closed", closed_at=func.now())).rowcount
         if changed != 1:
             raise RuntimeError("invalid_session_transition")
+
+def mark_session_endpoint_closed(session_id: uuid.UUID) -> None:
+    with transaction() as connection:
+        connection.execute(update(sessions).where(
+            sessions.c.id == session_id, sessions.c.state.in_(("active", "closing"))
+        ).values(state="closed", closed_at=func.now()))
 
 def create_or_get_execution(workspace_id: uuid.UUID, caller_id: uuid.UUID,
                             session_id: uuid.UUID, idempotency_key: str, script: str,
@@ -404,6 +416,23 @@ def mark_execution_unknown(execution_id: uuid.UUID, reason: str,
         ).values(status="outcome_unknown", outcome_reason=reason,
                  last_confirmed_status=last_confirmed_status, finished_at=func.now()))
 
+def mark_execution_failed_to_start(execution_id: uuid.UUID, reason: str) -> None:
+    with transaction() as connection:
+        connection.execute(update(executions).where(
+            executions.c.id == execution_id,
+            executions.c.status == "queued",
+        ).values(status="failed_to_start", outcome_reason=reason,
+                 last_confirmed_status="queued", finished_at=func.now()))
+
+def mark_queued_execution_cancelled(workspace_id: uuid.UUID, execution_id: uuid.UUID) -> RowMapping | None:
+    with transaction() as connection:
+        return connection.execute(update(executions).where(
+            executions.c.id == execution_id,
+            executions.c.workspace_id == workspace_id,
+            executions.c.status == "queued",
+        ).values(status="cancelled", outcome_reason="caller_cancelled_before_start",
+                 last_confirmed_status="queued", finished_at=func.now()).returning(executions)).mappings().one_or_none()
+
 def get_workspace_execution(workspace_id: uuid.UUID, execution_id: uuid.UUID) -> RowMapping | None:
     with transaction() as connection:
         return connection.execute(select(executions).where(
@@ -470,5 +499,9 @@ def fail_device_investigations(device_id: uuid.UUID | str) -> None:
             last_confirmed_status=executions.c.status, finished_at=func.now()))
         connection.execute(update(sessions).where(
             sessions.c.device_id == device_id,
-            sessions.c.state.in_(("starting", "active", "closing"))).values(
+            sessions.c.state == "starting").values(
             state="failed", closed_at=func.now()))
+        connection.execute(update(sessions).where(
+            sessions.c.device_id == device_id,
+            sessions.c.state == "closing").values(
+            state="cleanup_unknown", closed_at=func.now()))

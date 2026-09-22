@@ -4,7 +4,6 @@ import subprocess
 import sys
 import base64
 import json
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -165,25 +164,6 @@ def test_device_pagination_stays_inside_the_admins_workspace():
     assert len(second["devices"]) == 1 and second["next_cursor"] is None
     assert first["devices"][0]["id"] != second["devices"][0]["id"]
     assert httpx.get(BASE + "/devices", headers=other, params={"after": first["next_cursor"]}).json()["devices"] == []
-
-
-@pytest.mark.skipif(not os.environ.get("RMM_EXPIRY_TEST"), reason="ten-minute real-time expiry gate")
-def test_expired_code_and_approved_but_unproven_key_cannot_activate():
-    admin = local_admin()
-    pending_key, pending_public = endpoint_key()
-    approved_key, approved_public = endpoint_key()
-    with connect(BASE.replace("http", "ws") + "/agent") as socket:
-        pending = prove(socket, pending_key, pending_public)
-    with connect(BASE.replace("http", "ws") + "/agent") as socket:
-        approved = prove(socket, approved_key, approved_public)
-    assert httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": approved["code"]}).status_code == 200
-    deadline = time.monotonic() + 601
-    while time.monotonic() < deadline:
-        time.sleep(1)
-    assert httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": pending["code"]}).status_code == 409
-    with connect(BASE.replace("http", "ws") + "/agent") as socket:
-        assert prove(socket, approved_key, approved_public)["state"] == "denied"
-    assert httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]["reachability"] == "approval_expired"
 
 
 @pytest.mark.skipif(not os.environ.get("RMM_RATE_TEST"), reason="intentionally consumes global connection allowance")

@@ -103,7 +103,20 @@ class EndpointAgentSimulator:
                     execution = message["executionId"]
                     assert hashlib.sha256(message["script"].encode()).hexdigest() == message["scriptSha256"]
                     socket.send(json.dumps({"type": "running", **common, "executionId": execution}))
-                    if message["script"] == "$trialValue = 42":
+                    if message["script"] == "WAIT_FOR_CANCEL":
+                        while True:
+                            followup = json.loads(socket.recv(timeout=2))
+                            if followup["type"] == "cancel_execution" and followup["executionId"] == execution:
+                                socket.send(json.dumps({
+                                    "type": "result", **common, "executionId": execution,
+                                    "state": "cancelled", "invocationOutcome": "stopped",
+                                    "exitCode": None, "exitCodeSource": None,
+                                    "hadErrors": False, "durationMs": 1.0,
+                                    "captureTruncated": False, "lastNativeExitCode": None,
+                                }))
+                                break
+                        continue
+                    elif message["script"] == "$trialValue = 42":
                         variable = 42
                     elif message["script"] == "$trialValue":
                         socket.send(json.dumps({"type": "output", **common, "executionId": execution,
@@ -162,6 +175,74 @@ def submit(operator, session, script, key):
         BASE + f"/sessions/{session}/executions", headers={**operator, "Idempotency-Key": key},
         json={"script": script, "timeout_ms": 5000},
     )
+
+
+def test_timeout_is_required_and_offline_submission_fails_to_start():
+    admin = bootstrap_admin()
+    operator, _ = create_operator(admin, "deadline-agent")
+    key, public, device = enroll(admin)
+    with EndpointAgentSimulator(key, public):
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
+        assert opened.status_code == 201
+        session = opened.json()
+        missing_timeout = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
+            **operator, "Idempotency-Key": "missing-timeout",
+        }, json={"script": "'ok'"})
+        assert missing_timeout.status_code == 422
+        submitted = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
+            **operator, "Idempotency-Key": "selected-timeout",
+        }, json={"script": "'ok'", "timeout_ms": 5000})
+        assert submitted.status_code == 202
+        result = wait_for_execution(operator, submitted.json()["execution_id"])
+        assert result["status"] == "completed"
+
+    offline = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
+        **operator, "Idempotency-Key": "offline",
+    }, json={"script": "'must-not-run'", "timeout_ms": 5000})
+    assert offline.status_code == 202
+    result = wait_for_execution(operator, offline.json()["execution_id"])
+    assert result["status"] == "failed_to_start"
+    assert result["outcome_reason"] == "device_offline_before_dispatch"
+    assert result["last_confirmed_status"] == "queued"
+
+
+def test_caller_can_cancel_running_execution():
+    admin = bootstrap_admin()
+    operator, _ = create_operator(admin, "cancel-agent")
+    key, public, device = enroll(admin)
+    with EndpointAgentSimulator(key, public):
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
+        assert opened.status_code == 201
+        session = opened.json()["session_id"]
+        submitted = submit(operator, session, "WAIT_FOR_CANCEL", "cancel-me")
+        assert submitted.status_code == 202
+        execution = submitted.json()["execution_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            running = httpx.get(BASE + f"/executions/{execution}", headers=operator).json()
+            if running["status"] == "running":
+                break
+            time.sleep(0.05)
+        cancelled = httpx.post(BASE + f"/executions/{execution}/cancel", headers=operator)
+        assert cancelled.status_code == 202
+        result = wait_for_execution(operator, execution)
+        assert result["status"] == "cancelled"
+        assert result["invocation_outcome"] == "stopped"
+        assert result["exit_code"] is None
+
+
+def test_close_without_endpoint_confirmation_blocks_replacement():
+    admin = bootstrap_admin()
+    operator, _ = create_operator(admin, "cleanup-agent")
+    key, public, device = enroll(admin)
+    with EndpointAgentSimulator(key, public):
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
+        assert opened.status_code == 201
+        session = opened.json()["session_id"]
+    closed = httpx.post(BASE + f"/sessions/{session}/close", headers=operator)
+    assert closed.status_code == 503
+    with EndpointAgentSimulator(key, public):
+        assert httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device}).status_code == 409
 
 
 def test_operator_runs_persistent_investigation_and_idempotent_retry_once():

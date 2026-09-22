@@ -15,32 +15,75 @@ internal static class AgentRuntime {
         var sessions = new HashSet<string>(StringComparer.Ordinal);
         var executions = new HashSet<string>(StringComparer.Ordinal);
         Task<(string Session, string Execution, WorkerResult Result)>? invocation = null;
+        CancellationTokenSource? invocationStop = null;
+        string? currentExecution = null;
+        bool closeAfterInvocation = false;
         Task<JsonElement>? incoming = null;
         using var stopped = new CancellationTokenSource();
         using var sendLock = new SemaphoreSlim(1, 1);
         Task heartbeats = sendHeartbeats ? Heartbeats(socket, sendLock, stopped.Token) : Task.CompletedTask;
         try {
             while (socket.State == WebSocketState.Open) {
-                incoming ??= Receive(socket);
                 if (invocation is not null) {
+                    incoming ??= Receive(socket, TimeSpan.FromMinutes(2));
                     var ready = await Task.WhenAny(incoming, invocation);
                     if (ready == invocation) {
                         var completed = await invocation;
                         invocation = null;
+                        invocationStop?.Dispose();
+                        invocationStop = null;
+                        currentExecution = null;
                         await Send(socket, sendLock, new { type = "result", deviceId = device,
                             sessionId = completed.Session, executionId = completed.Execution,
                             completed.Result.State, completed.Result.InvocationOutcome, completed.Result.ExitCode,
                             completed.Result.ExitCodeSource, completed.Result.HadErrors,
                             completed.Result.DurationMs, completed.Result.CaptureTruncated,
                             completed.Result.LastNativeExitCode });
-                        continue;
+                        if (closeAfterInvocation && worker is not null) {
+                            await worker.DisposeAsync();
+                            worker = null;
+                            await Send(socket, sendLock, new { type = "session_closed", deviceId = device, sessionId = session });
+                            session = null;
+                            closeAfterInvocation = false;
+                        }
+                    } else {
+                        try {
+                            var runningMessage = await incoming;
+                            if (runningMessage.TryGetProperty("type", out var runningMessageType)
+                                && runningMessageType.ValueKind == JsonValueKind.String
+                                && runningMessageType.GetString() == "heartbeat_ack") {
+                                continue;
+                            }
+                            Dispatch? runningRequest;
+                            try { runningRequest = Dispatch.Parse(runningMessage, device); }
+                            catch (JsonException) { runningRequest = null; }
+                            if (runningRequest?.Type == "cancel_execution" && runningRequest.SessionId == session
+                                && runningRequest.ExecutionId == currentExecution) {
+                                invocationStop?.Cancel();
+                            } else if (runningRequest?.Type == "close_session" && runningRequest.SessionId == session) {
+                                closeAfterInvocation = true;
+                                invocationStop?.Cancel();
+                            } else {
+                                await Reject(socket, sendLock, runningRequest is null ? "invalid_request" : "invalid_state_or_duplicate");
+                            }
+                        } catch (JsonException) {
+                            await Reject(socket, sendLock, "invalid_request");
+                        } catch (OperationCanceledException) {
+                        } finally {
+                            incoming = null;
+                        }
                     }
+                    continue;
                 }
                 JsonElement message;
+                incoming ??= Receive(socket, TimeSpan.FromMinutes(2));
                 try { message = await incoming; }
                 catch (JsonException) {
                     incoming = null;
                     await Reject(socket, sendLock, "invalid_request");
+                    continue;
+                } catch (OperationCanceledException) {
+                    incoming = null;
                     continue;
                 }
                 incoming = null;
@@ -70,9 +113,13 @@ internal static class AgentRuntime {
                     string execution = request.ExecutionId!;
                     await Send(socket, sendLock, new { type = "running", deviceId = device,
                         sessionId = session, executionId = execution });
+                    invocationStop = new CancellationTokenSource();
+                    currentExecution = execution;
+                    closeAfterInvocation = false;
                     invocation = Complete(worker, session!, execution, request.Script!, request.TimeoutMs,
                         (stream, text) => Send(socket, sendLock, new { type = "output", deviceId = device,
-                            sessionId = session, executionId = execution, stream, text }));
+                            sessionId = session, executionId = execution, stream, text }),
+                        invocationStop.Token);
                 } else await Reject(socket, sendLock, "invalid_state_or_duplicate");
             }
         } finally {
@@ -85,8 +132,8 @@ internal static class AgentRuntime {
 
     private static async Task<(string Session, string Execution, WorkerResult Result)> Complete(
         WorkerProcess worker, string session, string execution, string script, int timeoutMs,
-        Func<string, string, Task> onOutput) =>
-        (session, execution, await worker.Execute(script, timeoutMs, onOutput));
+        Func<string, string, Task> onOutput, CancellationToken cancellation) =>
+        (session, execution, await worker.Execute(script, timeoutMs, onOutput, cancellation));
 
     private static async Task Heartbeats(WebSocket socket, SemaphoreSlim sendLock, CancellationToken stopped) {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(15));
@@ -108,8 +155,8 @@ internal static class AgentRuntime {
         } finally { sendLock.Release(); }
     }
 
-    private static async Task<JsonElement> Receive(WebSocket socket) {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+    private static async Task<JsonElement> Receive(WebSocket socket, TimeSpan wait) {
+        using var timeout = new CancellationTokenSource(wait);
         using var data = new MemoryStream();
         var buffer = new byte[8192];
         WebSocketReceiveResult part;

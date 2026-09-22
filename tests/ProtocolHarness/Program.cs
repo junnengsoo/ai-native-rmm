@@ -47,7 +47,7 @@ try {
     string device = hello.GetProperty("deviceId").GetString()!;
     Require(device == "test-device" && hello.GetProperty("protocolVersion").GetInt32() == 1, "certificate peer is bound to the expected device and version");
     string session = Guid.NewGuid().ToString();
-    await Send(socket, new { type = "open_session", deviceId = device, sessionId = session });
+    await Send(socket, OpenSession(device, session));
     Require((await Receive(socket)).GetProperty("type").GetString() == "session_ready", "real worker ready");
     var result = await ExecuteWithOutput("'hello from Windows'", 5000);
     Require(result.Result.GetProperty("state").GetString() == "completed"
@@ -139,6 +139,26 @@ try {
     await ReplaceSession();
     var cleanup = await ExecuteWithOutput($"$null -eq (Get-Process -Id {childId} -ErrorAction SilentlyContinue)", 5000);
     Require(cleanup.Stdout.Trim() == "True", "session-owned native child was terminated");
+    string cancelledExecution = Guid.NewGuid().ToString();
+    var cancelRequest = Request("'before-cancel'; Start-Sleep -Seconds 20");
+    cancelRequest["executionId"] = cancelledExecution;
+    await Send(socket, cancelRequest);
+    Require((await Receive(socket)).GetProperty("type").GetString() == "running", "cancel target started");
+    await Send(socket, new { type = "cancel_execution", deviceId = device, sessionId = session, executionId = cancelledExecution });
+    JsonElement cancelled;
+    while (true) {
+        cancelled = await Receive(socket);
+        Require(cancelled.GetProperty("executionId").GetString() == cancelledExecution
+            && cancelled.GetProperty("sessionId").GetString() == session
+            && cancelled.GetProperty("deviceId").GetString() == device, "correlated cancellation message");
+        if (cancelled.GetProperty("type").GetString() == "output") continue;
+        break;
+    }
+    Require(cancelled.GetProperty("state").GetString() == "cancelled"
+        && cancelled.GetProperty("invocationOutcome").GetString() == "stopped"
+        && cancelled.GetProperty("exitCode").ValueKind == JsonValueKind.Null, "caller cancellation confirms stopping");
+    await Rejected(Request("'must-not-run'"), "cancelled worker is retired");
+    await ReplaceSession();
     var lost = await Execute("[Environment]::Exit(19)", 5000);
     Require(lost.GetProperty("state").GetString() == "outcome_unknown" && lost.GetProperty("exitCode").ValueKind == JsonValueKind.Null,
         "worker disappearance cannot forge definitive completion");
@@ -160,7 +180,7 @@ try {
         await Send(socket, new { type = "close_session", deviceId = device, sessionId = session });
         Require((await Receive(socket)).GetProperty("type").GetString() == "session_closed", "old worker cleanup acknowledged");
         session = Guid.NewGuid().ToString();
-        await Send(socket, new { type = "open_session", deviceId = device, sessionId = session });
+        await Send(socket, OpenSession(device, session));
         Require((await Receive(socket)).GetProperty("type").GetString() == "session_ready", "replacement worker ready");
     }
 
@@ -217,6 +237,9 @@ Process StartAgent(string thumbprint, string? pin = null) => Process.Start(new P
     Environment = { ["RMM_TEST_SECRET"] = "isolated-dummy-secret" },
     ArgumentList = { args[0], "--agent", "wss://localhost:18443/agent", thumbprint, pin ?? Convert.ToHexString(SHA256.HashData(serverCert.RawData)), "test-device" }
 })!;
+static object OpenSession(string device, string session) => new {
+    type = "open_session", deviceId = device, sessionId = session
+};
 static X509Certificate2 Certificate(string thumbprint) {
     using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
     store.Open(OpenFlags.ReadOnly);

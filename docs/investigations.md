@@ -1,4 +1,4 @@
-# Persistent investigations — slice 3
+# Persistent investigations — slices 3–4
 
 An admin creates independently revocable callers. An `operator` can open one
 debugging session on an online device, submit one PowerShell execution at a time,
@@ -24,19 +24,24 @@ return the original execution; changing any bound input returns `409`.
 - `POST /callers` — admin only; returns a new credential once.
 - `POST /sessions` — operator only; returns only after the endpoint worker is ready.
 - `GET /sessions/{id}` — operator, workspace scoped.
-- `POST /sessions/{id}/executions` — operator; requires `Idempotency-Key`.
+- `POST /sessions/{id}/executions` — operator; requires `Idempotency-Key` and an explicit `timeout_ms`.
 - `GET /executions/{id}` — operator, workspace scoped; includes up to 8 KiB
   of preview per output stream.
 - `GET /executions/{id}/output/{stdout|stderr}` — operator, workspace scoped;
   returns retained output pages of at most 64 KiB.
 - `GET /executions/{id}/output/{stdout|stderr}/events` — operator, workspace
   scoped; finite HTTP long-poll for retained output after a cursor.
+- `POST /executions/{id}/cancel` — operator, workspace scoped; requests cancellation of queued/running work.
 - `POST /sessions/{id}/close` — operator; returns after endpoint cleanup confirmation.
 
-Execution statuses are `queued`, `running`, `completed`, `timed_out`, and
-`outcome_unknown`. Unknown outcomes retain null values for evidence that was not
-observed and report a reason plus the last confirmed lifecycle state. Completed
-results distinguish normalized invocation codes from explicit script exits.
+Execution statuses are `queued`, `running`, `completed`, `failed_to_start`,
+`timed_out`, `cancelled`, and `outcome_unknown`. `failed_to_start` is used for
+known non-execution, including submission while the endpoint is offline.
+`timed_out` and `cancelled` are used only when the endpoint confirms that the
+worker and owned children stopped. Unknown outcomes retain null values for
+evidence that was not observed and report a reason plus the last confirmed
+lifecycle state. Completed results distinguish normalized invocation codes from
+explicit script exits.
 Output is retained incrementally as inert per-stream data, never parsed as
 lifecycle even when it resembles protocol JSON. Endpoint terminal `result`
 messages carry lifecycle metadata only; stdout/stderr text comes from ordered
@@ -56,6 +61,13 @@ or timeout. It includes the current execution status, a terminal boolean,
 `next_cursor`, stream high-water cursor, `more_available`, explicit gap/loss
 metadata, and `timed_out`/`no_change` flags so a caller can decide whether to
 inspect evidence, poll again, page more output, or submit the next command.
+
+The caller must select `timeout_ms` for every execution; there is no default.
+Values are accepted from 100 ms through the 60-minute safety ceiling. The
+endpoint enforces the selected timeout locally even if the caller disconnects.
+Timeout, cancellation, and explicit session closure terminate the worker's
+Windows Job Object, including owned child processes, and wait up to ten seconds
+for confirmation before reporting uncertainty.
 
 ## Manual smoke test
 
@@ -99,6 +111,19 @@ same requests with an HTTP client:
 9. `POST /sessions/SESSION_ID/close`; expect `status: closed`. Create another
    session and evaluate `$null -eq $global:trialValue`; expect `True`, proving a
    fresh PowerShell environment. Close it.
+10. For timeout cleanup, create a fresh session and submit a long script with
+   `timeout_ms: 500` that starts an owned child process before sleeping. Poll the
+   execution until it returns `timed_out`, `invocation_outcome: stopped`, null
+   exit-code fields, and any partial output observed before the timeout. Close
+   that session, open a fresh session, and verify the child process ID is gone.
+11. Repeat with caller cancellation: submit a long-running execution, call
+   `POST /executions/EXECUTION_ID/cancel`, and poll until it returns `cancelled`,
+   `invocation_outcome: stopped`, and null exit-code fields.
+12. For offline behavior, create a session while the device is online, stop the
+   endpoint agent, then submit an execution. The execution record should become
+   `failed_to_start` with `outcome_reason: device_offline_before_dispatch` and
+   `last_confirmed_status: queued`; no script output or invented exit code should
+   be present.
 
 On 2026-09-21, the local public HTTP suite ran against a live PostgreSQL-backed
 control plane with an independent endpoint simulator: `20 passed, 3 skipped`.
@@ -107,14 +132,17 @@ pages, Unicode, empty streams, output imitating control messages, disconnected
 slow consumers, and workspace-scoped denial. The opt-in
 `tests/control_plane/test_windows.py` automates the persistent investigation path
 against the authorized Azure Windows VM. It additionally stops the endpoint,
-waits for staleness, restarts it, and verifies the stable device identity.
+observes an offline terminal execution record, waits for staleness, restarts it,
+and verifies the stable device identity.
 
 ## Boundaries
 
 The trial uses one control-plane process because live WebSocket routing is
 in-memory; durable claims and results remain in PostgreSQL. A restart marks
 previously running work `outcome_unknown` and live sessions `failed` rather than
-relaunching uncertain work. Multi-process connection routing, caller revocation,
-installer/service lifecycle, output search, and configurable execution profiles
-belong to later tickets. Nothing in this slice claims that arbitrary scripts are
-sandboxed from the managed Windows host.
+relaunching uncertain work. The prototype does not include configurable session
+idle/absolute lifetime, start-deadline clock coordination, offline command
+queueing, or restart reconciliation. Multi-process connection routing, full
+output search, caller revocation, installer/service lifecycle, and configurable
+execution profiles belong to later tickets. Nothing in this slice claims that
+arbitrary scripts are sandboxed from the managed Windows host.

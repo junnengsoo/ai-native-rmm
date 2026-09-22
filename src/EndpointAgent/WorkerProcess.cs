@@ -69,13 +69,15 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             throw;
         }
     }
-    public async Task<WorkerResult> Execute(string script, int timeoutMs, Func<string, string, Task> onOutput) {
+    public async Task<WorkerResult> Execute(string script, int timeoutMs, Func<string, string, Task> onOutput,
+                                            CancellationToken cancellation) {
         var watch = Stopwatch.StartNew();
         using var deadline = new CancellationTokenSource(timeoutMs);
+        using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellation);
         try {
-            await writer.WriteLineAsync(JsonSerializer.Serialize(new { script }).AsMemory(), deadline.Token);
+            await writer.WriteLineAsync(JsonSerializer.Serialize(new { script }).AsMemory(), stopSignal.Token);
             while (true) {
-                string line = await reader.ReadLineAsync(deadline.Token) ?? throw new EndOfStreamException();
+                string line = await reader.ReadLineAsync(stopSignal.Token) ?? throw new EndOfStreamException();
                 using var message = JsonDocument.Parse(line);
                 if (message.RootElement.TryGetProperty("kind", out var kind) && kind.GetString() == "output") {
                     var stream = message.RootElement.GetProperty("stream").GetString() == "stdout" ? "stdout" : "stderr";
@@ -90,8 +92,11 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         } catch (Exception error) when (error is OperationCanceledException or IOException or JsonException) {
             IsUsable = false;
             stopped = await job.Stop();
-            bool timeout = error is OperationCanceledException && stopped;
-            return new WorkerResult(timeout ? "timed_out" : "outcome_unknown", timeout ? "stopped" : null,
+            bool confirmedCancellation = error is OperationCanceledException && stopped;
+            string? state = confirmedCancellation
+                ? cancellation.IsCancellationRequested ? "cancelled" : "timed_out"
+                : "outcome_unknown";
+            return new WorkerResult(state, confirmedCancellation ? "stopped" : null,
                 null, null, false, watch.Elapsed.TotalMilliseconds, true, null);
         }
     }

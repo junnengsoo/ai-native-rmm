@@ -24,8 +24,9 @@ from .database import (
     digest, fail_device_investigations, finish_execution, get_execution_output_events,
     get_execution_output_high_water,
     get_execution_output_page, get_execution_output_preview, get_workspace_execution, get_workspace_session, increment_rate_limit,
-    initialize, list_workspace_devices, mark_execution_unknown, mark_session_closed,
-    mark_session_failed, mark_session_ready, record_heartbeat, recover_interrupted_work,
+    initialize, list_workspace_devices, mark_execution_failed_to_start, mark_execution_unknown,
+    mark_queued_execution_cancelled, mark_session_cleanup_unknown, mark_session_closed,
+    mark_session_endpoint_closed, mark_session_failed, mark_session_ready, record_heartbeat, recover_interrupted_work,
 )
 from .reachability import classify_reachability
 
@@ -42,6 +43,9 @@ async def lifespan(app):
 
 app = FastAPI(title="RMM investigation control plane", lifespan=lifespan)
 output_waiters: dict[tuple[str, str], asyncio.Condition] = {}
+
+MAX_RUNTIME_MS = 3_600_000
+CLEANUP_GRACE_SECONDS = 10
 
 
 @app.middleware("http")
@@ -195,7 +199,7 @@ def validate_endpoint_agent_message(message: dict) -> None:
         return
     if kind != "result":
         return
-    if message["state"] not in {"completed", "timed_out", "outcome_unknown"}:
+    if message["state"] not in {"completed", "timed_out", "cancelled", "outcome_unknown"}:
         raise ValueError()
     if not isinstance(message["hadErrors"], bool) or not isinstance(message["captureTruncated"], bool):
         raise ValueError()
@@ -208,7 +212,7 @@ def validate_endpoint_agent_message(message: dict) -> None:
             raise ValueError()
     elif message["exitCode"] is not None or message["exitCodeSource"] is not None:
         raise ValueError()
-    elif message["state"] == "timed_out" and message["invocationOutcome"] != "stopped":
+    elif message["state"] in {"timed_out", "cancelled"} and message["invocationOutcome"] != "stopped":
         raise ValueError()
     elif message["state"] == "outcome_unknown" and message["invocationOutcome"] is not None:
         raise ValueError()
@@ -222,7 +226,7 @@ class SessionCreation(BaseModel):
 class ExecutionCreation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     script: str = Field(min_length=1, max_length=32768)
-    timeout_ms: int = Field(default=30000, ge=100, le=30000)
+    timeout_ms: int = Field(ge=100, le=MAX_RUNTIME_MS)
 
 
 def session_view(row):
@@ -376,14 +380,18 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
     except LookupError:
         raise HTTPException(404, "active_session_not_found") from None
     except RuntimeError as error:
-        code = "idempotency_conflict" if str(error) == "idempotency_conflict" else "session_busy"
+        if str(error) == "idempotency_conflict":
+            code = "idempotency_conflict"
+        else:
+            code = "session_busy"
         raise HTTPException(409, code) from None
     if created:
         session = await asyncio.to_thread(get_workspace_session, caller["workspace_id"], session_id)
         channel = await endpoint_agents.get_connected_channel(str(session["device_id"]))
         if channel is None:
-            await asyncio.to_thread(mark_execution_unknown, row["id"],
-                                    "device_offline_before_dispatch", "queued")
+            await asyncio.to_thread(mark_execution_failed_to_start, row["id"],
+                                    "device_offline_before_dispatch")
+            row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], row["id"])
         else:
             asyncio.create_task(dispatch_execution(row["id"], channel, str(session["device_id"])))
     return {"execution_id": str(row["id"]), "status": row["status"],
@@ -462,6 +470,34 @@ async def long_poll_execution_output(execution_id: uuid.UUID, stream: str,
     }
 
 
+@app.post("/executions/{execution_id}/cancel", status_code=202)
+async def cancel_execution(execution_id: uuid.UUID, authorization: str | None = Header(default=None)):
+    caller = authenticated_caller(authorization, "operator")
+    cancelled = await asyncio.to_thread(mark_queued_execution_cancelled, caller["workspace_id"], execution_id)
+    if cancelled is not None:
+        return execution_view(cancelled)
+    row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
+    if row is None:
+        raise HTTPException(404, "execution_not_found")
+    if row["status"] != "running":
+        return execution_view(row)
+    session = await asyncio.to_thread(get_workspace_session, caller["workspace_id"], row["session_id"])
+    if session is None:
+        raise HTTPException(404, "session_not_found")
+    channel = await endpoint_agents.get_connected_channel(str(session["device_id"]))
+    if channel is None:
+        await asyncio.to_thread(mark_execution_unknown, execution_id,
+                                "cancel_confirmation_lost", "running")
+    else:
+        try:
+            await channel.send({"type": "cancel_execution", "deviceId": str(session["device_id"]),
+                                "sessionId": str(row["session_id"]), "executionId": str(execution_id)})
+        except Exception:
+            await asyncio.to_thread(mark_execution_unknown, execution_id,
+                                    "cancel_confirmation_lost", "running")
+    return execution_view(await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id))
+
+
 @app.post("/sessions/{session_id}/close")
 async def close_session(session_id: uuid.UUID, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
@@ -470,16 +506,16 @@ async def close_session(session_id: uuid.UUID, authorization: str | None = Heade
         raise HTTPException(409, "session_not_active")
     channel = await endpoint_agents.get_connected_channel(str(row["device_id"]))
     if channel is None:
-        await asyncio.to_thread(mark_session_failed, session_id)
+        await asyncio.to_thread(mark_session_cleanup_unknown, session_id)
         raise HTTPException(503, "session_close_unconfirmed")
     closed = channel.expect("session_closed", str(session_id))
     try:
         await channel.send({"type": "close_session", "deviceId": str(row["device_id"]),
                             "sessionId": str(session_id)})
-        await asyncio.wait_for(closed, 20)
+        await asyncio.wait_for(closed, CLEANUP_GRACE_SECONDS)
         await asyncio.to_thread(mark_session_closed, session_id)
     except Exception:
-        await asyncio.to_thread(mark_session_failed, session_id)
+        await asyncio.to_thread(mark_session_cleanup_unknown, session_id)
         raise HTTPException(503, "session_close_unconfirmed") from None
     return session_view(await asyncio.to_thread(get_workspace_session, caller["workspace_id"], session_id))
 
@@ -528,6 +564,9 @@ async def endpoint_agent(socket: WebSocket):
                     await notify_output(message["executionId"], message["stream"])
                     continue
                 if not channel.deliver(message):
+                    if message["type"] == "session_closed":
+                        await asyncio.to_thread(mark_session_endpoint_closed, message["sessionId"])
+                        continue
                     # Late or unsolicited evidence is never attached to another claim.
                     continue
         finally:
