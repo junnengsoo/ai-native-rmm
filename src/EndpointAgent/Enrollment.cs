@@ -49,7 +49,7 @@ internal static class Enrollment {
                     if (!Guid.TryParse(status.GetProperty("device_id").GetString(), out var device))
                         throw new InvalidDataException();
                     Console.WriteLine("online " + device);
-                    await EnrolledAgent.Run(socket, device.ToString());
+                    await AgentRuntime.Run(socket, device.ToString(), sendHeartbeats: true);
                 } else if (state == "denied") throw new UnauthorizedAccessException();
                 else if (state != "rate_limited") throw new InvalidDataException();
             } catch (WebSocketException) { Console.Error.WriteLine("connection_unavailable"); }

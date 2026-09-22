@@ -3,12 +3,13 @@ using System.Text.Json;
 
 namespace EndpointAgent;
 
-// Runs the deliberately small v1 dispatch protocol on an authenticated,
-// enrolled connection. The control plane remains the lifecycle authority.
-internal static class EnrolledAgent {
+// Shared session/execution runtime for every authenticated endpoint connection.
+// Authentication entry points decide whether their peer supports reachability
+// heartbeats; dispatch, worker lifecycle, and protocol bounds live only here.
+internal static class AgentRuntime {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
-    public static async Task Run(WebSocket socket, string device) {
+    public static async Task Run(WebSocket socket, string device, bool sendHeartbeats) {
         WorkerProcess? worker = null;
         string? session = null;
         var sessions = new HashSet<string>(StringComparer.Ordinal);
@@ -17,7 +18,7 @@ internal static class EnrolledAgent {
         Task<JsonElement>? incoming = null;
         using var stopped = new CancellationTokenSource();
         using var sendLock = new SemaphoreSlim(1, 1);
-        var heartbeats = Heartbeats(socket, sendLock, stopped.Token);
+        Task heartbeats = sendHeartbeats ? Heartbeats(socket, sendLock, stopped.Token) : Task.CompletedTask;
         try {
             while (socket.State == WebSocketState.Open) {
                 incoming ??= Receive(socket);
@@ -28,14 +29,20 @@ internal static class EnrolledAgent {
                         invocation = null;
                         await Send(socket, sendLock, new { type = "result", deviceId = device,
                             sessionId = completed.Session, executionId = completed.Execution,
-                            completed.Result.State, completed.Result.InvocationOutcome, completed.Result.ExitCode, completed.Result.ExitCodeSource,
-                            completed.Result.HadErrors, completed.Result.Stdout, completed.Result.Stderr,
-                            completed.Result.DurationMs, completed.Result.CaptureTruncated,
+                            completed.Result.State, completed.Result.InvocationOutcome, completed.Result.ExitCode,
+                            completed.Result.ExitCodeSource, completed.Result.HadErrors, completed.Result.Stdout,
+                            completed.Result.Stderr, completed.Result.DurationMs, completed.Result.CaptureTruncated,
                             completed.Result.LastNativeExitCode });
                         continue;
                     }
                 }
-                JsonElement message = await incoming;
+                JsonElement message;
+                try { message = await incoming; }
+                catch (JsonException) {
+                    incoming = null;
+                    await Reject(socket, sendLock, "invalid_request");
+                    continue;
+                }
                 incoming = null;
                 if (message.TryGetProperty("type", out var messageType)
                     && messageType.ValueKind == JsonValueKind.String
@@ -51,7 +58,8 @@ internal static class EnrolledAgent {
                     session = request.SessionId;
                     worker = await WorkerProcess.Start();
                     await Send(socket, sendLock, new { type = "session_ready", deviceId = device, sessionId = session });
-                } else if (request.Type == "close_session" && worker is not null && invocation is null && request.SessionId == session) {
+                } else if (request.Type == "close_session" && worker is not null && invocation is null
+                    && request.SessionId == session) {
                     await worker.DisposeAsync();
                     worker = null;
                     await Send(socket, sendLock, new { type = "session_closed", deviceId = device, sessionId = session });
@@ -60,13 +68,15 @@ internal static class EnrolledAgent {
                     && request.SessionId == session && executions.Count < 1000
                     && executions.Add(request.ExecutionId!)) {
                     string execution = request.ExecutionId!;
-                    await Send(socket, sendLock, new { type = "running", deviceId = device, sessionId = session, executionId = execution });
+                    await Send(socket, sendLock, new { type = "running", deviceId = device,
+                        sessionId = session, executionId = execution });
                     invocation = Complete(worker, session!, execution, request.Script!, request.TimeoutMs);
                 } else await Reject(socket, sendLock, "invalid_state_or_duplicate");
             }
         } finally {
             stopped.Cancel();
-            try { await heartbeats; } catch (Exception error) when (error is OperationCanceledException or WebSocketException) { }
+            try { await heartbeats; }
+            catch (Exception error) when (error is OperationCanceledException or WebSocketException) { }
             if (worker is not null) await worker.DisposeAsync();
         }
     }
@@ -84,12 +94,14 @@ internal static class EnrolledAgent {
     private static Task Reject(WebSocket socket, SemaphoreSlim sendLock, string code) =>
         Send(socket, sendLock, new { type = "rejected", code });
 
-    private static async Task Send(WebSocket socket, SemaphoreSlim sendLock, object value, CancellationToken cancellation = default) {
+    private static async Task Send(WebSocket socket, SemaphoreSlim sendLock, object value,
+                                   CancellationToken cancellation = default) {
         await sendLock.WaitAsync(cancellation);
         try {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
             timeout.CancelAfter(TimeSpan.FromSeconds(10));
-            await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(value, Json), WebSocketMessageType.Text, true, timeout.Token);
+            await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(value, Json),
+                WebSocketMessageType.Text, true, timeout.Token);
         } finally { sendLock.Release(); }
     }
 
