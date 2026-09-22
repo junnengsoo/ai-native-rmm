@@ -72,5 +72,18 @@ class EndpointAgentRegistry:
         async with self._lock:
             return self._channels.get(device_id)
 
+    async def disconnect(self, device_id: str, code: int = 1008) -> bool:
+        """Stop routing before closing so a revoked peer cannot receive new work."""
+        async with self._lock:
+            channel = self._channels.pop(device_id, None)
+        if channel is None:
+            return False
+        channel.fail_waiters()
+        try:
+            await channel.socket.close(code=code)
+        except RuntimeError:
+            pass
+        return True
+
 
 endpoint_agents = EndpointAgentRegistry()

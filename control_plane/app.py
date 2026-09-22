@@ -22,11 +22,14 @@ from .database import (
     append_execution_output,
     claim_execution, create_caller, create_or_get_execution, create_starting_session,
     digest, fail_device_investigations, finish_execution,
-    get_execution_output_page, get_execution_output_preview, get_workspace_execution, get_workspace_session, increment_rate_limit,
+    get_execution_output_page, get_execution_output_preview, get_live_device_session,
+    get_workspace_device, get_workspace_execution, get_workspace_session, increment_rate_limit,
     initialize, list_workspace_devices, mark_execution_failed_to_start, mark_execution_unknown,
+    mark_device_revocation_cleanup_unknown,
     mark_queued_execution_cancelled, mark_session_cleanup_unknown, mark_session_closed,
     mark_session_endpoint_closed, mark_session_failed, mark_session_ready, range_execution_output,
-    record_heartbeat, recover_interrupted_work, search_execution_output, tail_execution_output,
+    record_heartbeat, recover_interrupted_work, revoke_workspace_device,
+    search_execution_output, tail_execution_output,
 )
 from .reachability import classify_reachability
 
@@ -107,10 +110,61 @@ def list_devices(authorization: str | None = Header(default=None), after: uuid.U
     devices = list_workspace_devices(caller["workspace_id"], after, limit + 1)
     page = [
         {"id": device["id"], "approved_at": device["approved_at"], "last_seen": device["last_seen"],
-         "reachability": classify_reachability(device["last_seen"], device["activate_before"], observed_at)}
+         "reachability": classify_reachability(device["last_seen"], device["activate_before"], observed_at),
+         "authorization_status": device["authorization_status"], "revoked_at": device["revoked_at"],
+         "revoked_by": device["revoked_by"]}
         for device in devices[:limit]
     ]
     return {"devices": page, "next_cursor": str(devices[limit - 1]["id"]) if len(devices) > limit else None}
+
+
+@app.post("/devices/{device_id}/revoke")
+async def revoke_device(device_id: uuid.UUID, authorization: str | None = Header(default=None)):
+    admin = authenticated_caller(authorization, "admin")
+    revoked = await asyncio.to_thread(
+        revoke_workspace_device, admin["workspace_id"], admin["id"], device_id)
+    if revoked is None:
+        raise HTTPException(404, "device_not_found")
+    device, changed = revoked
+    cleanup = "not_required"
+
+    # A repeated request must stay safe and idempotent. The first successful
+    # transaction owns best-effort cleanup; every request still tears down any
+    # channel that raced with the durable authorization change.
+    try:
+        if changed:
+            session = await asyncio.to_thread(
+                get_live_device_session, admin["workspace_id"], device_id)
+            channel = await endpoint_agents.get_connected_channel(str(device_id))
+            if session is not None and session["state"] == "active" and channel is not None:
+                closing = await asyncio.to_thread(
+                    begin_session_close, admin["workspace_id"], session["id"])
+                if closing is not None:
+                    closed = channel.expect("session_closed", str(session["id"]))
+                    try:
+                        await channel.send({"type": "close_session", "deviceId": str(device_id),
+                                            "sessionId": str(session["id"])})
+                        await asyncio.wait_for(closed, CLEANUP_GRACE_SECONDS)
+                        await asyncio.to_thread(mark_session_closed, session["id"])
+                        cleanup = "confirmed"
+                    except Exception:
+                        cleanup = "unconfirmed"
+            elif session is not None:
+                cleanup = "unconfirmed"
+
+            if cleanup == "unconfirmed":
+                execution_ids = await asyncio.to_thread(
+                    mark_device_revocation_cleanup_unknown, device_id)
+                for execution_id in execution_ids:
+                    await notify_terminal(execution_id)
+        else:
+            cleanup = "already_revoked"
+    finally:
+        await endpoint_agents.disconnect(str(device_id))
+    return {"device_id": str(device["id"]),
+            "authorization_status": device["authorization_status"],
+            "revoked_at": device["revoked_at"], "revoked_by": str(device["revoked_by"]),
+            "cleanup": cleanup}
 
 
 class Approval(BaseModel):
@@ -354,6 +408,11 @@ async def fail_device_investigations_and_notify(device_id: uuid.UUID | str) -> N
 @app.post("/sessions", status_code=201)
 async def create_session(body: SessionCreation, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
+    device = await asyncio.to_thread(get_workspace_device, caller["workspace_id"], body.device_id)
+    if device is None:
+        raise HTTPException(404, "device_not_found")
+    if device["authorization_status"] == "revoked":
+        raise HTTPException(409, "device_revoked")
     channel = await endpoint_agents.get_connected_channel(str(body.device_id))
     if channel is None:
         raise HTTPException(409, "device_offline")
@@ -605,7 +664,10 @@ async def endpoint_agent(socket: WebSocket):
                     if time.monotonic() - last_heartbeat < 1:
                         raise ValueError()
                     last_heartbeat = time.monotonic()
-                    await asyncio.to_thread(record_heartbeat, status["device_id"])
+                    active = await asyncio.to_thread(record_heartbeat, status["device_id"])
+                    if not active:
+                        await channel.send({"state": "denied"})
+                        break
                     await channel.send({"type": "heartbeat_ack"})
                     continue
                 validate_endpoint_agent_message(message)

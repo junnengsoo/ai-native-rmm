@@ -200,7 +200,23 @@ Write-Output 'RMM_DATA:stopped'
         start()
         row = enrolled_device()
         assert row["id"] == device and row["reachability"] == "online"
-        print("Windows: paired → persistent session → idempotent execution → fresh session → stale/restart identity")
+
+        revoked = httpx.post(BASE + f"/devices/{device}/revoke", headers=admin, timeout=35)
+        revoked.raise_for_status()
+        assert revoked.json()["authorization_status"] == "revoked"
+        assert enrolled_device()["authorization_status"] == "revoked"
+        assert httpx.post(BASE + "/sessions", headers=operator,
+                          json={"device_id": device}).json() == {"detail": "device_revoked"}
+        time.sleep(17)
+        windows(f"""
+$agentId=Get-Content '{root}\\pid.txt'
+$process=Get-Process -Id $agentId -ErrorAction SilentlyContinue
+if ($null -ne $process) {{ throw 'revoked_agent_still_running' }}
+$codes=([regex]::Matches((Get-Content '{root}\\out.txt' -Raw),'PAIRING_CODE ')).Count
+if ($codes -ne 1) {{ throw 'revoked_key_reentered_pairing' }}
+Write-Output 'RMM_DATA:revoked'
+""")
+        print("Windows: paired → execution → restart identity → durable revocation denial")
     finally:
         windows(f"""
 if (Test-Path '{root}\\pid.txt') {{

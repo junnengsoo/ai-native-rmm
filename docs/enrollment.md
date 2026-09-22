@@ -130,8 +130,9 @@ there are no reusable bearer tokens on Windows. `GET /devices` scopes every row
 to the authenticated workspace; `limit` is 1–100 and `after` accepts the prior
 `next_cursor` UUID. Reachability is `awaiting_activation`, `online`, `stale`, or
 `activation_expired`. Device authorization status is a separate concern from
-reachability; durable device revocation belongs to a later slice. Times come from
-PostgreSQL, not endpoint claims. A small typed
+reachability; `authorization_status` is `active` or `revoked` and is described in
+[device revocation](device-revocation.md). Times come from PostgreSQL, not endpoint
+claims. A small typed
 Python policy classifies each page against one database-supplied `observed_at`:
 contact strictly newer than 45 seconds is online; contact exactly 45 seconds old
 is stale. Without contact, the activation deadline is expired at equality.
