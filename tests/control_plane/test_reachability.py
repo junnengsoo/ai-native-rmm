@@ -7,10 +7,10 @@ from control_plane.reachability import classify_reachability
 
 
 @pytest.mark.parametrize(("last_seen_age", "activation_remaining", "expected"), [
-    (None, 1, "approved"),
-    (None, 0, "approval_expired"),
-    (None, -1, "approval_expired"),
-    (None, None, "approved"),
+    (None, 1, "awaiting_activation"),
+    (None, 0, "activation_expired"),
+    (None, -1, "activation_expired"),
+    (None, None, "awaiting_activation"),
     (44.999999, -1, "online"),
     (45, 1, "stale"),
     (45.000001, -1, "stale"),

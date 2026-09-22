@@ -86,8 +86,8 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOU
    UUID. The approval HTTP request carries the code in its JSON body.
 3. Run `.venv/bin/python -m control_plane.client list`. Within about 15 seconds,
    Windows prints `online` and the list reports `online` with the same UUID.
-   Repeat after 15–20 seconds; `last_seen` advances. `approved` means admin
-   approval exists but the endpoint has not yet completed a fresh key proof.
+   Repeat after 15–20 seconds; `last_seen` advances. `awaiting_activation` means
+   admin approval exists but the endpoint has not yet completed a fresh key proof.
 4. Stop the Windows agent with Ctrl+C. After 46 seconds, list again: reachability
    is `stale`. Staleness describes missing recent evidence, not device power state.
    Restart with the same account/key name; expect the same UUID and `online`.
@@ -100,7 +100,7 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOU
    trial; uninstall and recovery approved by an admin belong to later tickets.
 
 An approved key must first activate before the original ten-minute code deadline;
-otherwise it reports `approval_expired` and cannot authenticate. There is no key
+otherwise it reports `activation_expired` and cannot authenticate. There is no key
 replacement/recovery operation yet. If the one-time code display is lost, allow
 the pending request to expire; reconnect then receives a fresh code. Do not
 silently enroll a replacement key as the same logical device.
@@ -128,8 +128,10 @@ sends `{"type":"heartbeat"}` and the server acknowledges it. The same authentica
 channel also carries strictly bound session/execution dispatch. Reconnect proves the persisted key again;
 there are no reusable bearer tokens on Windows. `GET /devices` scopes every row
 to the authenticated workspace; `limit` is 1–100 and `after` accepts the prior
-`next_cursor` UUID. Reachability is `approved`, `online`, `stale`, or
-`approval_expired`. Times come from PostgreSQL, not endpoint claims. A small typed
+`next_cursor` UUID. Reachability is `awaiting_activation`, `online`, `stale`, or
+`activation_expired`. Device authorization status is a separate concern from
+reachability; durable device revocation belongs to a later slice. Times come from
+PostgreSQL, not endpoint claims. A small typed
 Python policy classifies each page against one database-supplied `observed_at`:
 contact strictly newer than 45 seconds is online; contact exactly 45 seconds old
 is stale. Without contact, the activation deadline is expired at equality.
