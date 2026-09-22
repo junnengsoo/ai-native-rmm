@@ -8,7 +8,7 @@ customer deployment profile.
 
 The MSI installs one service:
 
-- Service name: `ProsperEndpointAgent`
+- Service name: `SquashEndpointAgent`
 - Start mode: automatic
 - Test execution identity: `LocalSystem`
 - Command line: `EndpointAgent.exe --service`
@@ -23,7 +23,7 @@ The installer writes machine configuration under
 
 - `Endpoint`: the trusted `wss://.../agent` control-plane URL.
 - `KeyName`: the CNG key name used by the service. The default is
-  `ProsperEndpointAgent`.
+  `SquashEndpointAgent`.
 
 The service writes local status to
 `C:\ProgramData\Prosper\AiNativeRmm\status.json`. While enrollment is pending,
@@ -56,7 +56,7 @@ msiexec /i .\artifacts\windows-agent\ProsperEndpointAgent.msi /qn /l*v install.l
 Optional:
 
 ```powershell
-RMM_KEY_NAME=ProsperEndpointAgentTest
+RMM_KEY_NAME=SquashEndpointAgentTest
 ```
 
 Expected installation outcome:

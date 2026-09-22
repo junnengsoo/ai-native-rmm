@@ -51,7 +51,7 @@ def test_real_msi_service_restart_and_uninstall_cleanup():
     key_name = "rmm-msi-" + uuid.uuid4().hex
     root = "C:\\Windows\\Temp\\" + key_name
     payload = bundle_source()
-    service = "ProsperEndpointAgent"
+    service = "SquashEndpointAgent"
     status_path = "C:\\ProgramData\\Prosper\\AiNativeRmm\\status.json"
     install_folder = "C:\\Program Files\\Prosper Endpoint Agent"
 

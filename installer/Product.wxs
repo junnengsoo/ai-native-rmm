@@ -9,7 +9,7 @@
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="RMM_ENDPOINT" Secure="yes" />
-    <Property Id="RMM_KEY_NAME" Secure="yes" Value="ProsperEndpointAgent" />
+    <Property Id="RMM_KEY_NAME" Secure="yes" Value="SquashEndpointAgent" />
     <Property Id="INSTALLED_RMM_KEY_NAME" Secure="yes">
       <RegistrySearch Id="InstalledKeyName"
                       Root="HKLM"
@@ -26,8 +26,8 @@
           <RegistryValue Root="HKLM" Key="SOFTWARE\Prosper\AiNativeRmm" Name="Endpoint" Value="[RMM_ENDPOINT]" Type="string" />
           <RegistryValue Root="HKLM" Key="SOFTWARE\Prosper\AiNativeRmm" Name="KeyName" Value="[RMM_KEY_NAME]" Type="string" />
           <ServiceInstall Id="InstallService"
-                          Name="ProsperEndpointAgent"
-                          DisplayName="Prosper Endpoint Agent"
+                          Name="SquashEndpointAgent"
+                          DisplayName="Squash Endpoint Agent"
                           Description="Outbound endpoint agent for the AI-native RMM trial."
                           Type="ownProcess"
                           Start="auto"
@@ -35,7 +35,7 @@
                           Account="LocalSystem"
                           Arguments="--service" />
           <ServiceControl Id="ControlService"
-                          Name="ProsperEndpointAgent"
+                          Name="SquashEndpointAgent"
                           Start="install"
                           Stop="both"
                           Remove="uninstall"

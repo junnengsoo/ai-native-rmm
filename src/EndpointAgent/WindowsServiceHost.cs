@@ -7,9 +7,9 @@ namespace EndpointAgent;
 
 [SupportedOSPlatform("windows")]
 internal sealed class WindowsServiceHost : ServiceBase {
-    public const string ServiceNameValue = "ProsperEndpointAgent";
+    public const string ServiceNameValue = "SquashEndpointAgent";
     public const string RegistryPath = @"SOFTWARE\Prosper\AiNativeRmm";
-    public const string DefaultKeyName = "ProsperEndpointAgent";
+    public const string DefaultKeyName = "SquashEndpointAgent";
     public static readonly string DataDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "Prosper", "AiNativeRmm");
