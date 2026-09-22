@@ -8,3 +8,5 @@ httpx==0.28.1
 pytest==9.1.1
 websockets==17.1
 openai-agents==0.8.4
+openai==2.19.0
+pydantic==2.12.5

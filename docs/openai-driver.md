@@ -18,13 +18,19 @@ Run the driver tests without contacting OpenAI:
 .venv/bin/python -m pytest -q tests/control_plane/test_openai_driver.py
 ```
 
-The tests mock the Agents SDK runner and fake the public control-plane API. They
-cover the single SDK tool surface, fixed read-only templates, invalid argument
-rejection, long-poll result collection, bounded automatic page retrieval when a
-preview is shortened, timing kept outside model context, session close in the
-driver `finally` path, and operator authentication without OpenAI key leakage.
+The tests use a scripted local SDK `Model` with the real Agents SDK `Runner` and
+function-tool path, while faking the public control-plane and endpoint evidence.
+They cover dependent diagnostic calls, the single SDK tool surface, fixed
+read-only templates, invalid argument rejection, long-poll result collection,
+bounded retained-output page continuation, terminal-safe rendering of untrusted
+text, lifecycle-hook model timing, session close in the driver `finally` path,
+and operator authentication without OpenAI key leakage.
 
-## Manual smoke
+## Optional paid Windows/OpenAI smoke
+
+This is a separate manual check after deterministic local tests pass. It makes
+one small OpenAI call and requires a live local control plane plus an enrolled
+Windows endpoint. Do not run it as part of the local rewrite validation.
 
 Complete local enrollment in [enrollment.md](enrollment.md), then use an
 operator key and explicit device ID from the caller shell:
@@ -61,12 +67,14 @@ Expected behavior:
 
 - The caller opens one debugging session and closes it in `finally`.
 - The SDK runner manages model turns and function-tool execution.
-- The model can choose only fixed read-only diagnostics.
+- The model can choose only fixed read-only operations; target host and port are
+  caller-bound.
 - The caller follows output through bounded long-poll events.
-- If a preview is shortened, the tool retrieves one bounded retained page.
+- If a preview is shortened, the tool retrieves bounded retained pages using
+  continuation cursors.
 - The final report proposes human fixes but performs no remediation.
-- Rendered timings show per-tool API time, estimated model/SDK time, total time,
-  and model usage when returned by the SDK.
+- Rendered timings show per-tool API time, SDK lifecycle-hook model time, total
+  time, and model usage when returned by the SDK.
 
 Remove the test fault afterward:
 
