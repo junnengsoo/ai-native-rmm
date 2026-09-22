@@ -16,7 +16,9 @@ import httpx
 DEFAULT_MODEL = "gpt-5-nano"
 DEFAULT_MAX_STEPS = 5
 DEFAULT_MAX_SECONDS = 180
-DEFAULT_CLEANUP_SECONDS = 30
+SERVER_CLOSE_GRACE_SECONDS = 30
+MIN_CLEANUP_SECONDS = SERVER_CLOSE_GRACE_SECONDS + 1
+DEFAULT_CLEANUP_SECONDS = 35
 MAX_CLEANUP_SECONDS = 60
 DEFAULT_EXECUTION_TIMEOUT_MS = 20_000
 DEFAULT_LONG_POLL_MS = 2_000
@@ -239,6 +241,13 @@ def validate_positive_int(value: Any, code: str, maximum: int | None = None) -> 
     if maximum is not None and value > maximum:
         raise ValueError(code)
     return value
+
+
+def validate_cleanup_seconds(value: Any) -> int:
+    selected = validate_positive_int(value, "cleanup_seconds_out_of_range", MAX_CLEANUP_SECONDS)
+    if selected < MIN_CLEANUP_SECONDS:
+        raise ValueError("cleanup_seconds_out_of_range")
+    return selected
 
 
 def build_script(operation: str, target_host: str, port: int) -> str:
@@ -684,7 +693,7 @@ def drive_diagnostic(
 ) -> DiagnosticResult:
     validate_positive_int(max_steps, "max_steps_must_be_positive")
     validate_positive_int(max_seconds, "max_seconds_must_be_positive")
-    validate_positive_int(cleanup_seconds, "cleanup_seconds_out_of_range", MAX_CLEANUP_SECONDS)
+    cleanup_seconds = validate_cleanup_seconds(cleanup_seconds)
     deadline = deadline_monotonic if deadline_monotonic is not None else time.perf_counter() + max_seconds
     session = control_plane.open_session(
         device_id,

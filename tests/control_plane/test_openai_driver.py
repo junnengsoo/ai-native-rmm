@@ -458,12 +458,12 @@ def test_session_close_uses_one_bounded_attempt_for_non_idempotent_api():
         control_plane=control_plane,
         max_steps=1,
         max_seconds=60,
-        cleanup_seconds=2,
+        cleanup_seconds=31,
     )
 
     assert result.closed is False
     assert control_plane.close_attempts == 1
-    assert control_plane.close_timeouts[0] <= 2
+    assert 30 < control_plane.close_timeouts[0] <= 31
     assert "session closure was not confirmed" in result.final_report
 
 
@@ -480,7 +480,7 @@ def test_unconfirmed_session_close_is_surfaced_as_command_failure():
         control_plane=control_plane,
         max_steps=1,
         max_seconds=60,
-        cleanup_seconds=1,
+        cleanup_seconds=31,
     )
 
     assert result.closed is False
@@ -508,8 +508,35 @@ def test_cleanup_seconds_must_be_positive_and_bounded():
             device_id="device-1",
             model_client=model,
             control_plane=control_plane,
+            cleanup_seconds=30,
+        )
+    with pytest.raises(ValueError):
+        drive_diagnostic(
+            problem="Diagnose file server access",
+            device_id="device-1",
+            model_client=model,
+            control_plane=control_plane,
             cleanup_seconds=61,
         )
+
+
+def test_default_cleanup_timeout_leaves_transport_slack_over_server_grace():
+    model = FakeModel(outputs=[
+        [{"type": "message", "content": [{"type": "output_text", "text": "No commands needed."}]}],
+    ])
+    control_plane = FakeControlPlane()
+
+    result = drive_diagnostic(
+        problem="Diagnose file server access",
+        device_id="device-1",
+        model_client=model,
+        control_plane=control_plane,
+        max_steps=1,
+        max_seconds=60,
+    )
+
+    assert result.closed is True
+    assert control_plane.close_timeouts == [35]
 
 
 def test_bool_port_and_timeout_are_rejected():
@@ -597,7 +624,7 @@ def test_model_failure_raises_structured_error_with_close_failure():
             control_plane=FakeControlPlane(close_failures=1),
             max_steps=1,
             max_seconds=60,
-            cleanup_seconds=1,
+            cleanup_seconds=31,
         )
 
     assert caught.value.code == "driver_failed"

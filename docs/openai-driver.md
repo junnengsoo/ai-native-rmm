@@ -14,9 +14,10 @@ OpenAI text model for this smoke path. The driver uses a small default budget:
 five tool steps, three minutes wall-clock shared by preflight and diagnosis,
 600 output tokens per model call, and 20-second execution timeouts capped to the
 remaining wall-clock budget. Session closure uses one bounded close request with
-a separate 30-second cleanup allowance, because the current close API moves an
-active session into a closing state and is not idempotent after an unconfirmed
-cleanup. An unconfirmed close is surfaced as command failure. These are
+a separate 35-second cleanup allowance. The server-side close grace is 30
+seconds, so caller cleanup settings must be 31-60 seconds to leave transport
+slack while keeping the non-idempotent close operation bounded. An unconfirmed
+close is surfaced as command failure. These are
 deliberately conservative prototype defaults, not the unapproved
 15-command/15-minute budget.
 
