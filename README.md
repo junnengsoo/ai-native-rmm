@@ -14,7 +14,7 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 
 Slices 1–5 provide the Windows execution harness, PostgreSQL-backed enrollment,
 the public persistent-investigation API, truthful timeout/cancellation/offline
-outcomes, and a caller-side OpenAI diagnostic driver prototype.
+outcomes, and a caller-side OpenAI Agents SDK diagnostic driver prototype.
 Start with [local pairing](docs/enrollment.md),
 [persistent investigations](docs/investigations.md),
 [the OpenAI diagnostic driver](docs/openai-driver.md), or the

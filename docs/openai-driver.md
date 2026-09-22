@@ -1,88 +1,53 @@
 # OpenAI diagnostic driver
 
-The OpenAI driver is a prototype caller, not endpoint intelligence. It uses the
-OpenAI Responses API from the caller process to choose among constrained
-read-only diagnostic operations, then maps those operations locally to fixed
-PowerShell templates submitted through the public control-plane session/execution
-APIs. The model never receives a raw PowerShell execution tool. The endpoint
-receives only the selected fixed diagnostic script and normal session metadata.
-OpenAI keys, admin keys, operator keys, and control-plane HTTP access are never
-exposed to the endpoint or included in model tool results.
+The OpenAI driver is a caller-side demo, not endpoint intelligence. It uses the
+OpenAI Agents SDK with one `Agent`, one constrained read-only diagnostic tool,
+and the SDK `Runner` tool loop. The tool maps model-selected operations to fixed
+PowerShell templates and submits them through the public control-plane
+session/execution APIs.
 
-The default model is `gpt-5-nano`, selected as the lowest-cost currently listed
-OpenAI text model for this smoke path. The driver uses a small default budget:
-five tool steps, three minutes wall-clock shared by preflight and diagnosis,
-600 output tokens per model call, and 20-second execution timeouts capped to the
-remaining wall-clock budget. Session closure uses one bounded close request with
-a separate 35-second cleanup allowance. The server-side close grace is 30
-seconds, so caller cleanup settings must be 31-60 seconds to leave transport
-slack while keeping the non-idempotent close operation bounded. An unconfirmed
-close is surfaced as command failure. These are
-deliberately conservative prototype defaults, not the unapproved
-15-command/15-minute budget.
+The endpoint never receives OpenAI keys, admin keys, operator keys, raw model
+tool requests, or arbitrary PowerShell. It only receives fixed diagnostic
+scripts selected by the caller. The default model is `gpt-5-nano`.
 
-## Local deterministic tests
+## Deterministic tests
 
-The tests mock the OpenAI boundary and use fake or mocked control-plane calls:
+Run the driver tests without contacting OpenAI:
 
 ```sh
 .venv/bin/python -m pytest -q tests/control_plane/test_openai_driver.py
 ```
 
-They cover adaptive tool sequencing, rejection of arbitrary or mutating tool
-requests, bounded output pages without skipped middle output, per-investigation
-execution/cursor restrictions, session closure on budget exhaustion, cleanup
-failure reporting, local argument validation, separate progress reporting,
-separate timing records, paginated device discovery, OpenAI request shape, token
-usage collection, and the fact that control-plane calls authenticate with the
-operator credential rather than the OpenAI key.
+The tests mock the Agents SDK runner and fake the public control-plane API. They
+cover the single SDK tool surface, fixed read-only templates, invalid argument
+rejection, long-poll result collection, bounded automatic page retrieval when a
+preview is shortened, timing kept outside model context, session close in the
+driver `finally` path, and operator authentication without OpenAI key leakage.
 
-On 2026-09-21, all five fixed PowerShell templates were also executed directly
-on the authorized Windows 11 Azure VM under Azure Run Command: network
-configuration, default-gateway reachability, DNS resolution, target ping, and
-TCP-port testing all parsed and completed successfully. The VM was deallocated
-immediately afterward. This verifies the real Windows command surface, but it is
-not a substitute for the end-to-end OpenAI, control-plane, tunnel, and endpoint
-smoke below.
+## Manual smoke
 
-The same revision passed all 28 focused driver tests. A fresh Python 3.13
-control-plane container backed by an isolated PostgreSQL 16 volume also passed
-the broader non-Windows control-plane suite: 52 passed and one opt-in test was
-skipped. The isolated Compose project and its disposable database volume were
-removed after the run.
-
-## Manual Windows/OpenAI smoke
-
-Complete the local Compose, tunnel, Windows enrollment, and admin setup in
-[enrollment.md](enrollment.md), keeping these variables in the shell that runs
-the driver:
+Complete local enrollment in [enrollment.md](enrollment.md), then use an
+operator key and explicit device ID from the caller shell:
 
 ```sh
 export RMM_API_URL=http://127.0.0.1:18080
-export RMM_ADMIN_KEY=ADMIN_KEY_PLACEHOLDER
+export RMM_OPERATOR_KEY=OPERATOR_KEY_PLACEHOLDER
+export RMM_DEVICE_ID=DEVICE_UUID
 export OPENAI_API_KEY=OPENAI_KEY_PLACEHOLDER
 ```
 
-The driver can create its own one-use operator caller with the admin key. If an
-operator key already exists, set `RMM_OPERATOR_KEY=OPERATOR_KEY_PLACEHOLDER`
-instead. When using only an operator key, also set `RMM_DEVICE_ID=DEVICE_UUID`.
-
-Use a reversible test-only host-name fault. This does not affect the tunnel,
-Azure Run Command, RDP, or any management path because it only changes the
-Windows hosts entry for the synthetic file-server name:
+Create a reversible test-only file-server fault on the Windows test device:
 
 ```powershell
 $marker = '# rmm-openai-driver-smoke'
 $line = "203.0.113.10 rmm-test-fileserver $marker"
 $hosts = "$env:WINDIR\System32\drivers\etc\hosts"
-$existing = Get-Content -LiteralPath $hosts -ErrorAction Stop
-if ($existing -notcontains $line) {
+if ((Get-Content -LiteralPath $hosts) -notcontains $line) {
     Add-Content -LiteralPath $hosts -Value $line
 }
 ```
 
-Do not tell the model that the hosts entry is the hidden cause. Ask only the
-plain-English problem:
+Do not tell the model the hidden cause. Ask only the plain-English problem:
 
 ```sh
 .venv/bin/python -m control_plane.openai_driver \
@@ -94,27 +59,16 @@ plain-English problem:
 
 Expected behavior:
 
-- The driver opens an authorized debugging session, calls OpenAI from the caller,
-  and adaptively submits dependent fixed-template diagnostics through
-  `POST /sessions/{id}/executions`.
-- Each execution is followed through bounded long-poll output events and final
-  execution records. Both stdout and stderr are drained after terminal status
-  before the driver moves on. If a preview is shortened, the model may request a
-  bounded retained output page for an execution created by this investigation,
-  using the next cursor tracked by the caller. Driver pages use the control
-  plane's 8 KiB minimum and expose the full returned page before advancing the
-  cursor.
-- The final report names the likely cause and proposed human fixes, but does not
-  apply remediation.
-- The rendered output lists API round-trip time, endpoint execution duration,
-  model latency before each tool step, total model latency, completion state,
-  and token usage/cost when the API returns usage.
-- While commands are running, bounded output progress is emitted separately from
-  model context on stderr.
-- The session is closed even when a budget ends the investigation; the single
-  bounded close attempt is controlled by `--cleanup-seconds`.
+- The caller opens one debugging session and closes it in `finally`.
+- The SDK runner manages model turns and function-tool execution.
+- The model can choose only fixed read-only diagnostics.
+- The caller follows output through bounded long-poll events.
+- If a preview is shortened, the tool retrieves one bounded retained page.
+- The final report proposes human fixes but performs no remediation.
+- Rendered timings show per-tool API time, estimated model/SDK time, total time,
+  and model usage when returned by the SDK.
 
-Restore the controlled fault afterward:
+Remove the test fault afterward:
 
 ```powershell
 $marker = '# rmm-openai-driver-smoke'
@@ -124,6 +78,16 @@ $hosts = "$env:WINDIR\System32\drivers\etc\hosts"
   Set-Content -LiteralPath $hosts
 ```
 
-The smoke should consume at most one bounded `gpt-5-nano` run. Retry only when
-the first run fails before receiving a usable OpenAI response or before any
-diagnostic command can be submitted.
+## Prior failure notes
+
+The previous live-smoke failures were not OpenAI model failures:
+
+- The `422` occurred before any OpenAI call. The custom Azure harness extracted
+  the pairing code incorrectly, so approval was attempted with an invalid body.
+- One run pointed the tunnel at the Issue 4 stack instead of the Issue 15 control
+  plane, so the public API did not match the branch under test.
+- The slow loop repeatedly rebuilt and redeployed through Azure Run Command.
+  That made each retry expensive and also risked competing with other VM work.
+
+For this issue, keep SDK rewrite validation local and deterministic. Use the
+manual smoke only once the normal enrollment/control-plane path is already up.
