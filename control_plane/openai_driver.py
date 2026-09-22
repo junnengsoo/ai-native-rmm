@@ -68,6 +68,8 @@ class DiagnosticContext:
     scripts_submitted: int = 0
     owned_execution_ids: set[str] = field(default_factory=set)
     terminal_execution_ids: set[str] = field(default_factory=set)
+    pending_execution_id: str | None = None
+    ambiguous_submission: bool = False
 
 
 @dataclass
@@ -218,19 +220,28 @@ def execution_preview(result: dict[str, Any]) -> dict[str, Any] | None:
 async def _submit_script(ctx: DiagnosticContext, script: str, timeout_ms: int) -> dict[str, Any]:
     selected_timeout = min(validate_timeout_ms(timeout_ms), int(remaining_seconds(ctx) * 1000))
     script = validate_script(script)
+    if ctx.ambiguous_submission:
+        raise DriverError("ambiguous_submission_unresolved")
+    if ctx.pending_execution_id is not None:
+        raise DriverError("execution_still_pending")
     if ctx.scripts_submitted >= ctx.max_steps:
         raise DriverError("script_step_budget_exhausted")
     ctx.scripts_submitted += 1
     started = time.perf_counter()
-    submitted = await ctx.control_plane.submit_execution(
-        ctx.session_id,
-        script,
-        selected_timeout,
-        timeout_seconds=remaining_seconds(ctx),
-    )
+    try:
+        submitted = await ctx.control_plane.submit_execution(
+            ctx.session_id,
+            script,
+            selected_timeout,
+            timeout_seconds=remaining_seconds(ctx),
+        )
+    except Exception:
+        ctx.ambiguous_submission = True
+        raise
     api_ms = (time.perf_counter() - started) * 1000
     execution_id = submitted["execution_id"]
     ctx.owned_execution_ids.add(execution_id)
+    ctx.pending_execution_id = execution_id
     ctx.steps.append(StepTiming("submit_script", execution_id, api_ms, None, submitted["status"]))
     return {
         "execution_id": execution_id,
@@ -248,6 +259,8 @@ async def _wait_for_execution(ctx: DiagnosticContext, execution_id: str, timeout
     api_ms = (time.perf_counter() - started) * 1000
     if result.get("terminal"):
         ctx.terminal_execution_ids.add(execution_id)
+        if ctx.pending_execution_id == execution_id:
+            ctx.pending_execution_id = None
     ctx.steps.append(StepTiming(
         "wait_for_execution",
         execution_id,
@@ -395,7 +408,8 @@ async def drive_diagnostic(
             f"Caller-bound target: {target_host}:{target_port}\n"
             f"Budget: at most {max_steps} submitted PowerShell scripts and {max_seconds} seconds. "
             "Use submit_script, wait_for_execution, and read_output as needed. "
-            "Wait can be called repeatedly for a submitted execution until terminal. "
+            "The control plane allows only one active script in this session: after submit_script, "
+            "call wait_for_execution for that returned execution ID until terminal before submitting another script. "
             "Read output pages only for execution IDs returned by this run. "
             "Run at least two dependent read-only diagnostic scripts before finalizing when the budget allows. "
             "Remember: read-only diagnosis is policy, not sandbox enforcement; scripts currently run as LocalSystem."
@@ -418,6 +432,8 @@ async def drive_diagnostic(
             all_submitted_terminal = (
                 ctx.scripts_submitted == len(ctx.owned_execution_ids)
                 and ctx.owned_execution_ids.issubset(ctx.terminal_execution_ids)
+                and ctx.pending_execution_id is None
+                and not ctx.ambiguous_submission
             )
             completed = bool(run_result.final_output) and terminal_depth_met and all_submitted_terminal
             if run_result.final_output and not completed:
