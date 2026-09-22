@@ -37,6 +37,17 @@ The technician-authorized binding of a pending endpoint key to a device identity
 **Pending enrollment**:
 An unapproved request to bind an endpoint public key to a device; it is not yet a trusted managed device and has no execution authority.
 
+**Awaiting activation**:
+An approved device whose endpoint key has not yet completed its first post-approval possession proof. Approval is already implied by the device's existence.
+_Avoid_: Approved as an ongoing device state
+
+**Device reachability**:
+The freshness of authenticated contact from a device, reported as online when recent or stale when recent evidence is absent. It is independent of the device's authorization status and does not assert whether the machine itself is powered on or connected.
+_Avoid_: Offline
+
+**Device authorization status**:
+An administrator-controlled device state that records whether its execution authority is active or revoked, independent of reachability.
+
 **Technician recovery**:
 An authorized replacement of a device's agent credential after reinstall, preserving the existing device identity and history.
 

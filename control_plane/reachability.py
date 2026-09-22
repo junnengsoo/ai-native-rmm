@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Literal
 
-Reachability = Literal["approved", "online", "stale", "approval_expired"]
+Reachability = Literal["awaiting_activation", "online", "stale", "activation_expired"]
 
 
 def classify_reachability(last_seen: datetime | None, activate_before: datetime | None,
@@ -10,5 +10,5 @@ def classify_reachability(last_seen: datetime | None, activate_before: datetime 
     if last_seen is not None:
         return "online" if last_seen > observed_at - timedelta(seconds=45) else "stale"
     if activate_before is not None and activate_before <= observed_at:
-        return "approval_expired"
-    return "approved"
+        return "activation_expired"
+    return "awaiting_activation"

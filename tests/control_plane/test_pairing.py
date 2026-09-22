@@ -63,7 +63,7 @@ def test_pending_key_requires_admin_approval_then_fresh_possession_proof():
     assert approved.status_code == 200
     device = approved.json()["device_id"]
     assert httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": pending["code"]}).status_code == 409
-    assert httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]["reachability"] == "approved"
+    assert httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]["reachability"] == "awaiting_activation"
     assert httpx.get(BASE + "/devices", headers=other).json()["devices"] == []
     wrong, _ = endpoint_key()
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
