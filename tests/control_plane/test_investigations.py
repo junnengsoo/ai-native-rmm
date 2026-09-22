@@ -78,6 +78,8 @@ class EndpointAgentSimulator:
         self.stop = threading.Event()
         self.ready = threading.Event()
         self.marker_count = 0
+        self.ledger_id = "test-ledger-" + uuid.uuid4().hex
+        self.sequence = 0
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def __enter__(self):
@@ -97,85 +99,128 @@ class EndpointAgentSimulator:
             self.ready.set()
             while not self.stop.is_set():
                 try:
-                    message = json.loads(socket.recv(timeout=0.2))
+                    message = self._recv_command(socket)
                 except TimeoutError:
                     continue
                 if message["type"] == "heartbeat_ack":
                     continue
-                common = {"deviceId": device, "sessionId": message["sessionId"]}
                 if message["type"] == "open_session":
                     variable = None
-                    socket.send(json.dumps({"type": "session_ready", **common}))
+                    self._send_ledger(socket, device, [
+                        ("session_started", {"sessionId": message["sessionId"]}),
+                    ])
                 elif message["type"] == "close_session":
                     variable = None
-                    socket.send(json.dumps({"type": "session_closed", **common}))
+                    self._send_ledger(socket, device, [
+                        ("session_closed", {"sessionId": message["sessionId"]}),
+                    ])
                 elif message["type"] == "execute":
                     execution = message["executionId"]
                     assert hashlib.sha256(message["script"].encode()).hexdigest() == message["scriptSha256"]
-                    socket.send(json.dumps({"type": "running", **common, "executionId": execution}))
+                    binding = {"sessionId": message["sessionId"], "executionId": execution,
+                               "scriptSha256": message["scriptSha256"]}
+                    self._send_ledger(socket, device, [
+                        ("execution_accepted", binding),
+                        ("execution_started", binding),
+                    ])
                     if message["script"] == "WAIT_FOR_CANCEL":
                         while True:
-                            followup = json.loads(socket.recv(timeout=2))
+                            followup = self._recv_command(socket, timeout=2)
                             if followup["type"] == "cancel_execution" and followup["executionId"] == execution:
-                                socket.send(json.dumps({
-                                    "type": "result", **common, "executionId": execution,
+                                self._send_ledger(socket, device, [
+                                    ("cancellation_requested", binding),
+                                    ("execution_finished", {
+                                    **binding,
                                     "state": "cancelled", "invocationOutcome": "stopped",
                                     "exitCode": None, "exitCodeSource": None,
                                     "hadErrors": False, "durationMs": 1.0,
                                     "captureTruncated": False, "lastNativeExitCode": None,
-                                }))
+                                    }),
+                                ])
                                 break
                         continue
                     elif message["script"] == "$trialValue = 42":
                         variable = 42
                     elif message["script"] == "$trialValue":
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stdout", "text": str(variable)}))
+                        self._send_output(socket, device, binding, "stdout", str(variable))
                     elif message["script"] == "PROGRESSIVE_OUTPUT":
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stdout", "text": "first\n"}))
+                        self._send_output(socket, device, binding, "stdout", "first\n")
                         time.sleep(0.2)
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stderr", "text": "{\"type\":\"result\"}\n"}))
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stdout", "text": "snowman ☃\n"}))
+                        self._send_output(socket, device, binding, "stderr", "{\"type\":\"result\"}\n")
+                        self._send_output(socket, device, binding, "stdout", "snowman ☃\n")
                     elif message["script"] == "LONG_OUTPUT":
                         chunk = "α" * 5000 + "\n"
                         for _ in range(10):
-                            socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                    "stream": "stdout", "text": chunk}))
+                            self._send_output(socket, device, binding, "stdout", chunk)
                     elif message["script"] == "MEG_OUTPUT":
                         chunk = "m" * 8192
                         for _ in range(128):
-                            socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                    "stream": "stdout", "text": chunk}))
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stdout", "text": "tail-after-meg"}))
+                            self._send_output(socket, device, binding, "stdout", chunk)
+                        self._send_output(socket, device, binding, "stdout", "tail-after-meg")
                     elif message["script"] == "EMPTY_OUTPUT":
                         pass
                     elif message["script"] == "SEARCHABLE_RETAINED_OUTPUT":
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stdout", "text": "start\nERR"}))
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stdout", "text": "OR café\nnext line\n"}))
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stderr", "text": "warn one\n"}))
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stderr", "text": "fatal two\ndone three\n"}))
+                        self._send_output(socket, device, binding, "stdout", "start\nERR")
+                        self._send_output(socket, device, binding, "stdout", "OR café\nnext line\n")
+                        self._send_output(socket, device, binding, "stderr", "warn one\n")
+                        self._send_output(socket, device, binding, "stderr", "fatal two\ndone three\n")
                     elif message["script"] == "MARK_ONCE":
                         self.marker_count += 1
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stdout", "text": "marked"}))
+                        self._send_output(socket, device, binding, "stdout", "marked")
                     else:
-                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
-                                                "stream": "stdout", "text": "ok"}))
-                    socket.send(json.dumps({
-                        "type": "result", **common, "executionId": execution,
+                        self._send_output(socket, device, binding, "stdout", "ok")
+                    self._send_ledger(socket, device, [
+                        ("execution_finished", {
+                        **binding,
                         "state": "completed", "invocationOutcome": "completed_normally",
                         "exitCode": 0, "exitCodeSource": "normalized_invocation",
                         "hadErrors": False, "durationMs": 1.0, "captureTruncated": False,
                         "lastNativeExitCode": None,
-                    }))
+                        }),
+                    ])
+
+    def _recv_command(self, socket, timeout=0.2):
+        while True:
+            message = json.loads(socket.recv(timeout=timeout))
+            if message["type"] in {"heartbeat_ack", "ledger_ack"}:
+                continue
+            return message
+
+    def _send_output(self, socket, device, binding, stream, text):
+        for chunk in utf8_chunks(text):
+            self._send_ledger(socket, device, [
+                ("output_chunk", {**binding, "stream": stream, "text": chunk}),
+            ])
+
+    def _send_ledger(self, socket, device, records):
+        payload = []
+        for record_type, data in records:
+            self.sequence += 1
+            payload.append({
+                "sequence": self.sequence,
+                "recordType": record_type,
+                "endpointObservedAt": "2026-09-22T00:00:00Z",
+                "data": data,
+            })
+        socket.send(json.dumps({
+            "type": "ledger_batch",
+            "deviceId": device,
+            "ledgerId": self.ledger_id,
+            "records": payload,
+        }))
+
+
+def utf8_chunks(value, limit=8192):
+    current, size = [], 0
+    for character in value:
+        encoded = len(character.encode())
+        if current and size + encoded > limit:
+            yield "".join(current)
+            current, size = [], 0
+        current.append(character)
+        size += encoded
+    if current:
+        yield "".join(current)
 
 
 def wait_for_execution(operator, execution_id):
@@ -197,7 +242,7 @@ def submit(operator, session, script, key):
     )
 
 
-def test_timeout_is_required_and_offline_submission_fails_to_start():
+def test_timeout_is_optional_and_offline_submission_fails_to_start():
     admin = bootstrap_admin()
     operator, _ = create_operator(admin, "deadline-agent")
     key, public, device = enroll(admin)
@@ -208,7 +253,8 @@ def test_timeout_is_required_and_offline_submission_fails_to_start():
         missing_timeout = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
             **operator, "Idempotency-Key": "missing-timeout",
         }, json={"script": "'ok'"})
-        assert missing_timeout.status_code == 422
+        assert missing_timeout.status_code == 202
+        assert wait_for_execution(operator, missing_timeout.json()["execution_id"])["status"] == "completed"
         submitted = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
             **operator, "Idempotency-Key": "selected-timeout",
         }, json={"script": "'ok'", "timeout_ms": 5000})

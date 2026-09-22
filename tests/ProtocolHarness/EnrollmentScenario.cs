@@ -5,6 +5,8 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 
 // Independent peer for reachability v1; deliberately does not call production code.
 internal static class EnrollmentScenario {
@@ -54,14 +56,13 @@ internal static class EnrollmentScenario {
                         return;
                     }
                     string session = Guid.NewGuid().ToString();
+                    var queuedRecords = new Queue<JsonElement>();
                     await Send(socket, OpenSession(device, session));
-                    Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "session_ready", "enrolled worker ready");
+                    await WaitRecord(record => record.GetProperty("recordType").GetString() == "session_started"
+                        && record.GetProperty("data").GetProperty("sessionId").GetString() == session);
                     string execution = Guid.NewGuid().ToString();
                     string script = "$global:enrolledValue=41; 'enrolled execution'";
                     await Send(socket, ExecuteRequest(device, session, execution, script, 5000));
-                    var running = await ReceiveDispatch(socket);
-                    Require(running.GetProperty("type").GetString() == "running"
-                        && running.GetProperty("executionId").GetString() == execution, "enrolled correlated running");
                     var first = await ReceiveResultWithOutput(socket, execution);
                     Require(first.Stdout.Contains("enrolled execution"), "enrolled output frame");
                     Require(first.Result.GetProperty("executionId").GetString() == execution
@@ -70,13 +71,13 @@ internal static class EnrollmentScenario {
                     string second = Guid.NewGuid().ToString();
                     script = "$global:enrolledValue + 1";
                     await Send(socket, ExecuteRequest(device, session, second, script, 5000));
-                    Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "running", "second invocation running");
+                    await WaitRecord(record => IsRecord(record, "execution_started", second));
                     var result = await ReceiveResultWithOutput(socket, second);
                     Require(result.Stdout.Trim() == "42", "enrolled session state persists");
                     string slow = Guid.NewGuid().ToString();
                     script = "Start-Sleep -Seconds 2; 'finished'";
                     await Send(socket, ExecuteRequest(device, session, slow, script, 5000));
-                    Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "running", "slow invocation running");
+                    await WaitRecord(record => IsRecord(record, "execution_started", slow));
                     string busy = Guid.NewGuid().ToString();
                     script = "'must-not-run-while-busy'";
                     await Send(socket, ExecuteRequest(device, session, busy, script, 5000));
@@ -85,32 +86,88 @@ internal static class EnrollmentScenario {
                     Require(result.Result.GetProperty("executionId").GetString() == slow
                         && result.Stdout.Contains("finished"), "original invocation completes once");
                     await Send(socket, new { type = "close_session", deviceId = device, sessionId = session });
-                    Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "session_closed", "enrolled worker closed");
+                    await WaitRecord(record => record.GetProperty("recordType").GetString() == "session_closed"
+                        && record.GetProperty("data").GetProperty("sessionId").GetString() == session);
                     completed.TrySetResult();
 
                     async Task<JsonElement> ReceiveDispatch(WebSocket peer) {
                         while (true) {
                             var message = await Receive(peer);
-                            if (message.GetProperty("type").GetString() != "heartbeat") return message;
-                            await Send(peer, new { type = "heartbeat_ack" });
+                            string type = message.GetProperty("type").GetString()!;
+                            if (type == "heartbeat") {
+                                await Send(peer, new { type = "heartbeat_ack" });
+                                continue;
+                            }
+                            if (type == "ledger_batch") {
+                                await AckLedgerBatch(peer, message);
+                                foreach (var record in message.GetProperty("records").EnumerateArray())
+                                    queuedRecords.Enqueue(record.Clone());
+                                continue;
+                            }
+                            return message;
                         }
                     }
+
+                    async Task<JsonElement> WaitRecord(Func<JsonElement, bool> predicate) {
+                        while (true) {
+                            int count = queuedRecords.Count;
+                            for (int index = 0; index < count; index++) {
+                                var queued = queuedRecords.Dequeue();
+                                if (predicate(queued)) return queued;
+                                queuedRecords.Enqueue(queued);
+                            }
+                            var message = await Receive(socket);
+                            string type = message.GetProperty("type").GetString()!;
+                            if (type == "heartbeat") {
+                                await Send(socket, new { type = "heartbeat_ack" });
+                                continue;
+                            }
+                            Require(type == "ledger_batch", "expected enrolled ledger batch");
+                            await AckLedgerBatch(socket, message);
+                            foreach (var record in message.GetProperty("records").EnumerateArray()) {
+                                JsonElement clone = record.Clone();
+                                if (predicate(clone)) return clone;
+                                queuedRecords.Enqueue(clone);
+                            }
+                        }
+                    }
+
+                    async Task AckLedgerBatch(WebSocket peer, JsonElement message) {
+                        long acknowledgedThrough = message.GetProperty("records").EnumerateArray()
+                            .Max(record => record.GetProperty("sequence").GetInt64());
+                        await Send(peer, new {
+                            type = "ledger_ack",
+                            ledger_id = message.GetProperty("ledgerId").GetString(),
+                            acknowledged_through = acknowledgedThrough
+                        });
+                    }
+
+                    bool IsRecord(JsonElement record, string type, string expectedExecution) =>
+                        record.GetProperty("recordType").GetString() == type
+                        && record.GetProperty("data").TryGetProperty("executionId", out var id)
+                        && id.GetString() == expectedExecution;
 
                     async Task<(JsonElement Result, string Stdout, string Stderr)> ReceiveResultWithOutput(WebSocket peer, string expectedExecution) {
                         var stdout = new StringBuilder();
                         var stderr = new StringBuilder();
                         while (true) {
-                            var message = await ReceiveDispatch(peer);
-                            string type = message.GetProperty("type").GetString()!;
-                            if (type == "output") {
-                                Require(message.GetProperty("executionId").GetString() == expectedExecution, "correlated enrolled output");
-                                string text = message.GetProperty("text").GetString()!;
-                                if (message.GetProperty("stream").GetString() == "stdout") stdout.Append(text);
+                            var record = await WaitRecord(value => {
+                                if (!value.TryGetProperty("data", out var data)
+                                    || !data.TryGetProperty("executionId", out var id)
+                                    || id.GetString() != expectedExecution) return false;
+                                string? type = value.GetProperty("recordType").GetString();
+                                return type is "output_chunk" or "execution_finished" or "worker_stopped";
+                            });
+                            string type = record.GetProperty("recordType").GetString()!;
+                            var data = record.GetProperty("data");
+                            if (type == "output_chunk") {
+                                string text = data.GetProperty("text").GetString()!;
+                                if (data.GetProperty("stream").GetString() == "stdout") stdout.Append(text);
                                 else stderr.Append(text);
                                 continue;
                             }
-                            Require(type == "result", "enrolled terminal result after output");
-                            return (message, stdout.ToString(), stderr.ToString());
+                            Require(type == "execution_finished", "enrolled terminal result after output");
+                            return (data.Clone(), stdout.ToString(), stderr.ToString());
                         }
                     }
                 }

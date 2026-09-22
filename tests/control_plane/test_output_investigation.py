@@ -22,7 +22,7 @@ def install_output_fakes(monkeypatch, row, workspace_id, calls):
 
     monkeypatch.setattr(app_module, "authenticated_caller", fake_auth)
     monkeypatch.setattr(app_module, "get_workspace_execution", fake_get_execution)
-    monkeypatch.setattr(app_module, "dispatch_execution", lambda *_: calls.append("dispatch"))
+    monkeypatch.setattr(app_module, "send_execution_command", lambda *_: calls.append("dispatch"))
 
 
 def fake_output_events():

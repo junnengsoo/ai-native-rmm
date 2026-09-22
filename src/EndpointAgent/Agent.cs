@@ -22,7 +22,8 @@ internal static class Agent {
         using var connectDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await socket.ConnectAsync(endpoint, connectDeadline.Token);
         await Send(socket, new { type = "hello", protocolVersion = 1, deviceId = device });
-        await AgentRuntime.Run(socket, device, sendHeartbeats: false);
+        var state = new AgentRuntimeState(device);
+        await AgentRuntime.Run(socket, device, sendHeartbeats: false, state);
     }
 
     private static bool ValidNow(X509Certificate2 cert) => DateTime.UtcNow >= cert.NotBefore.ToUniversalTime() && DateTime.UtcNow < cert.NotAfter.ToUniversalTime();

@@ -98,12 +98,12 @@ class ControlPlaneClient:
         except Exception as error:
             return False, "transport:" + type(error).__name__
 
-    async def submit_execution(self, session_id: str, script: str, timeout_ms: int, *, timeout_seconds: float) -> dict[str, Any]:
+    async def submit_execution(self, session_id: str, script: str, *, timeout_seconds: float) -> dict[str, Any]:
         return await self.request_json(
             "POST",
             f"/sessions/{session_id}/executions",
             headers={"Idempotency-Key": "openai-driver-" + uuid.uuid4().hex},
-            json={"script": script, "timeout_ms": timeout_ms},
+            json={"script": script},
             timeout_seconds=timeout_seconds,
         )
 
@@ -165,12 +165,6 @@ def validate_script(script: str) -> str:
     return script
 
 
-def validate_timeout_ms(timeout_ms: int) -> int:
-    if isinstance(timeout_ms, bool) or not 100 <= timeout_ms <= 60_000:
-        raise DriverError("invalid_timeout_ms")
-    return timeout_ms
-
-
 def validate_wait_seconds(timeout_seconds: float) -> float:
     if isinstance(timeout_seconds, bool) or not 0 <= timeout_seconds <= 60:
         raise DriverError("invalid_timeout_seconds")
@@ -210,8 +204,7 @@ def execution_preview(result: dict[str, Any]) -> dict[str, Any] | None:
     return summarized
 
 
-async def _submit_script(ctx: DiagnosticContext, script: str, timeout_ms: int) -> dict[str, Any]:
-    selected_timeout = min(validate_timeout_ms(timeout_ms), int(remaining_seconds(ctx) * 1000))
+async def _submit_script(ctx: DiagnosticContext, script: str) -> dict[str, Any]:
     script = validate_script(script)
     if ctx.scripts_submitted >= ctx.max_steps:
         raise DriverError("script_step_budget_exhausted")
@@ -220,7 +213,6 @@ async def _submit_script(ctx: DiagnosticContext, script: str, timeout_ms: int) -
     submitted = await ctx.control_plane.submit_execution(
         ctx.session_id,
         script,
-        selected_timeout,
         timeout_seconds=remaining_seconds(ctx),
     )
     api_ms = (time.perf_counter() - started) * 1000
@@ -231,7 +223,6 @@ async def _submit_script(ctx: DiagnosticContext, script: str, timeout_ms: int) -
         "execution_id": execution_id,
         "status": submitted["status"],
         "script_sha256": submitted.get("script_sha256"),
-        "timeout_ms": selected_timeout,
     }
 
 
@@ -328,10 +319,9 @@ async def _inspect_output(ctx: DiagnosticContext, execution_id: str, stream: str
 async def submit_script(
     wrapper: RunContextWrapper[DiagnosticContext],
     script: Annotated[str, Field(min_length=1, max_length=MAX_SCRIPT_BYTES)],
-    timeout_ms: Annotated[int, Field(ge=100, le=60_000)] = 5000,
 ) -> dict[str, Any]:
     """Submit one model-authored PowerShell script to the driver-owned session."""
-    return await _submit_script(wrapper.context, script, timeout_ms)
+    return await _submit_script(wrapper.context, script)
 
 
 @function_tool

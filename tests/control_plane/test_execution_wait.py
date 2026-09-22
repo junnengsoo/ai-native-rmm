@@ -142,7 +142,7 @@ def test_terminal_wait_is_workspace_scoped(monkeypatch):
         clear_waiters()
 
 
-async def _endpoint_disconnect_marks_unknown_and_wakes_terminal_wait(monkeypatch):
+async def _endpoint_disconnect_does_not_finalize_or_wake_terminal_wait(monkeypatch):
     workspace_id = uuid.uuid4()
     execution_id = uuid.uuid4()
     device_id = uuid.uuid4()
@@ -151,13 +151,12 @@ async def _endpoint_disconnect_marks_unknown_and_wakes_terminal_wait(monkeypatch
 
     def fake_fail_device_investigations(disconnected_device_id):
         assert disconnected_device_id == device_id
-        row["status"] = "outcome_unknown"
-        return [execution_id]
+        return []
 
     monkeypatch.setattr(app_module, "fail_device_investigations", fake_fail_device_investigations)
 
     waiting = asyncio.create_task(app_module.wait_execution_terminal(
-        execution_id, authorization="Bearer operator-secret", timeout_seconds=10,
+        execution_id, authorization="Bearer operator-secret", timeout_seconds=0.1,
     ))
     for _ in range(20):
         if str(execution_id) in app_module.terminal_waiters:
@@ -166,16 +165,17 @@ async def _endpoint_disconnect_marks_unknown_and_wakes_terminal_wait(monkeypatch
     assert str(execution_id) in app_module.terminal_waiters
 
     await app_module.fail_device_investigations_and_notify(device_id)
+    assert waiting.done() is False
     body = await asyncio.wait_for(waiting, 1)
 
-    assert body == {"execution_id": str(execution_id), "status": "outcome_unknown",
-                    "terminal": True, "wait_timed_out": False}
+    assert body == {"execution_id": str(execution_id), "status": "running",
+                    "terminal": False, "wait_timed_out": True}
     assert app_module.terminal_waiters == {}
 
 
-def test_endpoint_disconnect_marks_unknown_and_wakes_terminal_wait(monkeypatch):
+def test_endpoint_disconnect_does_not_finalize_or_wake_terminal_wait(monkeypatch):
     clear_waiters()
     try:
-        asyncio.run(_endpoint_disconnect_marks_unknown_and_wakes_terminal_wait(monkeypatch))
+        asyncio.run(_endpoint_disconnect_does_not_finalize_or_wake_terminal_wait(monkeypatch))
     finally:
         clear_waiters()

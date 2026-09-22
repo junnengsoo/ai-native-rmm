@@ -3,73 +3,126 @@ using System.Text.Json;
 
 namespace EndpointAgent;
 
-// Shared session/execution runtime for every authenticated endpoint connection.
-// Authentication entry points decide whether their peer supports reachability
-// heartbeats; dispatch, worker lifecycle, and protocol bounds live only here.
 internal static class AgentRuntime {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
-    public static async Task Run(WebSocket socket, string device, bool sendHeartbeats, CancellationToken cancellation = default) {
-        WorkerProcess? worker = null;
-        string? session = null;
-        var sessions = new HashSet<string>(StringComparer.Ordinal);
-        var executions = new HashSet<string>(StringComparer.Ordinal);
-        Task<(string Session, string Execution, WorkerResult Result)>? invocation = null;
-        CancellationTokenSource? invocationStop = null;
-        string? currentExecution = null;
-        bool closeAfterInvocation = false;
+    private sealed class RuntimeFrame {
+        public WorkerProcess? Worker { get; set; }
+        public string? Session { get; set; }
+        public string? CurrentExecution { get; set; }
+        public string? CurrentScriptHash { get; set; }
+        public Task<(string Session, string Execution, string ScriptSha256, WorkerResult Result)>? Invocation { get; set; }
+        public CancellationTokenSource? InvocationStop { get; set; }
+        public bool CloseAfterInvocation { get; set; }
+    }
+
+    private sealed class LedgerTransport {
+        private readonly SemaphoreSlim sendLock = new(1, 1);
+        private readonly object gate = new();
+        private long inFlightThrough;
+
+        public SemaphoreSlim SendLock => sendLock;
+
+        public async Task SendPending(WebSocket socket, EndpointLedger ledger, string device) {
+            IReadOnlyList<LedgerRecord> batch;
+            long batchThrough;
+            lock (gate) {
+                if (inFlightThrough > ledger.AcknowledgedThrough) return;
+                batch = ledger.PendingBatch();
+                if (batch.Count == 0) return;
+                batchThrough = batch[^1].Sequence;
+                inFlightThrough = batchThrough;
+            }
+            try {
+                await Send(socket, sendLock, new {
+                    type = "ledger_batch",
+                    deviceId = device,
+                    ledgerId = ledger.LedgerId,
+                    records = batch,
+                });
+            } catch {
+                lock (gate) {
+                    if (inFlightThrough == batchThrough) inFlightThrough = 0;
+                }
+                throw;
+            }
+        }
+
+        public void ObserveAck(EndpointLedger ledger) {
+            lock (gate) {
+                if (inFlightThrough <= ledger.AcknowledgedThrough) inFlightThrough = 0;
+            }
+        }
+    }
+
+    public static async Task Run(WebSocket socket, string device, bool sendHeartbeats, AgentRuntimeState state) {
+        var ledger = state.Ledger;
+        var frame = new RuntimeFrame {
+            Worker = state.Worker,
+            Session = ledger.Snapshot.SessionId,
+            CurrentExecution = ledger.Snapshot.ExecutionId,
+            CurrentScriptHash = ledger.Snapshot.ScriptSha256,
+            Invocation = state.Invocation,
+            InvocationStop = state.InvocationStop,
+        };
         Task<JsonElement>? incoming = null;
         using var stopped = new CancellationTokenSource();
-        using var sendLock = new SemaphoreSlim(1, 1);
-        var cancelled = Task.Delay(Timeout.InfiniteTimeSpan, cancellation);
-        Task heartbeats = sendHeartbeats ? Heartbeats(socket, sendLock, stopped.Token) : Task.CompletedTask;
+        var transport = new LedgerTransport();
+        Task heartbeats = sendHeartbeats ? Heartbeats(socket, transport.SendLock, stopped.Token) : Task.CompletedTask;
         try {
-            while (socket.State == WebSocketState.Open && !cancellation.IsCancellationRequested) {
-                if (invocation is not null) {
-                    incoming ??= Receive(socket, TimeSpan.FromMinutes(2), cancellation);
-                    var ready = await Task.WhenAny(incoming, invocation, cancelled);
-                    if (ready == cancelled) break;
-                    if (ready == invocation) {
-                        var completed = await invocation;
-                        invocation = null;
-                        invocationStop?.Dispose();
-                        invocationStop = null;
-                        currentExecution = null;
-                        await Send(socket, sendLock, new { type = "result", deviceId = device,
-                            sessionId = completed.Session, executionId = completed.Execution,
-                            completed.Result.State, completed.Result.InvocationOutcome, completed.Result.ExitCode,
-                            completed.Result.ExitCodeSource, completed.Result.HadErrors,
-                            completed.Result.DurationMs, completed.Result.CaptureTruncated,
-                            completed.Result.LastNativeExitCode });
-                        if (closeAfterInvocation && worker is not null) {
-                            await worker.DisposeAsync();
-                            worker = null;
-                            await Send(socket, sendLock, new { type = "session_closed", deviceId = device, sessionId = session });
-                            session = null;
-                            closeAfterInvocation = false;
+            await TrySendPendingLedger(socket, transport, ledger, device);
+            while (socket.State == WebSocketState.Open) {
+                await TrySendPendingLedger(socket, transport, ledger, device);
+                if (frame.Invocation is not null) {
+                    incoming ??= Receive(socket, TimeSpan.FromMinutes(2));
+                    var ready = await Task.WhenAny(incoming, frame.Invocation);
+                    if (ready == frame.Invocation) {
+                        var completed = await frame.Invocation;
+                        frame.Invocation = null;
+                        state.Invocation = null;
+                        state.InvocationStop?.Dispose();
+                        state.InvocationStop = null;
+                        frame.InvocationStop = null;
+                        frame.CurrentExecution = null;
+                        frame.CurrentScriptHash = null;
+                        if (completed.Result.State == "outcome_unknown") {
+                            bool cleaned = await Cleanup(frame.Worker);
+                            ledger.WorkerStopped(completed.Session, completed.Execution, completed.ScriptSha256,
+                                "worker_result_unknown", cleaned, completed.Result.CaptureTruncated);
+                            frame.Worker = null;
+                            state.Worker = null;
+                            frame.Session = null;
+                            frame.CloseAfterInvocation = false;
+                        } else {
+                            ledger.ExecutionFinished(completed.Session, completed.Execution, completed.ScriptSha256, completed.Result);
+                            if (frame.CloseAfterInvocation) {
+                                bool cleaned = await Cleanup(frame.Worker);
+                                if (cleaned) ledger.SessionClosed(completed.Session);
+                                else ledger.WorkerStopped(completed.Session, completed.Execution, completed.ScriptSha256,
+                                    "cleanup_unconfirmed", false, completed.Result.CaptureTruncated);
+                                frame.Worker = null;
+                                state.Worker = null;
+                                frame.Session = null;
+                                frame.CloseAfterInvocation = false;
+                            } else if (completed.Result.State is "cancelled" or "timed_out"
+                                || completed.Result.InvocationOutcome == "explicit_exit"
+                                || frame.Worker is { IsUsable: false }) {
+                                bool cleaned = await Cleanup(frame.Worker);
+                                ledger.WorkerStopped(completed.Session, completed.Execution, completed.ScriptSha256,
+                                    completed.Result.State, cleaned, completed.Result.CaptureTruncated);
+                                frame.Worker = null;
+                                state.Worker = null;
+                                frame.Session = null;
+                                frame.CloseAfterInvocation = false;
+                            }
                         }
+                        await TrySendPendingLedger(socket, transport, ledger, device);
                     } else {
                         try {
-                            var runningMessage = await incoming;
-                            if (runningMessage.TryGetProperty("type", out var runningMessageType)
-                                && runningMessageType.ValueKind == JsonValueKind.String
-                                && runningMessageType.GetString() == "heartbeat_ack") {
-                                continue;
-                            }
-                            Dispatch? runningRequest;
-                            try { runningRequest = Dispatch.Parse(runningMessage, device); }
-                            catch (JsonException) { runningRequest = null; }
-                            if (runningRequest?.Type == "cancel_execution" && runningRequest.SessionId == session
-                                && runningRequest.ExecutionId == currentExecution) {
-                                invocationStop?.Cancel();
-                            } else if (runningRequest?.Type == "close_session" && runningRequest.SessionId == session) {
-                                closeAfterInvocation = true;
-                                invocationStop?.Cancel();
-                            } else {
-                                await Reject(socket, sendLock, runningRequest is null ? "invalid_request" : "invalid_state_or_duplicate");
-                            }
+                            var message = await incoming;
+                            await HandleMessage(socket, transport, ledger, device, message, frame, state);
                         } catch (JsonException) {
-                            await Reject(socket, sendLock, "invalid_request");
+                            await Reject(socket, transport.SendLock, device, "invalid_request");
                         } catch (OperationCanceledException) {
                         } finally {
                             incoming = null;
@@ -77,65 +130,138 @@ internal static class AgentRuntime {
                     }
                     continue;
                 }
-                JsonElement message;
-                incoming ??= Receive(socket, TimeSpan.FromMinutes(2), cancellation);
-                try { message = await incoming; }
-                catch (JsonException) {
-                    incoming = null;
-                    await Reject(socket, sendLock, "invalid_request");
-                    continue;
+
+                incoming ??= Receive(socket, TimeSpan.FromMinutes(2));
+                try {
+                    var message = await incoming;
+                    await HandleMessage(socket, transport, ledger, device, message, frame, state);
+                } catch (JsonException) {
+                    await Reject(socket, transport.SendLock, device, "invalid_request");
                 } catch (OperationCanceledException) {
+                    if (frame.Session is not null && frame.Invocation is null) {
+                        bool cleaned = await Cleanup(frame.Worker);
+                        if (cleaned) ledger.SessionClosed(frame.Session);
+                        else ledger.WorkerStopped(frame.Session, null, null, "session_timeout_cleanup_unconfirmed", false);
+                        frame.Worker = null;
+                        state.Worker = null;
+                        frame.Session = null;
+                        await TrySendPendingLedger(socket, transport, ledger, device);
+                    }
+                } finally {
                     incoming = null;
-                    continue;
                 }
-                incoming = null;
-                if (message.TryGetProperty("type", out var messageType)
-                    && messageType.ValueKind == JsonValueKind.String
-                    && messageType.GetString() == "heartbeat_ack") continue;
-
-                Dispatch? request;
-                try { request = Dispatch.Parse(message, device); }
-                catch (JsonException) { request = null; }
-                if (request is null) { await Reject(socket, sendLock, "invalid_request"); continue; }
-
-                if (request.Type == "open_session" && worker is null && invocation is null
-                    && sessions.Count < 100 && sessions.Add(request.SessionId)) {
-                    session = request.SessionId;
-                    worker = await WorkerProcess.Start();
-                    await Send(socket, sendLock, new { type = "session_ready", deviceId = device, sessionId = session });
-                } else if (request.Type == "close_session" && worker is not null && invocation is null
-                    && request.SessionId == session) {
-                    await worker.DisposeAsync();
-                    worker = null;
-                    await Send(socket, sendLock, new { type = "session_closed", deviceId = device, sessionId = session });
-                    session = null;
-                } else if (request.Type == "execute" && worker is not null && worker.IsUsable && invocation is null
-                    && request.SessionId == session && executions.Count < 1000
-                    && executions.Add(request.ExecutionId!)) {
-                    string execution = request.ExecutionId!;
-                    await Send(socket, sendLock, new { type = "running", deviceId = device,
-                        sessionId = session, executionId = execution });
-                    invocationStop = new CancellationTokenSource();
-                    currentExecution = execution;
-                    closeAfterInvocation = false;
-                    invocation = Complete(worker, session!, execution, request.Script!, request.TimeoutMs,
-                        (stream, text) => Send(socket, sendLock, new { type = "output", deviceId = device,
-                            sessionId = session, executionId = execution, stream, text }),
-                        invocationStop.Token);
-                } else await Reject(socket, sendLock, "invalid_state_or_duplicate");
             }
         } finally {
             stopped.Cancel();
             try { await heartbeats; }
             catch (Exception error) when (error is OperationCanceledException or WebSocketException) { }
-            if (worker is not null) await worker.DisposeAsync();
         }
     }
 
-    private static async Task<(string Session, string Execution, WorkerResult Result)> Complete(
-        WorkerProcess worker, string session, string execution, string script, int timeoutMs,
-        Func<string, string, Task> onOutput, CancellationToken cancellation) =>
-        (session, execution, await worker.Execute(script, timeoutMs, onOutput, cancellation));
+    private static async Task HandleMessage(WebSocket socket, LedgerTransport transport, EndpointLedger ledger,
+                                            string device, JsonElement message, RuntimeFrame frame,
+                                            AgentRuntimeState state) {
+        if (TryApplyAck(ledger, transport, message)) return;
+        if (message.TryGetProperty("type", out var typeElement)
+            && typeElement.ValueKind == JsonValueKind.String
+            && typeElement.GetString() == "heartbeat_ack") return;
+
+        Dispatch? request;
+        try { request = Dispatch.Parse(message, device); }
+        catch (JsonException) { request = null; }
+        if (request is null) {
+            await Reject(socket, transport.SendLock, device, "invalid_request");
+            return;
+        }
+        if (ledger.HasUnacknowledgedRecords && (request.Type is "open_session" or "execute")) {
+            await Reject(socket, transport.SendLock, device, "reconciliation_pending", request);
+            return;
+        }
+
+        if (request.Type == "open_session" && frame.Worker is null && frame.Invocation is null) {
+            frame.Worker = await WorkerProcess.Start();
+            state.Worker = frame.Worker;
+            frame.Session = request.SessionId;
+            ledger.SessionStarted(frame.Session);
+            await TrySendPendingLedger(socket, transport, ledger, device);
+        } else if (request.Type == "close_session" && request.SessionId == frame.Session && frame.Invocation is null) {
+            bool cleaned = await Cleanup(frame.Worker);
+            if (cleaned) ledger.SessionClosed(request.SessionId);
+            else ledger.WorkerStopped(request.SessionId, null, null, "cleanup_unconfirmed", false);
+            frame.Worker = null;
+            state.Worker = null;
+            frame.Session = null;
+            await TrySendPendingLedger(socket, transport, ledger, device);
+        } else if (request.Type == "close_session" && request.SessionId == frame.Session && frame.Invocation is not null) {
+            frame.CloseAfterInvocation = true;
+            frame.InvocationStop?.Cancel();
+        } else if (request.Type == "execute" && frame.Worker is not null && frame.Worker.IsUsable && frame.Invocation is null
+                   && request.SessionId == frame.Session) {
+            string execution = request.ExecutionId!;
+            string scriptHash = request.ScriptSha256!;
+            if (!ledger.TryExecutionAccepted(frame.Session!, execution, scriptHash)) {
+                await Reject(socket, transport.SendLock, device, "invalid_state_or_duplicate", request);
+                return;
+            }
+            frame.InvocationStop = new CancellationTokenSource();
+            state.InvocationStop = frame.InvocationStop;
+            frame.CurrentExecution = execution;
+            frame.CurrentScriptHash = scriptHash;
+            frame.CloseAfterInvocation = false;
+            frame.Invocation = CompleteAndLedger(socket, transport, ledger, device, frame.Worker, frame.Session!, execution,
+                scriptHash, request.Script!, request.TimeoutMs, frame.InvocationStop.Token);
+            state.Invocation = frame.Invocation;
+            await TrySendPendingLedger(socket, transport, ledger, device);
+        } else if (request.Type == "cancel_execution" && request.SessionId == frame.Session
+                   && request.ExecutionId == frame.CurrentExecution && frame.CurrentScriptHash is not null) {
+            ledger.CancellationRequested(request.SessionId, request.ExecutionId!, frame.CurrentScriptHash);
+            await TrySendPendingLedger(socket, transport, ledger, device);
+            frame.InvocationStop?.Cancel();
+        } else {
+            await Reject(socket, transport.SendLock, device, "invalid_state_or_duplicate", request);
+        }
+    }
+
+    private static async Task<(string Session, string Execution, string ScriptSha256, WorkerResult Result)> CompleteAndLedger(
+        WebSocket socket, LedgerTransport transport, EndpointLedger ledger, string device, WorkerProcess worker,
+        string session, string execution, string scriptSha256, string script, int timeoutMs,
+        CancellationToken cancellation) {
+        ledger.ExecutionStarted(session, execution, scriptSha256);
+        await TrySendPendingLedger(socket, transport, ledger, device);
+        var result = await worker.Execute(script, timeoutMs, async (stream, text) => {
+            ledger.OutputChunk(session, execution, scriptSha256, stream, text);
+            await TrySendPendingLedger(socket, transport, ledger, device);
+        }, cancellation);
+        return (session, execution, scriptSha256, result);
+    }
+
+    private static bool TryApplyAck(EndpointLedger ledger, LedgerTransport transport, JsonElement message) {
+        if (!message.TryGetProperty("type", out var typeElement)
+            || typeElement.ValueKind != JsonValueKind.String
+            || typeElement.GetString() != "ledger_ack") return false;
+        string? ledgerId = message.TryGetProperty("ledger_id", out var id) ? id.GetString() : null;
+        if (ledgerId is null && message.TryGetProperty("ledgerId", out var camelId)) ledgerId = camelId.GetString();
+        if (ledgerId is null || !message.TryGetProperty("acknowledged_through", out var ack)) return true;
+        ledger.Acknowledge(ledgerId, ack.GetInt64());
+        transport.ObserveAck(ledger);
+        return true;
+    }
+
+    private static async Task TrySendPendingLedger(WebSocket socket, LedgerTransport transport,
+                                                   EndpointLedger ledger, string device) {
+        try { await transport.SendPending(socket, ledger, device); }
+        catch (Exception error) when (error is WebSocketException or OperationCanceledException or ObjectDisposedException) { }
+    }
+
+    private static async Task<bool> Cleanup(WorkerProcess? worker) {
+        if (worker is null) return true;
+        try {
+            await worker.DisposeAsync();
+            return true;
+        } catch (InvalidOperationException) {
+            return false;
+        }
+    }
 
     private static async Task Heartbeats(WebSocket socket, SemaphoreSlim sendLock, CancellationToken stopped) {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(15));
@@ -143,8 +269,17 @@ internal static class AgentRuntime {
             await Send(socket, sendLock, new { type = "heartbeat" }, stopped);
     }
 
-    private static Task Reject(WebSocket socket, SemaphoreSlim sendLock, string code) =>
-        Send(socket, sendLock, new { type = "rejected", code });
+    private static Task Reject(WebSocket socket, SemaphoreSlim sendLock, string device, string code,
+                               Dispatch? request = null) {
+        var payload = new Dictionary<string, object?> {
+            ["type"] = "rejected",
+            ["code"] = code,
+            ["deviceId"] = device,
+        };
+        if (request?.SessionId is not null) payload["sessionId"] = request.SessionId;
+        if (request?.ExecutionId is not null) payload["executionId"] = request.ExecutionId;
+        return Send(socket, sendLock, payload);
+    }
 
     private static async Task Send(WebSocket socket, SemaphoreSlim sendLock, object value,
                                    CancellationToken cancellation = default) {
@@ -157,16 +292,15 @@ internal static class AgentRuntime {
         } finally { sendLock.Release(); }
     }
 
-    private static async Task<JsonElement> Receive(WebSocket socket, TimeSpan wait, CancellationToken cancellation) {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        timeout.CancelAfter(wait);
+    private static async Task<JsonElement> Receive(WebSocket socket, TimeSpan wait) {
+        using var timeout = new CancellationTokenSource(wait);
         using var data = new MemoryStream();
         var buffer = new byte[8192];
         WebSocketReceiveResult part;
         do {
             part = await socket.ReceiveAsync(buffer, timeout.Token);
             if (part.MessageType == WebSocketMessageType.Close) throw new WebSocketException();
-            if (part.MessageType != WebSocketMessageType.Text || data.Length + part.Count > 80_000)
+            if (part.MessageType != WebSocketMessageType.Text || data.Length + part.Count > 300_000)
                 throw new InvalidDataException();
             data.Write(buffer, 0, part.Count);
         } while (!part.EndOfMessage);

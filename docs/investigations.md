@@ -29,7 +29,7 @@ return the original execution; changing any bound input returns `409`.
 - `POST /callers` — admin only; returns a new credential once.
 - `POST /sessions` — operator only; returns only after the endpoint worker is ready.
 - `GET /sessions/{id}` — operator, workspace scoped.
-- `POST /sessions/{id}/executions` — operator; requires `Idempotency-Key` and an explicit `timeout_ms`.
+- `POST /sessions/{id}/executions` — operator; requires `Idempotency-Key`; `timeout_ms` is accepted for client compatibility but is not an endpoint execution deadline.
 - `GET /executions/{id}/wait?timeout_seconds=20` — operator, workspace scoped;
   immediate status lookup when `timeout_seconds=0`, or a terminal-state wait
   for command-line callers. It wakes only when the execution reaches a terminal
@@ -49,6 +49,10 @@ return the original execution; changing any bound input returns `409`.
 - `POST /executions/{id}/cancel` — operator, workspace scoped; requests cancellation of queued/running work.
 - `POST /sessions/{id}/close` — operator; returns after endpoint cleanup confirmation.
 
+Session status `lost` means a previously live PowerShell worker was retired
+during reconnect reconciliation; its variables, functions, modules, and working
+directory must be treated as gone.
+
 Execution statuses are `queued`, `running`, `completed`, `failed_to_start`,
 `timed_out`, `cancelled`, and `outcome_unknown`. `failed_to_start` is used for
 known non-execution, including submission while the endpoint is offline.
@@ -58,17 +62,36 @@ evidence that was not observed and report a reason plus the last confirmed
 lifecycle state. Completed results distinguish normalized invocation codes from
 explicit script exits.
 Output is retained incrementally as inert per-stream data, never parsed as
-lifecycle even when it resembles protocol JSON. Endpoint terminal `result`
-messages carry lifecycle metadata only; stdout/stderr text comes from ordered
-endpoint `output` frames. Terminal wait responses derive and return preview text
+lifecycle even when it resembles protocol JSON. Endpoint terminal records carry
+lifecycle metadata only; stdout/stderr text comes from ordered endpoint ledger
+`output_chunk` records. Terminal wait responses derive and return preview text
 only under `output_preview`; they do not duplicate preview text as top-level
 `stdout` or `stderr`. Paging endpoints expose more retained context without
 rerunning the script. Cursors are per execution stream,
 monotonically ordered by retained UTF-8 text events, and never split a Unicode
 character.
+
+Reconnect reconciliation is ledger based. The endpoint writes accepted work,
+output, output-loss markers, worker-stop evidence, and terminal records to a
+local append-only ledger before sending them. The control plane ingests ordered
+`ledger_batch` messages transactionally and replies with `ledger_ack` only after
+the contiguous records are committed. A socket disconnect makes reachability
+stale, but it does not cancel a surviving invocation, retire the PowerShell
+worker, or finalize the execution as unknown. On reconnect, the endpoint resends
+records above its acknowledged checkpoint; duplicate records with identical
+content are ignored and conflicting duplicates or binding/hash mismatches are
+rejected.
+
+A terminal record received after reconnect is the ordinary result for that
+execution as long as the execution was not already finalized as genuinely
+unknown. Normal completion leaves the debugging session active and reusable. If
+the endpoint service or machine restarts with no surviving worker and no terminal
+record, the endpoint writes `worker_stopped`; any accepted running execution
+becomes `outcome_unknown`, and the old session becomes `lost`. Reconciliation
+never replays the prior script.
 Preview shortening is reported separately from capture loss. Capture loss means
-execution ended before all emitted output could be forwarded, such as timeout or
-worker loss; a shortened preview only means more retained output is available
+execution ended before all emitted output could be forwarded, such as cancellation,
+session cleanup, endpoint restart, or worker loss; a shortened preview only means more retained output is available
 behind the paging endpoints.
 
 Retained-output investigation is a control-plane storage read. Search is
@@ -86,12 +109,12 @@ response includes the normal bounded execution view plus `terminal: true` and
 `queued`/`running` status, `terminal: false`, and `wait_timed_out: true`; it
 does not cancel or otherwise affect the execution.
 
-The caller must select `timeout_ms` for every execution; there is no default.
-Values are accepted from 100 ms through the 60-minute safety ceiling. The
-endpoint enforces the selected timeout locally even if the caller disconnects.
-Timeout, cancellation, and explicit session closure terminate the worker's
-Windows Job Object, including owned child processes, and wait up to 30 seconds
-for confirmation before reporting uncertainty.
+The endpoint does not enforce a separate per-execution timeout. Compatible
+clients may still send `timeout_ms` from 100 ms through the 60-minute safety
+ceiling, but cancellation, explicit session closure, revocation cleanup, and
+session/service lifetime own worker termination. Confirmed cleanup terminates the
+worker's Windows Job Object, including owned child processes, and close waits up
+to 30 seconds for confirmation before reporting uncertainty.
 
 ## Manual smoke test
 
@@ -144,11 +167,11 @@ same requests with an HTTP client:
 
    Use the `start_byte` and `end_byte` from the search match for the range
    request. All three reads must work while the endpoint is offline. Submit a
-   new execution to the same session while offline; it should create a distinct
-   record that becomes `failed_to_start`, proving the retained-output reads did
-   not create or dispatch endpoint work. Also verify a search for absent text
-   returns `matches: []`, unauthorized workspace reads return `404`, an empty
-   query returns `422`, and an inverted range returns `422`.
+   new execution to the same session while offline; the old session should no
+   longer be active, proving retained-output reads did not create or dispatch
+   endpoint work. Also verify a search for absent text returns `matches: []`,
+   unauthorized workspace reads return `404`, an empty query returns `422`, and
+   an inverted range returns `422`.
 8. Submit `$global:trialValue = 41`, then `$global:trialValue + 1` under a new
    idempotency key. The terminal wait response must show
    `output_preview.stdout.text` containing `42`, exit code `0`, and a duration.
@@ -161,25 +184,37 @@ same requests with an HTTP client:
 10. `POST /sessions/SESSION_ID/close`; expect `status: closed`. Create another
    session and evaluate `$null -eq $global:trialValue`; expect `True`, proving a
    fresh PowerShell environment. Close it.
-11. For timeout cleanup, create a fresh session and submit a long script with
-   `timeout_ms: 500` that starts an owned child process before sleeping. Poll the
-   execution until it returns `timed_out`, `invocation_outcome: stopped`, null
-   exit-code fields, and any partial output observed before the timeout. Close
-   that session, open a fresh session, and verify the child process ID is gone.
+11. For active close cleanup, create a fresh session and submit a long script
+   that starts an owned child process before sleeping. Close the session while
+   the execution is running; expect the execution to return `cancelled`,
+   `invocation_outcome: stopped`, the session to become `closed`, and the owned
+   child process to be gone after opening a fresh session.
 12. Repeat with caller cancellation: submit a long-running execution, call
    `POST /executions/EXECUTION_ID/cancel`, and poll until it returns `cancelled`,
    `invocation_outcome: stopped`, and null exit-code fields.
 13. For offline behavior, create a session while the device is online, stop the
-   endpoint agent, then submit an execution. The execution record should become
-   `failed_to_start` with `outcome_reason: device_offline_before_dispatch` and
-   `last_confirmed_status: queued`; no script output or invented exit code should
-   be present.
+   endpoint agent, then submit an execution to that old session. The request may
+   create a truthful `failed_to_start` execution if no endpoint connection can
+   accept it; it must not invent output, an exit code, or a replacement dispatch.
+14. For active reconnect reconciliation, create a session and submit a script
+   that writes durable marker 1, waits, then writes durable marker 2. Interrupt
+   connectivity after marker 1 and reconnect while the invocation is still
+   active. The execution should remain `running`, new sessions/executions should
+   be blocked, and marker 2 should be written exactly once. When the invocation
+   becomes terminal, `GET /executions/{id}/wait` should show the ordinary
+   terminal status and output preview, and the same session should accept a
+   second command after reconciliation completes.
+15. Drop a `ledger_ack`, reconnect, and confirm retransmission does not duplicate
+   retained output or lifecycle transitions.
+16. Exercise a small test-only endpoint ledger capacity and confirm execution
+   completes with `output_complete: false` and an output-loss reason while
+   preserving terminal evidence.
 
-On 2026-09-21, the local public HTTP suite ran against a live PostgreSQL-backed
-control plane with an independent endpoint simulator: `20 passed, 3 skipped`.
-The output test covered terminal waits that ignore intermediate output, preview
-bounds, 64 KiB pages, Unicode, empty streams, output imitating control messages,
-wait timeouts that leave execution running, and workspace-scoped denial. The opt-in
+On 2026-09-23, the Compose-backed control-plane suite ran against PostgreSQL and
+the independent endpoint simulators: `66 passed, 3 skipped`. The output tests
+covered terminal waits that ignore intermediate output, preview bounds, 64 KiB
+pages, Unicode, empty streams, output imitating control messages, wait timeouts
+that leave execution running, and workspace-scoped denial. The opt-in
 `tests/control_plane/test_windows.py` automates the persistent investigation path
 against the authorized Azure Windows VM. It additionally stops the endpoint,
 observes an offline terminal execution record, waits for staleness, restarts it,
@@ -188,13 +223,13 @@ and verifies the stable device identity.
 ## Boundaries
 
 The trial uses one control-plane process because live WebSocket routing is
-in-memory; durable claims and results remain in PostgreSQL. A restart marks
-previously running work `outcome_unknown` and live sessions `failed` rather than
-relaunching uncertain work. The prototype does not include configurable session
-idle/absolute lifetime, start-deadline clock coordination, offline command
-queueing, or restart reconciliation. Multi-process connection routing, caller
-revocation, recovery/revocation, and configurable
-execution profiles belong to later tickets. The candidate
-[Windows service installer](windows-service-installer.md) deliberately keeps the
-same `LocalSystem` execution identity. Nothing in this slice claims that arbitrary
+in-memory. Durable endpoint ledger records, committed cursor acknowledgements,
+normal execution results, output-loss markers, and genuinely unknown outcomes
+remain in PostgreSQL. The ledger is intentionally scoped to one generation, one
+active debugging session, and one active execution at a time; it is not a general
+event-sourcing system. The prototype does not include multiple concurrent
+executions, high-availability control-plane routing, offline command queueing,
+automatic rerun of unknown work, indefinite endpoint retention after
+acknowledgement, full caller revocation, installer/service lifecycle, or
+configurable execution profiles. Nothing in this slice claims that arbitrary
 scripts are sandboxed from the managed Windows host.

@@ -49,14 +49,13 @@ class FakeControlPlane:
         self.closed = self.close_ok
         return (self.close_ok, None if self.close_ok else "session_close_unconfirmed")
 
-    async def submit_execution(self, session_id, script, timeout_ms, *, timeout_seconds):
+    async def submit_execution(self, session_id, script, *, timeout_seconds):
         assert session_id == "session-1"
-        assert 100 <= timeout_ms <= 60_000
         if self.fail_submit:
             raise httpx.ReadTimeout("submit response lost")
         execution_id = f"exec-{self.next_execution}"
         self.next_execution += 1
-        self.submitted.append((execution_id, script, timeout_ms))
+        self.submitted.append((execution_id, script))
         return {
             "execution_id": execution_id,
             "status": "queued",
@@ -143,10 +142,8 @@ def test_agent_exposes_exactly_three_script_execution_tools():
     assert agent.model_settings.max_tokens == 600
 
     schemas = {tool.name: tool.params_json_schema["properties"] for tool in agent.tools}
-    assert set(schemas["submit_script"]) == {"script", "timeout_ms"}
+    assert set(schemas["submit_script"]) == {"script"}
     assert schemas["submit_script"]["script"]["maxLength"] == 32768
-    assert schemas["submit_script"]["timeout_ms"]["minimum"] == 100
-    assert schemas["submit_script"]["timeout_ms"]["maximum"] == 60000
     assert set(schemas["wait_for_execution"]) == {"execution_id", "timeout_seconds"}
     assert schemas["wait_for_execution"]["timeout_seconds"]["maximum"] == 60
     assert set(schemas["inspect_output"]) == {
@@ -169,14 +166,14 @@ def test_real_agents_sdk_submit_tool_invokes_bound_session_and_schema():
 
     payload = asyncio.run(submit_tool.on_invoke_tool(
         tool_context(ctx),
-        json.dumps({"script": "Resolve-DnsName rmm-test-fileserver", "timeout_ms": 5000}),
+        json.dumps({"script": "Resolve-DnsName rmm-test-fileserver"}),
     ))
 
     assert payload["execution_id"] == "exec-1"
     assert payload["status"] == "queued"
     assert payload["script_sha256"]
     assert ctx.owned_execution_ids == {"exec-1"}
-    assert ctx.control_plane.submitted == [("exec-1", "Resolve-DnsName rmm-test-fileserver", 5000)]
+    assert ctx.control_plane.submitted == [("exec-1", "Resolve-DnsName rmm-test-fileserver")]
 
 
 def test_wait_and_inspect_reject_unknown_execution_ids():
@@ -191,10 +188,10 @@ def test_wait_and_inspect_reject_unknown_execution_ids():
 def test_submit_enforces_driver_owned_script_budget():
     ctx = context(max_steps=1)
 
-    first = asyncio.run(_submit_script(ctx, "Get-NetIPConfiguration", 5000))
+    first = asyncio.run(_submit_script(ctx, "Get-NetIPConfiguration"))
     assert first["execution_id"] == "exec-1"
     with pytest.raises(DriverError, match="script_step_budget_exhausted"):
-        asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445", 5000))
+        asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445"))
 
 
 def test_submit_consumes_budget_before_ambiguous_post_result():
@@ -202,19 +199,19 @@ def test_submit_consumes_budget_before_ambiguous_post_result():
     ctx.control_plane.fail_submit = True
 
     with pytest.raises(httpx.ReadTimeout):
-        asyncio.run(_submit_script(ctx, "Get-NetIPConfiguration", 5000))
+        asyncio.run(_submit_script(ctx, "Get-NetIPConfiguration"))
     assert ctx.scripts_submitted == 1
     assert ctx.owned_execution_ids == set()
     with pytest.raises(DriverError, match="script_step_budget_exhausted"):
-        asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver", 5000))
+        asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver"))
 
 
 def test_three_tools_handle_repeated_wait_and_retained_output_inspection():
     ctx = context(max_steps=2)
-    first = asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver", 5000))
+    first = asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver"))
     running = asyncio.run(_wait_for_execution(ctx, first["execution_id"], 0.1))
     complete = asyncio.run(_wait_for_execution(ctx, first["execution_id"], 5))
-    second = asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445", 5000))
+    second = asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445"))
     tcp = asyncio.run(_wait_for_execution(ctx, second["execution_id"], 5))
     search = asyncio.run(_inspect_output(ctx, second["execution_id"], "stdout", "search",
                                          query="TcpTestSucceeded", context_lines=1, limit_matches=5))
@@ -280,7 +277,7 @@ class ScriptedModel(Model):
                 type="function_call",
                 call_id="call-1",
                 name="submit_script",
-                arguments=json.dumps({"script": "Resolve-DnsName rmm-test-fileserver", "timeout_ms": 5000}),
+                arguments=json.dumps({"script": "Resolve-DnsName rmm-test-fileserver"}),
             )]
         elif self.calls == 2:
             first_execution = self.tool_outputs["call-1"]["execution_id"]
@@ -306,7 +303,7 @@ class ScriptedModel(Model):
                 type="function_call",
                 call_id="call-4",
                 name="submit_script",
-                arguments=json.dumps({"script": "Test-NetConnection rmm-test-fileserver -Port 445", "timeout_ms": 5000}),
+                arguments=json.dumps({"script": "Test-NetConnection rmm-test-fileserver -Port 445"}),
             )]
         elif self.calls == 5:
             second_execution = self.tool_outputs["call-4"]["execution_id"]
@@ -362,7 +359,7 @@ def test_real_agents_sdk_runner_loop_submit_wait_read_dependent_script_and_repor
     assert model.calls == 7
     assert result.completed is True
     assert result.final_report == "DNS resolves, but SMB TCP 445 is unreachable."
-    assert [script for _, script, _ in control_plane.submitted] == [
+    assert [script for _, script in control_plane.submitted] == [
         "Resolve-DnsName rmm-test-fileserver",
         "Test-NetConnection rmm-test-fileserver -Port 445",
     ]
@@ -394,10 +391,10 @@ def test_drive_diagnostic_delegates_loop_to_runner_and_closes_session():
         assert run_config.tracing_disabled is True
         await hooks.on_llm_start(None, agent, None, [])
         await hooks.on_llm_end(None, agent, None)
-        first = await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver", 5000)
+        first = await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver")
         await _wait_for_execution(context.context, first["execution_id"], 0.1)
         await _wait_for_execution(context.context, first["execution_id"], 5)
-        second = await _submit_script(context.context, "Test-NetConnection rmm-test-fileserver -Port 445", 5000)
+        second = await _submit_script(context.context, "Test-NetConnection rmm-test-fileserver -Port 445")
         await _wait_for_execution(context.context, second["execution_id"], 5)
         return SimpleNamespace(
             final_output="Likely file-server TCP 445 is unreachable.",
@@ -444,7 +441,7 @@ def test_drive_diagnostic_does_not_complete_without_diagnostics():
 
 def test_drive_diagnostic_does_not_complete_with_submit_only_run():
     async def fake_runner(agent, prompt, *, context, max_turns, hooks, run_config):
-        await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver", 5000)
+        await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver")
         return SimpleNamespace(final_output="Submitted, but did not wait.", raw_responses=[])
 
     result = asyncio.run(drive_diagnostic(
@@ -465,7 +462,7 @@ def test_drive_diagnostic_does_not_complete_after_ambiguous_submit_even_if_runne
     async def fake_runner(agent, prompt, *, context, max_turns, hooks, run_config):
         context.context.control_plane.fail_submit = True
         with pytest.raises(httpx.ReadTimeout):
-            await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver", 5000)
+            await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver")
         return SimpleNamespace(final_output="Submit outcome unknown.", raw_responses=[])
 
     result = asyncio.run(drive_diagnostic(
@@ -484,7 +481,7 @@ def test_drive_diagnostic_does_not_complete_after_ambiguous_submit_even_if_runne
 
 def test_drive_diagnostic_does_not_complete_with_only_nonterminal_wait_and_preserves_cleanup():
     async def fake_runner(agent, prompt, *, context, max_turns, hooks, run_config):
-        submitted = await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver", 5000)
+        submitted = await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver")
         waited = await _wait_for_execution(context.context, submitted["execution_id"], 0.1)
         assert waited["terminal"] is False
         return SimpleNamespace(final_output="Still running.", raw_responses=[])
@@ -540,10 +537,10 @@ def test_unconfirmed_session_close_is_reported():
 
 def test_close_transport_failure_preserves_primary_outcome():
     async def fake_runner(agent, prompt, *, context, max_turns, hooks, run_config):
-        first = await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver", 5000)
+        first = await _submit_script(context.context, "Resolve-DnsName rmm-test-fileserver")
         await _wait_for_execution(context.context, first["execution_id"], 0.1)
         await _wait_for_execution(context.context, first["execution_id"], 5)
-        second = await _submit_script(context.context, "Test-NetConnection rmm-test-fileserver -Port 445", 5000)
+        second = await _submit_script(context.context, "Test-NetConnection rmm-test-fileserver -Port 445")
         await _wait_for_execution(context.context, second["execution_id"], 5)
         return SimpleNamespace(final_output="Primary finding.", raw_responses=[])
 
@@ -597,7 +594,7 @@ def test_control_plane_client_authenticates_public_api_without_openai_key():
         transport=httpx.MockTransport(handler),
     )
 
-    assert asyncio.run(client.submit_execution("session-1", "Get-Date", 1000, timeout_seconds=1))["execution_id"] == "exec-1"
+    assert asyncio.run(client.submit_execution("session-1", "Get-Date", timeout_seconds=1))["execution_id"] == "exec-1"
     assert asyncio.run(client.wait_execution("exec-1", 1))["terminal"] is True
     inspected = asyncio.run(client.inspect_output(
         "exec-1", "stdout", "search", {"query": "Tcp", "after_byte": 0}, timeout_seconds=1,
