@@ -45,6 +45,12 @@ immediately afterward. This verifies the real Windows command surface, but it is
 not a substitute for the end-to-end OpenAI, control-plane, tunnel, and endpoint
 smoke below.
 
+The same revision passed all 28 focused driver tests. A fresh Python 3.13
+control-plane container backed by an isolated PostgreSQL 16 volume also passed
+the broader non-Windows control-plane suite: 52 passed and one opt-in test was
+skipped. The isolated Compose project and its disposable database volume were
+removed after the run.
+
 ## Manual Windows/OpenAI smoke
 
 Complete the local Compose, tunnel, Windows enrollment, and admin setup in
