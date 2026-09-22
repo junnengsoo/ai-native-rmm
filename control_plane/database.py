@@ -11,7 +11,7 @@ from typing import Iterator
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import (Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Index, Integer,
+from sqlalchemy import (BigInteger, Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Identity, Index, Integer,
                         MetaData, String, Table, Text, UniqueConstraint, case,
                         create_engine, delete, func, inspect, insert, or_, select,
                         text, update)
@@ -80,6 +80,19 @@ executions = Table("executions", metadata,
     UniqueConstraint("caller_id", "idempotency_key", name="executions_caller_idempotency_key"))
 Index("executions_one_live_per_session", executions.c.session_id, unique=True,
       postgresql_where=executions.c.status.in_(("queued", "running")))
+execution_output_events = Table("execution_output_events", metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    Column("execution_id", UUID(as_uuid=True), ForeignKey("executions.id", ondelete="CASCADE"), nullable=False),
+    Column("stream", String(8), nullable=False),
+    Column("sequence", Integer, nullable=False), Column("text", Text, nullable=False),
+    Column("byte_count", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    CheckConstraint("stream IN ('stdout', 'stderr')", name="execution_output_stream_valid"),
+    CheckConstraint("sequence > 0", name="execution_output_sequence_positive"),
+    CheckConstraint("byte_count > 0 AND byte_count <= 8192", name="execution_output_byte_count_bounded"),
+    UniqueConstraint("execution_id", "stream", "sequence", name="execution_output_sequence_key"))
+Index("execution_output_execution_stream_sequence", execution_output_events.c.execution_id,
+      execution_output_events.c.stream, execution_output_events.c.sequence)
 audit_records = Table("audit_records", metadata,
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("workspace_id", UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=False),
@@ -321,14 +334,57 @@ def claim_execution(execution_id: uuid.UUID) -> RowMapping | None:
             executions.c.id == execution_id, executions.c.status == "queued"
         ).values(status="running", started_at=func.now()).returning(executions)).mappings().one_or_none()
 
+def split_utf8_chunks(value: str, limit: int = 8192) -> list[str]:
+    chunks, current, size = [], [], 0
+    for character in value:
+        encoded_size = len(character.encode())
+        if current and size + encoded_size > limit:
+            chunks.append("".join(current))
+            current, size = [], 0
+        current.append(character)
+        size += encoded_size
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+def append_execution_output(execution_id: uuid.UUID, stream: str, value: str,
+                            session_id: uuid.UUID | str | None = None,
+                            device_id: uuid.UUID | str | None = None) -> list[int]:
+    if stream not in {"stdout", "stderr"}:
+        raise ValueError("invalid_stream")
+    chunks = split_utf8_chunks(value)
+    if not chunks:
+        return []
+    with transaction() as connection:
+        statement = select(executions.c.id).where(executions.c.id == execution_id).with_for_update()
+        if session_id is not None or device_id is not None:
+            statement = statement.join(sessions, sessions.c.id == executions.c.session_id).where(
+                executions.c.status == "running")
+        if session_id is not None:
+            statement = statement.where(executions.c.session_id == session_id)
+        if device_id is not None:
+            statement = statement.where(sessions.c.device_id == device_id)
+        connection.execute(statement).scalar_one()
+        next_sequence = (connection.execute(select(func.coalesce(func.max(execution_output_events.c.sequence), 0)).where(
+            execution_output_events.c.execution_id == execution_id,
+            execution_output_events.c.stream == stream)).scalar_one() + 1)
+        sequences = []
+        for offset, chunk in enumerate(chunks):
+            sequence = next_sequence + offset
+            sequences.append(sequence)
+            connection.execute(insert(execution_output_events).values(
+                execution_id=execution_id, stream=stream, sequence=sequence,
+                text=chunk, byte_count=len(chunk.encode())))
+        return sequences
+
 def finish_execution(execution_id: uuid.UUID, result: dict[str, object]) -> None:
     values = {
         "status": result["state"], "invocation_outcome": result.get("invocationOutcome"),
         "outcome_reason": "endpoint_reported_unknown" if result["state"] == "outcome_unknown" else None,
         "last_confirmed_status": "running" if result["state"] == "outcome_unknown" else None,
         "exit_code": result.get("exitCode"), "exit_code_source": result.get("exitCodeSource"),
-        "had_errors": result.get("hadErrors"), "stdout": result.get("stdout"),
-        "stderr": result.get("stderr"), "duration_ms": result.get("durationMs"),
+        "had_errors": result.get("hadErrors"), "stdout": None, "stderr": None,
+        "duration_ms": result.get("durationMs"),
         "capture_truncated": result.get("captureTruncated"),
         "last_native_exit_code": result.get("lastNativeExitCode"), "finished_at": func.now(),
     }
@@ -353,6 +409,43 @@ def get_workspace_execution(workspace_id: uuid.UUID, execution_id: uuid.UUID) ->
         return connection.execute(select(executions).where(
             executions.c.id == execution_id,
             executions.c.workspace_id == workspace_id)).mappings().one_or_none()
+
+def get_execution_output_events(execution_id: uuid.UUID, stream: str, after: int,
+                                limit: int) -> list[RowMapping]:
+    with transaction() as connection:
+        return list(connection.execute(select(
+            execution_output_events.c.sequence, execution_output_events.c.text,
+            execution_output_events.c.byte_count, execution_output_events.c.created_at,
+        ).where(
+            execution_output_events.c.execution_id == execution_id,
+            execution_output_events.c.stream == stream,
+            execution_output_events.c.sequence > after,
+        ).order_by(execution_output_events.c.sequence).limit(limit)).mappings())
+
+def get_execution_output_high_water(execution_id: uuid.UUID, stream: str) -> int:
+    with transaction() as connection:
+        return connection.execute(select(func.coalesce(func.max(execution_output_events.c.sequence), 0)).where(
+            execution_output_events.c.execution_id == execution_id,
+            execution_output_events.c.stream == stream)).scalar_one()
+
+def get_execution_output_page(execution_id: uuid.UUID, stream: str, after: int,
+                              limit_bytes: int) -> dict[str, object]:
+    rows = get_execution_output_events(execution_id, stream, after, 1000)
+    text_parts, byte_total, next_cursor = [], 0, after
+    for row in rows:
+        if text_parts and byte_total + row["byte_count"] > limit_bytes:
+            break
+        if row["byte_count"] > limit_bytes:
+            break
+        text_parts.append(row["text"])
+        byte_total += row["byte_count"]
+        next_cursor = row["sequence"]
+    has_more = bool(get_execution_output_events(execution_id, stream, next_cursor, 1))
+    return {"text": "".join(text_parts), "next_cursor": str(next_cursor), "has_more": has_more}
+
+def get_execution_output_preview(execution_id: uuid.UUID, stream: str, limit_bytes: int = 8192) -> dict[str, object]:
+    page = get_execution_output_page(execution_id, stream, 0, limit_bytes)
+    return {"text": page["text"], "shortened": page["has_more"]}
 
 def recover_interrupted_work() -> None:
     """A process restart destroys every live socket/worker claim."""

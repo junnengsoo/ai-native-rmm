@@ -30,8 +30,8 @@ internal static class AgentRuntime {
                         await Send(socket, sendLock, new { type = "result", deviceId = device,
                             sessionId = completed.Session, executionId = completed.Execution,
                             completed.Result.State, completed.Result.InvocationOutcome, completed.Result.ExitCode,
-                            completed.Result.ExitCodeSource, completed.Result.HadErrors, completed.Result.Stdout,
-                            completed.Result.Stderr, completed.Result.DurationMs, completed.Result.CaptureTruncated,
+                            completed.Result.ExitCodeSource, completed.Result.HadErrors,
+                            completed.Result.DurationMs, completed.Result.CaptureTruncated,
                             completed.Result.LastNativeExitCode });
                         continue;
                     }
@@ -70,7 +70,9 @@ internal static class AgentRuntime {
                     string execution = request.ExecutionId!;
                     await Send(socket, sendLock, new { type = "running", deviceId = device,
                         sessionId = session, executionId = execution });
-                    invocation = Complete(worker, session!, execution, request.Script!, request.TimeoutMs);
+                    invocation = Complete(worker, session!, execution, request.Script!, request.TimeoutMs,
+                        (stream, text) => Send(socket, sendLock, new { type = "output", deviceId = device,
+                            sessionId = session, executionId = execution, stream, text }));
                 } else await Reject(socket, sendLock, "invalid_state_or_duplicate");
             }
         } finally {
@@ -82,8 +84,9 @@ internal static class AgentRuntime {
     }
 
     private static async Task<(string Session, string Execution, WorkerResult Result)> Complete(
-        WorkerProcess worker, string session, string execution, string script, int timeoutMs) =>
-        (session, execution, await worker.Execute(script, timeoutMs));
+        WorkerProcess worker, string session, string execution, string script, int timeoutMs,
+        Func<string, string, Task> onOutput) =>
+        (session, execution, await worker.Execute(script, timeoutMs, onOutput));
 
     private static async Task Heartbeats(WebSocket socket, SemaphoreSlim sendLock, CancellationToken stopped) {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(15));
