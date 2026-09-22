@@ -35,6 +35,7 @@ public sealed class RmmInvocationHost : PSHost
 public static class RmmProtocol
 {
     private const int ChunkLimit = 8192;
+    private static bool invocationTerminated;
 
     public static void WriteLine(StreamWriter writer, string json)
     {
@@ -45,6 +46,10 @@ public static class RmmProtocol
     {
         return powershell.BeginInvoke<PSObject, PSObject>(input, output);
     }
+
+    public static void ResetTermination() { invocationTerminated = false; }
+    public static void MarkTermination() { invocationTerminated = true; }
+    public static bool WasTerminated() { return invocationTerminated; }
 
     public static void WriteOutput(StreamWriter writer, string stream, string value)
     {
@@ -159,7 +164,9 @@ try {
         $runspace.SessionStateProxy.SetVariable('LASTEXITCODE', $null)
         $powershell = [PowerShell]::Create()
         $powershell.Runspace = $runspace
-        [void]$powershell.AddScript($script, $false)
+        [RmmProtocol]::ResetTermination()
+        $wrappedScript = "try {`n" + $script + "`n} catch { [RmmProtocol]::MarkTermination(); throw }"
+        [void]$powershell.AddScript($wrappedScript, $false)
         $output = New-Object 'System.Management.Automation.PSDataCollection[System.Management.Automation.PSObject]'
         $pipelineInput = New-Object 'System.Management.Automation.PSDataCollection[System.Management.Automation.PSObject]'
         $pipelineInput.Complete()
@@ -198,6 +205,7 @@ try {
             if ($powershell.InvocationStateInfo.State -eq [System.Management.Automation.PSInvocationState]::Failed) {
                 $terminated = $true
             }
+            if ([RmmProtocol]::WasTerminated()) { $terminated = $true }
         } catch {
             $terminated = $true
             [RmmProtocol]::WriteOutput($writer, 'stderr', ([string]$_ + "`n"))
