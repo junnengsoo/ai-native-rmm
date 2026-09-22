@@ -69,7 +69,7 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             throw;
         }
     }
-    public async Task<WorkerResult> Execute(string script, int timeoutMs) {
+    public async Task<WorkerResult> Execute(string script, int timeoutMs, Func<string, string, Task> onOutput) {
         var watch = Stopwatch.StartNew();
         using var stdout = new BoundedOutput();
         using var stderr = new BoundedOutput();
@@ -80,8 +80,11 @@ internal sealed class WorkerProcess : IAsyncDisposable {
                 string line = await reader.ReadLineAsync(deadline.Token) ?? throw new EndOfStreamException();
                 using var message = JsonDocument.Parse(line);
                 if (message.RootElement.TryGetProperty("kind", out var kind) && kind.GetString() == "output") {
-                    var target = message.RootElement.GetProperty("stream").GetString() == "stdout" ? stdout : stderr;
-                    target.Write(message.RootElement.GetProperty("text").GetString());
+                    var stream = message.RootElement.GetProperty("stream").GetString() == "stdout" ? "stdout" : "stderr";
+                    var text = message.RootElement.GetProperty("text").GetString();
+                    var target = stream == "stdout" ? stdout : stderr;
+                    target.Write(text);
+                    if (!string.IsNullOrEmpty(text)) await onOutput(stream, text);
                     continue;
                 }
                 var result = JsonSerializer.Deserialize<WorkerResult>(line)!;

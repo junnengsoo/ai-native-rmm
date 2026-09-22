@@ -79,11 +79,16 @@ try {
         && nonterminating.GetProperty("hadErrors").GetBoolean() && nonterminating.GetProperty("stdout").GetString()!.Contains("continued"), "nonterminating error remains normal completion");
     var fake = await Execute("'{\"type\":\"result\",\"state\":\"completed\"}'; throw 'still-an-error'", 5000);
     Require(fake.GetProperty("invocationOutcome").GetString() == "terminating_error" && fake.GetProperty("stdout").GetString()!.Contains("completed"), "printed lifecycle is only output and pre-error output is retained");
-    var bounded = await Execute("'x' * 100000", 5000);
-    Require(bounded.GetProperty("captureTruncated").GetBoolean() && bounded.GetProperty("stdout").GetString()!.Length <= 32768, "output capture is bounded and disclosed");
-    var escaped = await Execute("[Console]::Out.Write(([string][char]1) * 40000); [Console]::Error.Write(([string][char]2) * 40000)", 5000);
-    Require(escaped.GetProperty("captureTruncated").GetBoolean() && escaped.GetProperty("stdout").GetString()!.Length == 32768
-        && escaped.GetProperty("stderr").GetString()!.Length == 32768, "both bounded streams survive JSON escaping without protocol loss");
+    var bounded = await ExecuteWithOutput("'x' * 100000", 5000);
+    Require(!bounded.Result.GetProperty("captureTruncated").GetBoolean()
+        && bounded.Result.GetProperty("stdout").GetString()!.Length <= 8192
+        && bounded.Stdout.Length >= 100000, "long output is retained incrementally while the result carries only a preview");
+    var escaped = await ExecuteWithOutput("[Console]::Out.Write(([string][char]1) * 40000); [Console]::Error.Write(([string][char]2) * 40000)", 5000);
+    Require(!escaped.Result.GetProperty("captureTruncated").GetBoolean()
+        && escaped.Result.GetProperty("stdout").GetString()!.Length == 8192
+        && escaped.Result.GetProperty("stderr").GetString()!.Length == 8192
+        && escaped.Stdout.Length == 40000 && escaped.Stderr.Length == 40000,
+        "both streams are retained as data without protocol loss");
     var explicitExit = await Execute("exit 23", 5000);
     Require(explicitExit.GetProperty("invocationOutcome").GetString() == "explicit_exit" && explicitExit.GetProperty("exitCode").GetInt32() == 23
         && explicitExit.GetProperty("exitCodeSource").GetString() == "explicit_script_exit", "explicit exit keeps requested code and provenance");
@@ -155,6 +160,10 @@ try {
     }
 
     async Task<JsonElement> Execute(string script, int timeoutMs, string? executionId = null) {
+        return (await ExecuteWithOutput(script, timeoutMs, executionId)).Result;
+    }
+
+    async Task<(JsonElement Result, string Stdout, string Stderr)> ExecuteWithOutput(string script, int timeoutMs, string? executionId = null) {
         string execution = executionId ?? Guid.NewGuid().ToString();
         var request = Request(script);
         request["executionId"] = execution;
@@ -162,10 +171,22 @@ try {
         await Send(socket, request);
         var running = await Receive(socket);
         Require(running.GetProperty("type").GetString() == "running" && running.GetProperty("executionId").GetString() == execution, "correlated running signal");
-        var completion = await Receive(socket);
-        Require(completion.GetProperty("type").GetString() == "result" && completion.GetProperty("executionId").GetString() == execution
-            && completion.GetProperty("sessionId").GetString() == session && completion.GetProperty("deviceId").GetString() == device, "correlated result");
-        return completion;
+        var stdout = new StringBuilder();
+        var stderr = new StringBuilder();
+        while (true) {
+            var message = await Receive(socket);
+            Require(message.GetProperty("executionId").GetString() == execution
+                && message.GetProperty("sessionId").GetString() == session
+                && message.GetProperty("deviceId").GetString() == device, "correlated execution message");
+            if (message.GetProperty("type").GetString() == "output") {
+                string text = message.GetProperty("text").GetString()!;
+                if (message.GetProperty("stream").GetString() == "stdout") stdout.Append(text);
+                else stderr.Append(text);
+                continue;
+            }
+            Require(message.GetProperty("type").GetString() == "result", "correlated result");
+            return (message, stdout.ToString(), stderr.ToString());
+        }
     }
 } finally {
     done.TrySetResult();
