@@ -12,8 +12,9 @@ OpenAI Agents SDK with one `Agent`, three model-visible tools, and the SDK
   when a terminal preview is shortened.
 
 Only one script can be active in the persistent PowerShell session at a time.
-The driver rejects a second submit until `wait_for_execution` observes terminal
-state for the pending execution.
+The control plane enforces that session boundary, and the model prompt tells the
+agent to submit one script, repeatedly wait for its terminal result, then submit
+the next script.
 
 The endpoint never receives OpenAI keys, admin keys, operator keys, raw model
 tool requests, or session-control authority from the model. Session open/close,

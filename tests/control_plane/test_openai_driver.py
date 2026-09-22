@@ -175,34 +175,13 @@ def test_wait_and_read_reject_unknown_execution_ids():
         asyncio.run(_read_output(ctx, "not-created-here", "stdout", "0"))
 
 
-def test_submit_rejects_new_script_until_pending_execution_is_terminal():
-    ctx = context(max_steps=2)
-
-    first = asyncio.run(_submit_script(ctx, "Get-NetIPConfiguration", 5000))
-    assert first["execution_id"] == "exec-1"
-    assert ctx.pending_execution_id == "exec-1"
-    with pytest.raises(DriverError, match="execution_still_pending"):
-        asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445", 5000))
-    running = asyncio.run(_wait_for_execution(ctx, first["execution_id"], 0.1))
-    assert running["terminal"] is False
-    assert ctx.pending_execution_id == "exec-1"
-    with pytest.raises(DriverError, match="execution_still_pending"):
-        asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445", 5000))
-    done = asyncio.run(_wait_for_execution(ctx, first["execution_id"], 5))
-    assert done["terminal"] is True
-    assert ctx.pending_execution_id is None
-    second = asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445", 5000))
-    assert second["execution_id"] == "exec-2"
-
-
-def test_submit_enforces_driver_owned_script_budget_after_terminal_wait():
+def test_submit_enforces_driver_owned_script_budget():
     ctx = context(max_steps=1)
 
     first = asyncio.run(_submit_script(ctx, "Get-NetIPConfiguration", 5000))
-    asyncio.run(_wait_for_execution(ctx, first["execution_id"], 0.1))
-    asyncio.run(_wait_for_execution(ctx, first["execution_id"], 5))
+    assert first["execution_id"] == "exec-1"
     with pytest.raises(DriverError, match="script_step_budget_exhausted"):
-        asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver", 5000))
+        asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445", 5000))
 
 
 def test_submit_consumes_budget_before_ambiguous_post_result():
@@ -213,23 +192,17 @@ def test_submit_consumes_budget_before_ambiguous_post_result():
         asyncio.run(_submit_script(ctx, "Get-NetIPConfiguration", 5000))
     assert ctx.scripts_submitted == 1
     assert ctx.owned_execution_ids == set()
-    assert ctx.ambiguous_submission is True
-    with pytest.raises(DriverError, match="ambiguous_submission_unresolved"):
+    with pytest.raises(DriverError, match="script_step_budget_exhausted"):
         asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver", 5000))
 
 
 def test_three_tools_handle_repeated_wait_and_paged_output():
     ctx = context(max_steps=2)
     first = asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver", 5000))
-    assert ctx.pending_execution_id == first["execution_id"]
     running = asyncio.run(_wait_for_execution(ctx, first["execution_id"], 0.1))
-    assert ctx.pending_execution_id == first["execution_id"]
     complete = asyncio.run(_wait_for_execution(ctx, first["execution_id"], 5))
-    assert ctx.pending_execution_id is None
     second = asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445", 5000))
-    assert ctx.pending_execution_id == second["execution_id"]
     tcp = asyncio.run(_wait_for_execution(ctx, second["execution_id"], 5))
-    assert ctx.pending_execution_id is None
     first_page = asyncio.run(_read_output(ctx, second["execution_id"], "stdout", "0"))
     second_page = asyncio.run(_read_output(ctx, second["execution_id"], "stdout", first_page["next_cursor"]))
 
