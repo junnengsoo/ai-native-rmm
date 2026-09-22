@@ -45,7 +45,7 @@ app = FastAPI(title="RMM investigation control plane", lifespan=lifespan)
 output_waiters: dict[tuple[str, str], asyncio.Condition] = {}
 
 MAX_RUNTIME_MS = 3_600_000
-CLEANUP_GRACE_SECONDS = 10
+CLEANUP_GRACE_SECONDS = 30
 
 
 @app.middleware("http")

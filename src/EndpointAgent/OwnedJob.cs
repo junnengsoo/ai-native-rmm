@@ -26,7 +26,7 @@ internal sealed class OwnedJob : IDisposable {
             if (!QueryInformationJobObject(handle, 1, out var accounting, Marshal.SizeOf<Accounting>(), IntPtr.Zero)) return false;
             if (accounting.ActiveProcesses == 0) return true;
             await Task.Delay(25);
-        } while (watch.Elapsed < TimeSpan.FromSeconds(10));
+        } while (watch.Elapsed < TimeSpan.FromSeconds(30));
         return false;
     }
     public void Dispose() => handle.Dispose();
