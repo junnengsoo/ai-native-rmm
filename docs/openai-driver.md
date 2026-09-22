@@ -37,6 +37,14 @@ separate timing records, paginated device discovery, OpenAI request shape, token
 usage collection, and the fact that control-plane calls authenticate with the
 operator credential rather than the OpenAI key.
 
+On 2026-09-21, all five fixed PowerShell templates were also executed directly
+on the authorized Windows 11 Azure VM under Azure Run Command: network
+configuration, default-gateway reachability, DNS resolution, target ping, and
+TCP-port testing all parsed and completed successfully. The VM was deallocated
+immediately afterward. This verifies the real Windows command surface, but it is
+not a substitute for the end-to-end OpenAI, control-plane, tunnel, and endpoint
+smoke below.
+
 ## Manual Windows/OpenAI smoke
 
 Complete the local Compose, tunnel, Windows enrollment, and admin setup in
