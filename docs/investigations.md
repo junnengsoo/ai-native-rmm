@@ -66,7 +66,7 @@ The caller must select `timeout_ms` for every execution; there is no default.
 Values are accepted from 100 ms through the 60-minute safety ceiling. The
 endpoint enforces the selected timeout locally even if the caller disconnects.
 Timeout, cancellation, and explicit session closure terminate the worker's
-Windows Job Object, including owned child processes, and wait up to ten seconds
+Windows Job Object, including owned child processes, and wait up to 30 seconds
 for confirmation before reporting uncertainty.
 
 ## Manual smoke test

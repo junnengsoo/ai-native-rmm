@@ -18,6 +18,12 @@ from websockets.sync.client import connect
 BASE = os.environ.get("RMM_TEST_URL", "http://127.0.0.1:18080")
 
 
+def test_cleanup_confirmation_grace_is_thirty_seconds():
+    from control_plane.app import CLEANUP_GRACE_SECONDS
+
+    assert CLEANUP_GRACE_SECONDS == 30
+
+
 def bootstrap_admin():
     created = subprocess.run(
         [sys.executable, "-m", "control_plane.setup", "Investigation test"],
