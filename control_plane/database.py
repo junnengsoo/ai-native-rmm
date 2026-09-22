@@ -31,7 +31,7 @@ def initialize():
                 public_key text PRIMARY KEY, code_hash text UNIQUE NOT NULL,
                 expires_at timestamptz NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS request_budget (
-                name text PRIMARY KEY, window_start timestamptz NOT NULL, attempts integer NOT NULL
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                scope text PRIMARY KEY, window_started_at timestamptz NOT NULL, attempt_count integer NOT NULL
             );
         """)

@@ -105,7 +105,12 @@ including dispatch, are rejected. Reconnect proves the persisted key again;
 there are no reusable bearer tokens on Windows. `GET /devices` scopes every row
 to the authenticated workspace; `limit` is 1–100 and `after` accepts the prior
 `next_cursor` UUID. Reachability is `approved`, `online`, `stale`, or
-`approval_expired`. Times come from PostgreSQL, not endpoint claims.
+`approval_expired`. Times come from PostgreSQL, not endpoint claims. A small typed
+Python policy classifies each page against one database-supplied `observed_at`:
+contact strictly newer than 45 seconds is online; contact exactly 45 seconds old
+is stale. Without contact, the activation deadline is expired at equality.
+Previously activated devices remain stale/online regardless of that deadline.
+Workspace filtering, ordering and pagination remain in PostgreSQL.
 
 The new reachability protocol uses application-level possession proof because a
 TLS-terminating development tunnel need not forward client certificates. The
@@ -129,7 +134,9 @@ not establish the later streaming/deployment slice's compatibility.
 - At most 120 agent connection attempts/minute globally, including invalid proof
   attempts; at most 600 admin HTTP requests/minute globally; at most ten
   approval attempts/minute per authenticated workspace. Fixed-window counters
-  persist across restarts. HTTP 429 includes `Retry-After: 60`; a rejected WS
+  persist across restarts in `rate_limits` (`scope`, `window_started_at`,
+  `attempt_count`), enforced by `enforce_rate_limit()`. HTTP 429 includes
+  `Retry-After: 60`; a rejected WS
   handshake returns 403. Global bounds intentionally trade availability under
   attack for bounded resource use in this trial, and are not production DDoS
   protection. No rate identity is taken from spoofable forwarding headers.
@@ -137,6 +144,10 @@ not establish the later streaming/deployment slice's compatibility.
   45 seconds; heartbeats faster than one/second rejected. HTTP bodies require
   Content-Length at most 2,048 bytes and no chunked encoding. Run the documented
   server command with its transport size/concurrency limits.
+  This HTTP ceiling fits only #4's tiny approval API: #5 must introduce a larger
+  global ceiling and an endpoint-specific script limit before accepting scripts.
+  Request-body-limit middleware and sanitized unexpected-error handling are
+  separate responsibilities; unexpected HTTP failures return only a generic 503.
   Database connection/statements are bounded to five seconds and lock waits to
   two seconds; failure returns a sanitized unavailable response.
 - Admin keys contain 256 random bits. Only their verification hashes and
@@ -154,13 +165,28 @@ With a dedicated local PostgreSQL database and `RMM_DATABASE_URL` configured:
 ```sh
 .venv/bin/uvicorn control_plane.app:app --host 127.0.0.1 --port 18080 --no-access-log --log-level warning --ws-max-size 2048 --limit-concurrency 256
 # Another terminal, same RMM_DATABASE_URL:
-RMM_EXPIRY_TEST=1 RMM_RATE_TEST=1 .venv/bin/pytest -q tests/control_plane/test_logging.py tests/control_plane/test_pairing.py
+RMM_EXPIRY_TEST=1 RMM_RATE_TEST=1 .venv/bin/python -m pytest -q tests/control_plane/test_logging.py tests/control_plane/test_pairing.py tests/control_plane/test_reachability.py
 # The rate test exhausts the global allowance: wait 60 seconds before
 # starting another agent on that test control plane.
-# Actual authorized Azure Windows VM → tunnel → this Mac:
-RMM_WINDOWS_WSS=wss://YOUR-TUNNEL.trycloudflare.com/agent .venv/bin/pytest -q -s tests/control_plane/test_windows.py
+```
+
+For the actual authorized Azure Windows VM → tunnel → Mac smoke, first follow
+the Compose setup above in the same shell, retaining `RMM_ADMIN_KEY` and
+`RMM_API_URL`. Azure CLI must be authenticated to the authorized trial subscription,
+and the existing trial VM must be running. No local `RMM_DATABASE_URL` or published
+PostgreSQL port is required: this smoke uses only HTTP and the admin key already
+created inside Compose. Replace the tunnel hostname with the current trusted URL:
+
+```sh
+RMM_WINDOWS_WSS=wss://YOUR-TUNNEL.trycloudflare.com/agent .venv/bin/python -m pytest -q -s tests/control_plane/test_windows.py
 bash scripts/azure-smoke.sh
 ```
+
+The smoke creates one retained device record in that workspace and selects its
+UUID, so existing trial devices do not affect its assertions. It removes the test
+key afterward; the retained record becomes stale, not a reusable enrollment.
+The renamed rate-limit schema assumes a fresh disposable database for this
+unmerged slice. Schema migration tooling remains #5 work.
 
 The expiry gate waits the real ten minutes. The Windows integration uses Azure
 only to deploy/start/stop an isolated test agent and observe its local code; API

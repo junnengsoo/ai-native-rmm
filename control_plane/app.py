@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from .database import connect, digest, initialize
+from .reachability import classify_reachability
 
 
 @asynccontextmanager
@@ -31,13 +32,18 @@ app = FastAPI(title="RMM enrollment and reachability", lifespan=lifespan)
 
 
 @app.middleware("http")
-async def bounded_http(request: Request, call_next):
+async def enforce_request_body_limit(request: Request, call_next):
     # Reject streaming bodies before FastAPI's JSON parser allocates them.
     length = request.headers.get("content-length")
     if request.headers.get("transfer-encoding") or (request.method == "POST" and length is None):
         return JSONResponse(status_code=411, content={"detail": "content_length_required"})
     if length is not None and (not length.isdecimal() or int(length) > 2048):
         return JSONResponse(status_code=413, content={"detail": "request_too_large"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def sanitize_unexpected_http_errors(request: Request, call_next):
     try:
         return await call_next(request)
     except Exception:
@@ -50,23 +56,23 @@ async def invalid_input(request: Request, error: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": "invalid_request"})
 
 
-def budget(name, limit):
+def enforce_rate_limit(scope: str, limit: int) -> None:
     """Fixed, globally bounded buckets survive restarts; never keyed by untrusted IP."""
     with connect() as db:
         row = db.execute("""
-            INSERT INTO request_budget VALUES (%s, now(), 1)
-            ON CONFLICT (name) DO UPDATE SET
-                window_start = CASE WHEN request_budget.window_start <= now() - interval '1 minute' THEN now() ELSE request_budget.window_start END,
-                attempts = CASE WHEN request_budget.window_start <= now() - interval '1 minute' THEN 1 ELSE LEAST(request_budget.attempts + 1, 100000) END
-            RETURNING attempts
-        """, (name,)).fetchone()
-    if row["attempts"] > limit:
+            INSERT INTO rate_limits (scope, window_started_at, attempt_count) VALUES (%s, now(), 1)
+            ON CONFLICT (scope) DO UPDATE SET
+                window_started_at = CASE WHEN rate_limits.window_started_at <= now() - interval '1 minute' THEN now() ELSE rate_limits.window_started_at END,
+                attempt_count = CASE WHEN rate_limits.window_started_at <= now() - interval '1 minute' THEN 1 ELSE LEAST(rate_limits.attempt_count + 1, 100000) END
+            RETURNING attempt_count
+        """, (scope,)).fetchone()
+    if row["attempt_count"] > limit:
         raise HTTPException(429, "rate_limited", headers={"Retry-After": "60"})
 
 
 def admin_workspace(authorization):
     """Resolve the initial admin credential to its authorized workspace."""
-    budget("http_auth", 600)
+    enforce_rate_limit("http_auth", 600)
     if not authorization or not authorization.startswith("Bearer ") or len(authorization) > 100:
         raise HTTPException(401, "unauthorized")
     with connect() as db:
@@ -84,16 +90,18 @@ def list_devices(authorization: str | None = Header(default=None), after: uuid.U
                  limit: int = Query(default=100, ge=1, le=100)):
     workspace = admin_workspace(authorization)
     with connect() as db:
+        observed_at = db.execute("SELECT now() AS observed_at").fetchone()["observed_at"]
         devices = db.execute("""
-            SELECT id, approved_at, last_seen,
-                CASE WHEN last_seen > now() - interval '45 seconds' THEN 'online'
-                     WHEN last_seen IS NOT NULL THEN 'stale'
-                     WHEN activate_before <= now() THEN 'approval_expired'
-                     ELSE 'approved' END AS reachability
+            SELECT id, approved_at, last_seen, activate_before
             FROM devices WHERE workspace_id = %s AND (%s::uuid IS NULL OR id > %s)
             ORDER BY id LIMIT %s
         """, (workspace, after, after, limit + 1)).fetchall()
-    return {"devices": devices[:limit], "next_cursor": str(devices[limit - 1]["id"]) if len(devices) > limit else None}
+    page = [
+        {"id": device["id"], "approved_at": device["approved_at"], "last_seen": device["last_seen"],
+         "reachability": classify_reachability(device["last_seen"], device["activate_before"], observed_at)}
+        for device in devices[:limit]
+    ]
+    return {"devices": page, "next_cursor": str(devices[limit - 1]["id"]) if len(devices) > limit else None}
 
 
 class Approval(BaseModel):
@@ -104,7 +112,7 @@ class Approval(BaseModel):
 @app.post("/pairings/approve")
 def approve(body: Approval, authorization: str | None = Header(default=None)):
     workspace = admin_workspace(authorization)
-    budget("approval:" + str(workspace), 10)
+    enforce_rate_limit("approval:" + str(workspace), 10)
     with connect() as db:
         # Share the enrollment transition lock so a concurrent reconnect cannot
         # create another pending code between consumption and device insertion.
@@ -179,7 +187,7 @@ async def close(socket, code=1000):
 @app.websocket("/agent")
 async def agent(socket: WebSocket):
     try:
-        await asyncio.to_thread(budget, "agent_connections", 120)
+        await asyncio.to_thread(enforce_rate_limit, "agent_connections", 120)
     except HTTPException:
         await close(socket, 1008)
         return

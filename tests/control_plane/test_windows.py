@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from test_pairing import BASE, local_admin
+BASE = os.environ.get("RMM_API_URL", "http://127.0.0.1:18080")
 
 
 def windows(script):
@@ -33,6 +33,10 @@ def windows(script):
 def test_real_windows_pairing_heartbeat_stop_and_stable_identity():
     endpoint = os.environ["RMM_WINDOWS_WSS"]
     assert endpoint.startswith("wss://") and "'" not in endpoint
+    credential = os.environ.get("RMM_ADMIN_KEY")
+    assert credential, "Set RMM_ADMIN_KEY to the workspace admin credential from local setup"
+    admin = {"Authorization": "Bearer " + credential}
+    assert httpx.get(BASE + "/devices", headers=admin).status_code == 200, "Check RMM_API_URL and RMM_ADMIN_KEY"
     key_name = "rmm-test-" + uuid.uuid4().hex
     root = "C:\\Windows\\Temp\\" + key_name
     archive = io.BytesIO()
@@ -41,7 +45,6 @@ def test_real_windows_pairing_heartbeat_stop_and_stable_identity():
             if path.is_file():
                 bundle.write(path, str(path))
     payload = base64.b64encode(archive.getvalue()).decode()
-    admin = local_admin()
     try:
         windows(f"""New-Item -ItemType Directory '{root}' | Out-Null
 icacls '{root}' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
@@ -86,16 +89,31 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         response = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": code})
         assert response.status_code == 200
         device = response.json()["device_id"]
+
+        def enrolled_device():
+            # The existing workspace can contain prior smoke devices. Locate this
+            # run's UUID, following the public pagination contract when necessary.
+            params = {}
+            while True:
+                listing = httpx.get(BASE + "/devices", headers=admin, params=params)
+                listing.raise_for_status()
+                page = listing.json()
+                for row in page["devices"]:
+                    if row["id"] == device:
+                        return row
+                assert page["next_cursor"], "Approved device missing from its workspace"
+                params = {"after": page["next_cursor"]}
+
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            row = httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]
+            row = enrolled_device()
             if row["reachability"] == "online":
                 break
             time.sleep(1)
         assert row["reachability"] == "online"
         first_seen = row["last_seen"]
         time.sleep(17)
-        row = httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]
+        row = enrolled_device()
         assert row["last_seen"] > first_seen
         windows(f"""
 $agentId=Get-Content '{root}\\pid.txt'
@@ -105,9 +123,9 @@ Stop-Process -Id $agentId
 Write-Output 'RMM_DATA:stopped'
 """)
         time.sleep(46)
-        assert httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]["reachability"] == "stale"
+        assert enrolled_device()["reachability"] == "stale"
         start()
-        row = httpx.get(BASE + "/devices", headers=admin).json()["devices"][0]
+        row = enrolled_device()
         assert row["id"] == device and row["reachability"] == "online"
         print("Windows: observed code → approved → online → heartbeat → stopped/stale → same device on restart")
     finally:
