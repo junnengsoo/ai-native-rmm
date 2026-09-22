@@ -11,6 +11,7 @@ $support = @'
 using System;
 using System.Globalization;
 using System.IO;
+using System.Management.Automation;
 using System.Management.Automation.Host;
 using System.Text;
 
@@ -38,6 +39,11 @@ public static class RmmProtocol
     public static void WriteLine(StreamWriter writer, string json)
     {
         lock (writer) { writer.WriteLine(json); }
+    }
+
+    public static IAsyncResult BeginInvoke(PowerShell powershell, PSDataCollection<PSObject> input, PSDataCollection<PSObject> output)
+    {
+        return powershell.BeginInvoke<PSObject, PSObject>(input, output);
     }
 
     public static void WriteOutput(StreamWriter writer, string stream, string value)
@@ -166,21 +172,7 @@ try {
         $watch = [Diagnostics.Stopwatch]::StartNew()
 
         try {
-            $beginInvoke = [PowerShell].GetMethods() |
-                Where-Object {
-                    $_.Name -eq 'BeginInvoke' -and
-                    $_.IsGenericMethodDefinition -and
-                    $_.GetParameters().Count -eq 2
-                } |
-                Select-Object -First 1
-            if ($null -eq $beginInvoke) { throw 'compatible_begin_invoke_missing' }
-            $genericBeginInvoke = $beginInvoke.MakeGenericMethod([psobject], [psobject])
-            # Array expressions enumerate PSDataCollection instances. Assigning
-            # fixed slots preserves the collection objects MethodInfo expects.
-            $invokeArguments = New-Object 'System.Object[]' 2
-            $invokeArguments[0] = $pipelineInput
-            $invokeArguments[1] = $output
-            $pending = $genericBeginInvoke.Invoke($powershell, $invokeArguments)
+            $pending = [RmmProtocol]::BeginInvoke($powershell, $pipelineInput, $output)
             while (-not $pending.IsCompleted) {
                 while ($outputIndex -lt $output.Count) {
                     [RmmProtocol]::WriteOutput($writer, 'stdout', ([string]$output[$outputIndex] + "`n"))
