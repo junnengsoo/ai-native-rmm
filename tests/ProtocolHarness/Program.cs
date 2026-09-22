@@ -174,6 +174,8 @@ try {
     await app.StopAsync();
 }
 
+await EnrollmentScenario.Run(args[0], serverCert);
+
 async Task RejectIdentity(string thumbprint, string pin) {
     using var invalid = StartAgent(thumbprint, pin);
     try {
