@@ -25,7 +25,8 @@ from .database import (
     get_execution_output_page, get_execution_output_preview, get_workspace_execution, get_workspace_session, increment_rate_limit,
     initialize, list_workspace_devices, mark_execution_failed_to_start, mark_execution_unknown,
     mark_queued_execution_cancelled, mark_session_cleanup_unknown, mark_session_closed,
-    mark_session_endpoint_closed, mark_session_failed, mark_session_ready, record_heartbeat, recover_interrupted_work,
+    mark_session_endpoint_closed, mark_session_failed, mark_session_ready, range_execution_output,
+    record_heartbeat, recover_interrupted_work, search_execution_output, tail_execution_output,
 )
 from .reachability import classify_reachability
 
@@ -278,6 +279,22 @@ def unicode_contract():
     return {"encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "cursored event text"}
 
 
+def retained_investigation_contract():
+    return {"encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "utf-8 byte offsets"}
+
+
+def validate_output_stream(stream: str) -> None:
+    if stream not in {"stdout", "stderr"}:
+        raise HTTPException(404, "stream_not_found")
+
+
+async def workspace_execution_or_404(workspace_id: uuid.UUID, execution_id: uuid.UUID):
+    row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
+    if row is None:
+        raise HTTPException(404, "execution_not_found")
+    return row
+
+
 async def notify_terminal(execution_id: uuid.UUID | str) -> None:
     async with terminal_waiters_lock:
         waiter = terminal_waiters.get(str(execution_id))
@@ -451,17 +468,61 @@ async def get_execution_output(execution_id: uuid.UUID, stream: str,
                                authorization: str | None = Header(default=None),
                                after: str = "0",
                                limit_bytes: int = Query(default=65536, ge=8192, le=65536)):
-    if stream not in {"stdout", "stderr"}:
-        raise HTTPException(404, "stream_not_found")
+    validate_output_stream(stream)
     caller = authenticated_caller(authorization, "operator")
-    row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
-    if row is None:
-        raise HTTPException(404, "execution_not_found")
+    row = await workspace_execution_or_404(caller["workspace_id"], execution_id)
     cursor = parse_output_cursor(after)
     page = await asyncio.to_thread(get_execution_output_page, execution_id, stream, cursor, limit_bytes)
     capture_lost = bool(row["capture_truncated"])
     return {**page, "more_available": page["has_more"],
             "capture_lost": capture_lost, "gap": output_gap(), "unicode": unicode_contract()}
+
+
+@app.get("/executions/{execution_id}/output/{stream}/search")
+async def search_execution_output_endpoint(execution_id: uuid.UUID, stream: str,
+                                           authorization: str | None = Header(default=None),
+                                           query: str = Query(min_length=1, max_length=1024),
+                                           case_sensitive: bool = False,
+                                           context_lines: int = Query(default=0, ge=0, le=5),
+                                           limit_matches: int = Query(default=20, ge=1, le=50),
+                                           after_byte: int = Query(default=0, ge=0)):
+    validate_output_stream(stream)
+    if query == "":
+        raise HTTPException(422, "empty_query")
+    caller = authenticated_caller(authorization, "operator")
+    row = await workspace_execution_or_404(caller["workspace_id"], execution_id)
+    result = await asyncio.to_thread(search_execution_output, execution_id, stream, query,
+                                     case_sensitive=case_sensitive, context_lines=context_lines,
+                                     limit_matches=limit_matches, after_byte=after_byte)
+    return {**result, "stream": stream, "capture_lost": bool(row["capture_truncated"]),
+            "gap": output_gap(), "unicode": retained_investigation_contract()}
+
+
+@app.get("/executions/{execution_id}/output/{stream}/tail")
+async def tail_execution_output_endpoint(execution_id: uuid.UUID, stream: str,
+                                         authorization: str | None = Header(default=None),
+                                         lines: int = Query(default=50, ge=1, le=200)):
+    validate_output_stream(stream)
+    caller = authenticated_caller(authorization, "operator")
+    row = await workspace_execution_or_404(caller["workspace_id"], execution_id)
+    result = await asyncio.to_thread(tail_execution_output, execution_id, stream, lines)
+    return {**result, "stream": stream, "capture_lost": bool(row["capture_truncated"]),
+            "gap": output_gap(), "unicode": retained_investigation_contract()}
+
+
+@app.get("/executions/{execution_id}/output/{stream}/range")
+async def range_execution_output_endpoint(execution_id: uuid.UUID, stream: str,
+                                          authorization: str | None = Header(default=None),
+                                          start_byte: int = Query(ge=0),
+                                          end_byte: int = Query(ge=0)):
+    validate_output_stream(stream)
+    if end_byte <= start_byte:
+        raise HTTPException(422, "invalid_range")
+    caller = authenticated_caller(authorization, "operator")
+    row = await workspace_execution_or_404(caller["workspace_id"], execution_id)
+    result = await asyncio.to_thread(range_execution_output, execution_id, stream, start_byte, end_byte)
+    return {**result, "stream": stream, "capture_lost": bool(row["capture_truncated"]),
+            "gap": output_gap(), "unicode": retained_investigation_contract()}
 
 
 @app.post("/executions/{execution_id}/cancel", status_code=202)

@@ -8,8 +8,19 @@ OpenAI Agents SDK with one `Agent`, three model-visible tools, and the SDK
   already-open driver-owned session.
 - `wait_for_execution(execution_id, timeout_seconds)` — wait for terminal state,
   or return a bounded nonterminal status when the HTTP wait expires.
-- `read_output(execution_id, stream, cursor)` — read one retained output page
-  when a terminal preview is shortened.
+- `inspect_output(execution_id, stream, mode, ...)` — inspect centrally retained
+  stdout/stderr from a driver-owned execution using `search`, `tail`, or `range`
+  mode. Search is literal text only with bounded context and `after_byte`
+  continuation; tail is line-count bounded; range expands UTF-8 byte positions
+  returned by previous inspections.
+
+The previous model-visible `read_output` page reader is intentionally not kept
+as a fourth tool. The public page endpoint remains available to ordinary API
+callers, but the driver now exposes one coherent retained-output tool so the
+model cannot choose between overlapping read surfaces. `inspect_output` never
+accepts storage paths, SQL, shell commands, regular expressions, or arbitrary
+host files, and it rejects execution IDs that were not created during the
+current driver run.
 
 Only one script can be active in the persistent PowerShell session at a time.
 The control plane enforces that session boundary, and the model prompt tells the
@@ -36,10 +47,11 @@ Run the driver tests without contacting OpenAI:
 The tests use a scripted local SDK `Model` with the real Agents SDK `Runner` and
 function-tool path, while faking the public control-plane and endpoint evidence.
 They cover dependent model-authored scripts, the exact three-tool SDK surface,
-submit → repeated nonterminal/terminal wait → dependent next script → paged
-output, unknown execution ID rejection, script budget enforcement, terminal-safe
-rendering of untrusted text, lifecycle-hook model timing, session close in the
-driver `finally` path, and operator authentication without OpenAI key leakage.
+submit → repeated nonterminal/terminal wait → dependent next script → retained
+output inspection, unknown execution ID rejection, script budget enforcement,
+terminal-safe rendering of untrusted text, lifecycle-hook model timing, session
+close in the driver `finally` path, and operator authentication without OpenAI
+key leakage.
 
 ## Optional paid Windows/OpenAI smoke
 
@@ -87,8 +99,10 @@ Expected behavior:
 - Session/device binding and credentials are never exposed as model tools.
 - The caller waits for terminal execution state through
   `GET /executions/{id}/wait`.
-- If a preview is shortened, the tool retrieves bounded retained pages using
-  continuation cursors.
+- If a preview is shortened, the model can use `inspect_output` to search, tail,
+  or expand retained output ranges through the control-plane storage API. This
+  still works after the endpoint disconnects because no endpoint work is
+  dispatched for retained-output reads.
 - The final report proposes human fixes but performs no remediation.
 - Rendered timings show per-tool API time, SDK lifecycle-hook model time, total
   time, and model usage when returned by the SDK.
