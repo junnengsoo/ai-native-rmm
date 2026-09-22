@@ -43,8 +43,9 @@ only the preview; paging and long-poll endpoints expose more retained context
 without rerunning the script. Cursors are per execution stream, monotonically
 ordered by retained UTF-8 text events, and never split a Unicode character.
 Preview shortening is reported separately from capture loss. Capture loss means
-the endpoint hit its bounded retention limit; a shortened preview only means
-more retained output is available behind the paging endpoints.
+execution ended before all emitted output could be forwarded, such as timeout or
+worker loss; a shortened preview only means more retained output is available
+behind the paging endpoints.
 
 Long-poll callers provide `after` and a finite `wait_ms`. A response returns on
 the first of new retained output after the cursor, terminal execution transition,

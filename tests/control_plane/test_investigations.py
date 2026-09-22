@@ -122,6 +122,14 @@ class EndpointAgentSimulator:
                             socket.send(json.dumps({"type": "output", **common, "executionId": execution,
                                                     "stream": "stdout", "text": chunk}))
                         stdout = (chunk * 10)[:8192]
+                    elif message["script"] == "MEG_OUTPUT":
+                        chunk = "m" * 8192
+                        for _ in range(128):
+                            socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                    "stream": "stdout", "text": chunk}))
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "tail-after-meg"}))
+                        stdout = chunk
                     elif message["script"] == "EMPTY_OUTPUT":
                         stdout = ""
                     elif message["script"] == "MARK_ONCE":
@@ -273,6 +281,19 @@ def test_execution_output_preview_pages_and_long_poll_are_bounded_and_scoped():
         ).json()
         assert second["text"]
         assert second["gap"]["detected"] is False
+
+        meg = submit(operator, session, "MEG_OUTPUT", "meg-output")
+        assert meg.status_code == 202
+        meg_id = meg.json()["execution_id"]
+        meg_result = wait_for_execution(operator, meg_id)
+        assert meg_result["output_preview"]["stdout"]["shortened"] is True
+        assert meg_result["capture"]["loss_detected"] is False
+        after_meg = httpx.get(
+            BASE + f"/executions/{meg_id}/output/stdout/events",
+            headers=operator, params={"after": "128", "limit": 1},
+        ).json()
+        assert after_meg["events"][0]["text"] == "tail-after-meg"
+        assert after_meg["gap"]["detected"] is False
 
         assert httpx.get(BASE + f"/executions/{execution}/output/stdout", headers=other_operator).status_code == 404
         denied = httpx.get(BASE + f"/executions/{execution}/output/stdout/events", headers=other_operator)

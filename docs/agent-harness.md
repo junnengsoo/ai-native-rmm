@@ -39,10 +39,10 @@ inertly. Completion means invocation completion, not that an IT issue is fixed.
 
 `output` frames carry `stream` (`stdout` or `stderr`) and inert text chunks while
 an execution is still running. The final `result` fields are `state`,
-`invocationOutcome`, `exitCode`, `hadErrors`, preview `stdout`, preview `stderr`,
-`durationMs`, `captureTruncated`, and `lastNativeExitCode`, alongside the three
-resource bindings. A native exit value is evidence about the last native command,
-not a universal script outcome.
+`invocationOutcome`, `exitCode`, `hadErrors`, compatibility-preview `stdout`,
+compatibility-preview `stderr`, `durationMs`, `captureTruncated`, and
+`lastNativeExitCode`, alongside the three resource bindings. A native exit value
+is evidence about the last native command, not a universal script outcome.
 `LASTEXITCODE` is reset before every invocation. Ordinary and nonterminating
 error completion normalizes to 0; an unhandled terminating error normalizes to
 1. Explicit exit reports its requested code. Explicit exit deliberately retires
@@ -54,14 +54,15 @@ The worker pins [Microsoft.PowerShell.SDK 7.4.13](https://www.nuget.org/packages
 so Windows tests gate changes to these engine semantics.
 
 Local execution timeouts range from 100 ms to 30 seconds for this harness slice.
-The result preview is bounded to 8 KiB per stream. Incremental output retention
-is bounded to 1 MiB per stream in the endpoint before it reports capture loss;
-the control plane stores retained chunks for preview, 64 KiB pages, and bounded
-HTTP long-poll. Preview shortening is not capture loss. A session worker is
-owned by a Windows Job Object. Timeout or closure terminates that job, including
-owned child processes; only confirmed zero active processes permits confirmed
-stopping. Stopping never undoes filesystem, registry, network, or other script
-side effects.
+The endpoint continuously drains PowerShell output and forwards UTF-8-safe chunks
+bounded to 8 KiB of text bytes before JSON framing. Terminal `stdout`/`stderr`
+fields are bounded compatibility previews only; the control plane derives API
+previews, 64 KiB pages, and long-poll events from durably stored `output` frames.
+Preview shortening is not capture loss. A session worker is owned by a Windows
+Job Object. Timeout or closure terminates that job, including owned child
+processes; only confirmed zero active processes permits confirmed stopping.
+Stopping never undoes filesystem, registry, network, or other script side
+effects.
 
 ## Run from macOS
 

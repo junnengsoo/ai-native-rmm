@@ -83,6 +83,11 @@ try {
     Require(!bounded.Result.GetProperty("captureTruncated").GetBoolean()
         && bounded.Result.GetProperty("stdout").GetString()!.Length <= 8192
         && bounded.Stdout.Length >= 100000, "long output is retained incrementally while the result carries only a preview");
+    var beyondMeg = await ExecuteWithOutput("'m' * (1024 * 1024 + 4096)", 10000);
+    Require(!beyondMeg.Result.GetProperty("captureTruncated").GetBoolean()
+        && beyondMeg.Result.GetProperty("stdout").GetString()!.Length == 8192
+        && beyondMeg.Stdout.Length >= 1024 * 1024 + 4096,
+        "output beyond one MiB is forwarded without endpoint capture loss");
     var escaped = await ExecuteWithOutput("[Console]::Out.Write(([string][char]1) * 40000); [Console]::Error.Write(([string][char]2) * 40000)", 5000);
     Require(!escaped.Result.GetProperty("captureTruncated").GetBoolean()
         && escaped.Result.GetProperty("stdout").GetString()!.Length == 8192
