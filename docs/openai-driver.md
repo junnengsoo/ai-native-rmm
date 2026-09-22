@@ -1,14 +1,24 @@
 # OpenAI diagnostic driver
 
 The OpenAI driver is a caller-side demo, not endpoint intelligence. It uses the
-OpenAI Agents SDK with one `Agent`, one constrained read-only diagnostic tool,
-and the SDK `Runner` tool loop. The tool maps model-selected operations to fixed
-PowerShell templates and submits them through the public control-plane
-session/execution APIs.
+OpenAI Agents SDK with one `Agent`, three model-visible tools, and the SDK
+`Runner` tool loop. The model-visible tools are:
+
+- `submit_script(script, timeout_ms)` — submit model-authored PowerShell to the
+  already-open driver-owned session.
+- `wait_for_execution(execution_id, timeout_seconds)` — wait for terminal state,
+  or return a bounded nonterminal status when the HTTP wait expires.
+- `read_output(execution_id, stream, cursor)` — read one retained output page
+  when a terminal preview is shortened.
 
 The endpoint never receives OpenAI keys, admin keys, operator keys, raw model
-tool requests, or arbitrary PowerShell. It only receives fixed diagnostic
-scripts selected by the caller. The default model is `gpt-5-nano`.
+tool requests, or session-control authority from the model. Session open/close,
+credentials, device/session binding, execution ownership, time/script budgets,
+and cleanup remain driver-owned. The default model is `gpt-5-nano`.
+
+The model is instructed to author only read-only diagnostic PowerShell and never
+to remediate. That is a policy boundary, not an enforced PowerShell sandbox:
+this prototype currently runs endpoint scripts as Windows `LocalSystem`.
 
 ## Deterministic tests
 
@@ -20,12 +30,11 @@ Run the driver tests without contacting OpenAI:
 
 The tests use a scripted local SDK `Model` with the real Agents SDK `Runner` and
 function-tool path, while faking the public control-plane and endpoint evidence.
-They cover dependent diagnostic calls, the single SDK tool surface, fixed
-read-only templates, invalid argument rejection, terminal-wait result collection,
-terminal-wait completion, bounded retained-output page continuation,
-terminal-safe rendering of untrusted text, lifecycle-hook model timing, session
-close in the driver `finally` path, and operator authentication without OpenAI
-key leakage.
+They cover dependent model-authored scripts, the exact three-tool SDK surface,
+submit → repeated nonterminal/terminal wait → dependent next script → paged
+output, unknown execution ID rejection, script budget enforcement, terminal-safe
+rendering of untrusted text, lifecycle-hook model timing, session close in the
+driver `finally` path, and operator authentication without OpenAI key leakage.
 
 ## Optional paid Windows/OpenAI smoke
 
@@ -68,8 +77,10 @@ Expected behavior:
 
 - The caller opens one debugging session and closes it in `finally`.
 - The SDK runner manages model turns and function-tool execution.
-- The model can choose only fixed read-only operations; target host and port are
-  caller-bound.
+- The model can author PowerShell, but the prompt policy allows only read-only
+  diagnosis. This is not a sandbox; the endpoint currently runs as LocalSystem.
+- Target host and port are caller-bound in the prompt; session/device binding
+  and credentials are never exposed as model tools.
 - The caller waits for terminal execution state through
   `GET /executions/{id}/wait`.
 - If a preview is shortened, the tool retrieves bounded retained pages using
