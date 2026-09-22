@@ -8,7 +8,6 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -95,8 +94,6 @@ class EndpointAgentSimulator:
                     continue
                 common = {"deviceId": device, "sessionId": message["sessionId"]}
                 if message["type"] == "open_session":
-                    assert message["idleTimeoutMs"] <= 7200000
-                    assert message["absoluteDeadlineUnixMs"] > int(time.time() * 1000)
                     variable = None
                     socket.send(json.dumps({"type": "session_ready", **common}))
                 elif message["type"] == "close_session":
@@ -105,9 +102,21 @@ class EndpointAgentSimulator:
                 elif message["type"] == "execute":
                     execution = message["executionId"]
                     assert hashlib.sha256(message["script"].encode()).hexdigest() == message["scriptSha256"]
-                    assert message["startDeadlineUnixMs"] > int(time.time() * 1000)
                     socket.send(json.dumps({"type": "running", **common, "executionId": execution}))
-                    if message["script"] == "$trialValue = 42":
+                    if message["script"] == "WAIT_FOR_CANCEL":
+                        while True:
+                            followup = json.loads(socket.recv(timeout=2))
+                            if followup["type"] == "cancel_execution" and followup["executionId"] == execution:
+                                socket.send(json.dumps({
+                                    "type": "result", **common, "executionId": execution,
+                                    "state": "cancelled", "invocationOutcome": "stopped",
+                                    "exitCode": None, "exitCodeSource": None,
+                                    "hadErrors": False, "stdout": "started", "stderr": "",
+                                    "durationMs": 1.0, "captureTruncated": False, "lastNativeExitCode": None,
+                                }))
+                                break
+                        continue
+                    elif message["script"] == "$trialValue = 42":
                         variable, stdout = 42, ""
                     elif message["script"] == "$trialValue":
                         stdout = str(variable)
@@ -143,7 +152,7 @@ def submit(operator, session, script, key):
     )
 
 
-def test_deadline_defaults_and_offline_outcomes_are_truthful():
+def test_timeout_is_required_and_offline_submission_fails_to_start():
     admin = bootstrap_admin()
     operator, _ = create_operator(admin, "deadline-agent")
     key, public, device = enroll(admin)
@@ -151,12 +160,13 @@ def test_deadline_defaults_and_offline_outcomes_are_truthful():
         opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
         assert opened.status_code == 201
         session = opened.json()
-        assert session["idle_timeout_ms"] == 1800000
-        remaining = datetime.fromisoformat(session["absolute_expires_at"]) - datetime.now(timezone.utc)
-        assert timedelta(hours=7, minutes=55) < remaining <= timedelta(hours=8, minutes=1)
-        submitted = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
-            **operator, "Idempotency-Key": "default-runtime",
+        missing_timeout = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
+            **operator, "Idempotency-Key": "missing-timeout",
         }, json={"script": "'ok'"})
+        assert missing_timeout.status_code == 422
+        submitted = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
+            **operator, "Idempotency-Key": "selected-timeout",
+        }, json={"script": "'ok'", "timeout_ms": 5000})
         assert submitted.status_code == 202
         result = wait_for_execution(operator, submitted.json()["execution_id"])
         assert result["status"] == "completed"
@@ -166,9 +176,34 @@ def test_deadline_defaults_and_offline_outcomes_are_truthful():
     }, json={"script": "'must-not-run'", "timeout_ms": 5000})
     assert offline.status_code == 202
     result = wait_for_execution(operator, offline.json()["execution_id"])
-    assert result["status"] == "outcome_unknown"
+    assert result["status"] == "failed_to_start"
     assert result["outcome_reason"] == "device_offline_before_dispatch"
     assert result["last_confirmed_status"] == "queued"
+
+
+def test_caller_can_cancel_running_execution():
+    admin = bootstrap_admin()
+    operator, _ = create_operator(admin, "cancel-agent")
+    key, public, device = enroll(admin)
+    with EndpointAgentSimulator(key, public):
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
+        assert opened.status_code == 201
+        session = opened.json()["session_id"]
+        submitted = submit(operator, session, "WAIT_FOR_CANCEL", "cancel-me")
+        assert submitted.status_code == 202
+        execution = submitted.json()["execution_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            running = httpx.get(BASE + f"/executions/{execution}", headers=operator).json()
+            if running["status"] == "running":
+                break
+            time.sleep(0.05)
+        cancelled = httpx.post(BASE + f"/executions/{execution}/cancel", headers=operator)
+        assert cancelled.status_code == 202
+        result = wait_for_execution(operator, execution)
+        assert result["status"] == "cancelled"
+        assert result["invocation_outcome"] == "stopped"
+        assert result["exit_code"] is None
 
 
 def test_close_without_endpoint_confirmation_blocks_replacement():

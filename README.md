@@ -13,7 +13,8 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 ## Status
 
 Slices 1–4 provide the Windows execution harness, PostgreSQL-backed enrollment,
-the public persistent-investigation API, and bounded truthful deadline outcomes.
+the public persistent-investigation API, and truthful timeout, cancellation, and
+offline outcomes.
 Start with [local pairing](docs/enrollment.md),
 [persistent investigations](docs/investigations.md), or the
 [independent Windows harness](docs/agent-harness.md). The installer remains a later slice.

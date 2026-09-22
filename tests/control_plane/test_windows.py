@@ -186,9 +186,10 @@ Write-Output 'RMM_DATA:stopped'
         while time.monotonic() < deadline:
             offline_result = httpx.get(BASE + f"/executions/{offline_submit.json()['execution_id']}", headers=operator)
             offline_result.raise_for_status()
-            if offline_result.json()["status"] == "outcome_unknown":
+            if offline_result.json()["status"] == "failed_to_start":
                 break
             time.sleep(.2)
+        assert offline_result.json()["status"] == "failed_to_start"
         assert offline_result.json()["outcome_reason"] == "device_offline_before_dispatch"
         time.sleep(46)
         assert enrolled_device()["reachability"] == "stale"

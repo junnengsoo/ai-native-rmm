@@ -51,17 +51,16 @@ callback; it does not infer explicit exit from a native command's exit value.
 The worker pins [Microsoft.PowerShell.SDK 7.4.13](https://www.nuget.org/packages/Microsoft.PowerShell.SDK/7.4.13)
 so Windows tests gate changes to these engine semantics.
 
-Local execution timeouts range from 100 ms to 60 minutes. `open_session` carries
-the selected idle timeout and absolute session deadline; `execute` carries a
-60-second start deadline. The agent rejects stale execution dispatch and enforces
-runtime, idle, and absolute deadlines locally, including after it has lost contact
-with the control plane. Output retention is bounded to 32,768 UTF-16 code units
-per stream in this early worker contract, with loss disclosed; it is not the
-later central output storage/spooling implementation. A session worker is owned
-by a Windows Job Object. Timeout or closure terminates that job, including owned
-child processes; only confirmed zero active processes permits confirmed stopping.
-Stopping never undoes filesystem, registry, network, or other script side
-effects.
+Local execution timeouts range from 100 ms to 60 minutes and must be selected by
+the caller on each `execute`. The agent enforces that runtime limit locally,
+including after it has lost contact with the control plane. Authenticated
+`cancel_execution` and `close_session` requests also stop the active worker. Output
+retention is bounded to 32,768 UTF-16 code units per stream in this early worker
+contract, with loss disclosed; it is not the later central output storage/spooling
+implementation. A session worker is owned by a Windows Job Object. Timeout,
+cancellation, or closure terminates that job, including owned child processes;
+only confirmed zero active processes permits confirmed stopping. Stopping never
+undoes filesystem, registry, network, or other script side effects.
 
 ## Run from macOS
 
@@ -125,10 +124,10 @@ VM with .NET SDK 8.0.425 and hosted PowerShell 7.4.13. All three scenarios passe
   nonexportable endpoint key, dummy secret/configuration excluded from worker,
   altered hash, wrong device/session, unknown fields, invalid timeout and malformed
   JSON rejected, and duplicate dispatch did not repeat its counter side effect.
-- Timeout and worker loss: stale dispatch rejected, output received before a
-  500 ms timeout retained, confirmed `timed_out`/`stopped` with null exit code,
-  native child confirmed gone, no reuse of retired workers, and abrupt worker
-  exit recorded as `outcome_unknown`.
+- Timeout and worker loss: output received before a 500 ms timeout retained,
+  confirmed `timed_out`/`stopped` with null exit code, native child confirmed
+  gone, no reuse of retired workers, and abrupt worker exit recorded as
+  `outcome_unknown`.
 
 The manual harmless/error smoke also ran in that suite (about 157 ms and 16 ms
 of measured invocation time in the recorded run). These are invocation timings,
@@ -139,10 +138,10 @@ There is no reconnect/replay protocol or durable execution history in this slice
 In-memory replay protection is bounded to 1,000 execution IDs and 100 session IDs
 per agent connection; the peer must stop when that allowance is exhausted.
 Inbound frames are limited to 80,000 bytes, scripts to 32,768 code units, connect
-waiting to 15 seconds, and idle frame waiting to the earlier of two minutes or the
-next local session deadline. Timeout/worker-loss results conservatively disclose
-possible capture loss. Success output is string rendered from PowerShell objects;
-debug/verbose/progress streams are drained but not retained. Later output-storage
-and service lifecycle slices remain separate. Job cleanup covers inherited worker
-descendants, not services, scheduled tasks, or other work that privileged scripts
-deliberately create outside that ownership.
+waiting to 15 seconds, and idle frame waiting to two minutes. Timeout/cancellation
+and worker-loss results conservatively disclose possible capture loss. Success
+output is string rendered from PowerShell objects; debug/verbose/progress streams
+are drained but not retained. Later output-storage and service lifecycle slices
+remain separate. Job cleanup covers inherited worker descendants, not services,
+scheduled tasks, or other work that privileged scripts deliberately create outside
+that ownership.

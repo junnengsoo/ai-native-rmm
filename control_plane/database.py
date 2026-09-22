@@ -57,10 +57,6 @@ sessions = Table("sessions", metadata,
     Column("state", String(16), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("ready_at", DateTime(timezone=True)), Column("closed_at", DateTime(timezone=True)),
-    Column("idle_timeout_ms", Integer, nullable=False, server_default="1800000"),
-    Column("last_activity_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-    Column("absolute_expires_at", DateTime(timezone=True), nullable=False, server_default=text("now() + interval '8 hours'")),
-    CheckConstraint("idle_timeout_ms > 0 AND idle_timeout_ms <= 7200000", name="sessions_idle_timeout_valid"),
     CheckConstraint("state IN ('starting', 'active', 'closing', 'closed', 'failed', 'cleanup_unknown')", name="sessions_state_valid"))
 Index("sessions_one_live_per_device", sessions.c.device_id, unique=True,
       postgresql_where=sessions.c.state.in_(("starting", "active", "closing", "cleanup_unknown")))
@@ -78,10 +74,9 @@ executions = Table("executions", metadata,
     Column("duration_ms", Float), Column("capture_truncated", Boolean),
     Column("last_native_exit_code", Integer),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-    Column("start_deadline_at", DateTime(timezone=True), nullable=False, server_default=text("now() + interval '60 seconds'")),
     Column("started_at", DateTime(timezone=True)), Column("finished_at", DateTime(timezone=True)),
     CheckConstraint("timeout_ms > 0", name="executions_timeout_positive"),
-    CheckConstraint("status IN ('queued', 'running', 'completed', 'expired', 'timed_out', 'outcome_unknown')", name="executions_status_valid"),
+    CheckConstraint("status IN ('queued', 'running', 'completed', 'failed_to_start', 'timed_out', 'cancelled', 'outcome_unknown')", name="executions_status_valid"),
     UniqueConstraint("caller_id", "idempotency_key", name="executions_caller_idempotency_key"))
 Index("executions_one_live_per_session", executions.c.session_id, unique=True,
       postgresql_where=executions.c.status.in_(("queued", "running")))
@@ -219,34 +214,11 @@ def create_caller(workspace_id: uuid.UUID, actor_id: uuid.UUID, name: str, role:
             action="caller.created", resource_type="caller", resource_id=caller_id))
     return caller_id, credential_id
 
-def expire_due_work() -> None:
-    with transaction() as connection:
-        now = func.now()
-        connection.execute(update(executions).where(
-            executions.c.status == "queued",
-            executions.c.start_deadline_at <= now,
-        ).values(status="expired", outcome_reason="start_deadline_exceeded",
-                 last_confirmed_status="queued", finished_at=now))
-        running_sessions = select(executions.c.session_id).where(
-            executions.c.status == "running")
-        idle_cutoff = sessions.c.last_activity_at + (sessions.c.idle_timeout_ms * text("interval '1 millisecond'"))
-        connection.execute(update(sessions).where(
-            sessions.c.state == "active",
-            sessions.c.id.not_in(running_sessions),
-            or_(sessions.c.absolute_expires_at + text("interval '10 seconds'") <= now,
-                idle_cutoff + text("interval '10 seconds'") <= now),
-        ).values(state="cleanup_unknown", closed_at=now))
-
 def create_starting_session(workspace_id: uuid.UUID, caller_id: uuid.UUID,
-                            device_id: uuid.UUID, idle_timeout_ms: int) -> RowMapping | None:
+                            device_id: uuid.UUID) -> RowMapping | None:
     session_id = uuid.uuid4()
     try:
         with transaction() as connection:
-            connection.execute(update(executions).where(
-                executions.c.status == "queued",
-                executions.c.start_deadline_at <= func.now(),
-            ).values(status="expired", outcome_reason="start_deadline_exceeded",
-                     last_confirmed_status="queued", finished_at=func.now()))
             owned = connection.execute(select(devices.c.id).where(
                 devices.c.id == device_id, devices.c.workspace_id == workspace_id,
                 devices.c.last_seen > func.now() - text("interval '45 seconds'")
@@ -255,8 +227,7 @@ def create_starting_session(workspace_id: uuid.UUID, caller_id: uuid.UUID,
                 return None
             connection.execute(insert(sessions).values(
                 id=session_id, workspace_id=workspace_id, device_id=device_id,
-                caller_id=caller_id, state="starting", idle_timeout_ms=idle_timeout_ms,
-                absolute_expires_at=func.now() + text("interval '8 hours'")))
+                caller_id=caller_id, state="starting"))
             connection.execute(insert(audit_records).values(
                 id=uuid.uuid4(), workspace_id=workspace_id, caller_id=caller_id,
                 action="session.requested", resource_type="session", resource_id=session_id))
@@ -270,7 +241,7 @@ def mark_session_ready(session_id: uuid.UUID) -> None:
     with transaction() as connection:
         changed = connection.execute(update(sessions).where(
             sessions.c.id == session_id, sessions.c.state == "starting"
-        ).values(state="active", ready_at=func.now(), last_activity_at=func.now())).rowcount
+        ).values(state="active", ready_at=func.now())).rowcount
         if changed != 1:
             raise RuntimeError("invalid_session_transition")
 
@@ -339,20 +310,12 @@ def create_or_get_execution(workspace_id: uuid.UUID, caller_id: uuid.UUID,
             sessions.c.state == "active").with_for_update()).mappings().one_or_none()
         if session is None:
             raise LookupError("active_session_not_found")
-        now = connection.execute(select(func.now())).scalar_one()
-        if session["absolute_expires_at"] <= now:
-            connection.execute(update(sessions).where(sessions.c.id == session_id).values(
-                state="closed", closed_at=func.now()))
-            raise LookupError("active_session_not_found")
-        if now + timedelta(milliseconds=timeout_ms) > session["absolute_expires_at"]:
-            raise RuntimeError("execution_deadline_exceeds_session")
         execution_id = uuid.uuid4()
         try:
             connection.execute(insert(executions).values(
                 id=execution_id, workspace_id=workspace_id, session_id=session_id,
                 caller_id=caller_id, idempotency_key=idempotency_key, script=script,
-                script_sha256=script_sha256, timeout_ms=timeout_ms, status="queued",
-                start_deadline_at=func.now() + text("interval '60 seconds'")))
+                script_sha256=script_sha256, timeout_ms=timeout_ms, status="queued"))
         except IntegrityError as error:
             if getattr(error.orig, "sqlstate", None) == "23505":
                 raise RuntimeError("session_busy") from None
@@ -366,33 +329,6 @@ def create_or_get_execution(workspace_id: uuid.UUID, caller_id: uuid.UUID,
 
 def claim_execution(execution_id: uuid.UUID) -> RowMapping | None:
     with transaction() as connection:
-        row = connection.execute(select(executions).where(
-            executions.c.id == execution_id).with_for_update()).mappings().one_or_none()
-        if row is None or row["status"] != "queued":
-            return None
-        if row["start_deadline_at"] <= connection.execute(select(func.now())).scalar_one():
-            connection.execute(update(executions).where(
-                executions.c.id == execution_id,
-                executions.c.status == "queued",
-            ).values(status="expired", outcome_reason="start_deadline_exceeded",
-                     last_confirmed_status="queued", finished_at=func.now()))
-            return None
-        session = connection.execute(select(sessions).where(
-            sessions.c.id == row["session_id"], sessions.c.state == "active").with_for_update()).mappings().one_or_none()
-        if session is None:
-            connection.execute(update(executions).where(
-                executions.c.id == execution_id,
-                executions.c.status == "queued",
-            ).values(status="outcome_unknown", outcome_reason="session_not_active_before_dispatch",
-                     last_confirmed_status="queued", finished_at=func.now()))
-            return None
-        if connection.execute(select(func.now())).scalar_one() + timedelta(milliseconds=row["timeout_ms"]) > session["absolute_expires_at"]:
-            connection.execute(update(executions).where(
-                executions.c.id == execution_id,
-                executions.c.status == "queued",
-            ).values(status="expired", outcome_reason="session_lifetime_exceeded_before_dispatch",
-                     last_confirmed_status="queued", finished_at=func.now()))
-            return None
         return connection.execute(update(executions).where(
             executions.c.id == execution_id, executions.c.status == "queued"
         ).values(status="running", started_at=func.now()).returning(executions)).mappings().one_or_none()
@@ -414,8 +350,6 @@ def finish_execution(execution_id: uuid.UUID, result: dict[str, object]) -> None
         ).values(**values)).rowcount
         if changed != 1:
             raise RuntimeError("invalid_execution_transition")
-        connection.execute(update(sessions).where(sessions.c.id == select(executions.c.session_id).where(
-            executions.c.id == execution_id).scalar_subquery()).values(last_activity_at=func.now()))
 
 def mark_execution_unknown(execution_id: uuid.UUID, reason: str,
                            last_confirmed_status: str) -> None:
@@ -425,8 +359,23 @@ def mark_execution_unknown(execution_id: uuid.UUID, reason: str,
             executions.c.status.in_(("queued", "running")),
         ).values(status="outcome_unknown", outcome_reason=reason,
                  last_confirmed_status=last_confirmed_status, finished_at=func.now()))
-        connection.execute(update(sessions).where(sessions.c.id == select(executions.c.session_id).where(
-            executions.c.id == execution_id).scalar_subquery()).values(last_activity_at=func.now()))
+
+def mark_execution_failed_to_start(execution_id: uuid.UUID, reason: str) -> None:
+    with transaction() as connection:
+        connection.execute(update(executions).where(
+            executions.c.id == execution_id,
+            executions.c.status == "queued",
+        ).values(status="failed_to_start", outcome_reason=reason,
+                 last_confirmed_status="queued", finished_at=func.now()))
+
+def mark_queued_execution_cancelled(workspace_id: uuid.UUID, execution_id: uuid.UUID) -> RowMapping | None:
+    with transaction() as connection:
+        return connection.execute(update(executions).where(
+            executions.c.id == execution_id,
+            executions.c.workspace_id == workspace_id,
+            executions.c.status == "queued",
+        ).values(status="cancelled", outcome_reason="caller_cancelled_before_start",
+                 last_confirmed_status="queued", finished_at=func.now()).returning(executions)).mappings().one_or_none()
 
 def get_workspace_execution(workspace_id: uuid.UUID, execution_id: uuid.UUID) -> RowMapping | None:
     with transaction() as connection:

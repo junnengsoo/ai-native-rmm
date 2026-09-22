@@ -128,14 +128,12 @@ internal static class EnrollmentScenario {
         if (!condition) throw new InvalidOperationException(description);
     }
     private static object OpenSession(string device, string session) => new {
-        type = "open_session", deviceId = device, sessionId = session,
-        idleTimeoutMs = 1800000,
-        absoluteDeadlineUnixMs = DateTimeOffset.UtcNow.AddHours(8).ToUnixTimeMilliseconds()
+        type = "open_session", deviceId = device, sessionId = session
     };
     private static object ExecuteRequest(string device, string session, string execution, string script, int timeoutMs) => new {
         type = "execute", deviceId = device, sessionId = session, executionId = execution,
         script, scriptSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))),
-        timeoutMs, startDeadlineUnixMs = DateTimeOffset.UtcNow.AddSeconds(60).ToUnixTimeMilliseconds()
+        timeoutMs
     };
     private static Task Send(WebSocket socket, object value) => socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(value), WebSocketMessageType.Text, true, CancellationToken.None);
     private static async Task<JsonElement> Receive(WebSocket socket) {

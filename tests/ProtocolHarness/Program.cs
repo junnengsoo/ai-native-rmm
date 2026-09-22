@@ -110,9 +110,6 @@ try {
     await Rejected(malformed, "unknown field");
     malformed = Request("'must-not-run'"); malformed["timeoutMs"] = 0;
     await Rejected(malformed, "unbounded or invalid timeout");
-    var stale = Request("'must-not-run'");
-    stale["startDeadlineUnixMs"] = DateTimeOffset.UtcNow.AddSeconds(-1).ToUnixTimeMilliseconds();
-    await Rejected(stale, "stale dispatch after start deadline");
     await socket.SendAsync(Encoding.UTF8.GetBytes("{broken json"), WebSocketMessageType.Text, true, CancellationToken.None);
     Require((await Receive(socket)).GetProperty("type").GetString() == "rejected", "malformed JSON is rejected safely");
     string duplicateId = Guid.NewGuid().ToString();
@@ -132,6 +129,19 @@ try {
     await ReplaceSession();
     var cleanup = await Execute($"$null -eq (Get-Process -Id {childId} -ErrorAction SilentlyContinue)", 5000);
     Require(cleanup.GetProperty("stdout").GetString()!.Trim() == "True", "session-owned native child was terminated");
+    string cancelledExecution = Guid.NewGuid().ToString();
+    var cancelRequest = Request("'before-cancel'; Start-Sleep -Seconds 20");
+    cancelRequest["executionId"] = cancelledExecution;
+    await Send(socket, cancelRequest);
+    Require((await Receive(socket)).GetProperty("type").GetString() == "running", "cancel target started");
+    await Send(socket, new { type = "cancel_execution", deviceId = device, sessionId = session, executionId = cancelledExecution });
+    var cancelled = await Receive(socket);
+    Require(cancelled.GetProperty("state").GetString() == "cancelled"
+        && cancelled.GetProperty("invocationOutcome").GetString() == "stopped"
+        && cancelled.GetProperty("exitCode").ValueKind == JsonValueKind.Null
+        && cancelled.GetProperty("stdout").GetString()!.Contains("before-cancel"), "caller cancellation confirms stopping and preserves evidence");
+    await Rejected(Request("'must-not-run'"), "cancelled worker is retired");
+    await ReplaceSession();
     var lost = await Execute("[Environment]::Exit(19)", 5000);
     Require(lost.GetProperty("state").GetString() == "outcome_unknown" && lost.GetProperty("exitCode").ValueKind == JsonValueKind.Null,
         "worker disappearance cannot forge definitive completion");
@@ -141,8 +151,7 @@ try {
     Dictionary<string, object> Request(string script) => new() {
         ["type"] = "execute", ["deviceId"] = device, ["sessionId"] = session,
         ["executionId"] = Guid.NewGuid().ToString(), ["script"] = script,
-        ["scriptSha256"] = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), ["timeoutMs"] = 5000,
-        ["startDeadlineUnixMs"] = DateTimeOffset.UtcNow.AddSeconds(60).ToUnixTimeMilliseconds()
+        ["scriptSha256"] = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), ["timeoutMs"] = 5000
     };
     async Task Rejected(object request, string description) {
         await Send(socket, request);
@@ -195,9 +204,7 @@ Process StartAgent(string thumbprint, string? pin = null) => Process.Start(new P
     ArgumentList = { args[0], "--agent", "wss://localhost:18443/agent", thumbprint, pin ?? Convert.ToHexString(SHA256.HashData(serverCert.RawData)), "test-device" }
 })!;
 static object OpenSession(string device, string session) => new {
-    type = "open_session", deviceId = device, sessionId = session,
-    idleTimeoutMs = 1800000,
-    absoluteDeadlineUnixMs = DateTimeOffset.UtcNow.AddHours(8).ToUnixTimeMilliseconds()
+    type = "open_session", deviceId = device, sessionId = session
 };
 static X509Certificate2 Certificate(string thumbprint) {
     using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);

@@ -21,8 +21,9 @@ from .database import (
     approve_pairing, authenticate_credential, authenticate_device, begin_session_close,
     claim_execution, create_caller, create_or_get_execution, create_starting_session,
     digest, fail_device_investigations, finish_execution, get_workspace_execution, get_workspace_session, increment_rate_limit,
-    initialize, list_workspace_devices, mark_execution_unknown, mark_session_cleanup_unknown, mark_session_closed,
-    mark_session_endpoint_closed, mark_session_failed, mark_session_ready, record_heartbeat, recover_interrupted_work, expire_due_work,
+    initialize, list_workspace_devices, mark_execution_failed_to_start, mark_execution_unknown,
+    mark_queued_execution_cancelled, mark_session_cleanup_unknown, mark_session_closed,
+    mark_session_endpoint_closed, mark_session_failed, mark_session_ready, record_heartbeat, recover_interrupted_work,
 )
 from .reachability import classify_reachability
 
@@ -39,11 +40,7 @@ async def lifespan(app):
 
 app = FastAPI(title="RMM investigation control plane", lifespan=lifespan)
 
-START_DEADLINE_MS = 60_000
-DEFAULT_RUNTIME_MS = 300_000
 MAX_RUNTIME_MS = 3_600_000
-DEFAULT_IDLE_MS = 1_800_000
-MAX_IDLE_MS = 7_200_000
 CLEANUP_GRACE_SECONDS = 10
 
 
@@ -191,7 +188,7 @@ def validate_endpoint_agent_message(message: dict) -> None:
         raise ValueError()
     if kind != "result":
         return
-    if message["state"] not in {"completed", "timed_out", "outcome_unknown"}:
+    if message["state"] not in {"completed", "timed_out", "cancelled", "outcome_unknown"}:
         raise ValueError()
     if not isinstance(message["stdout"], str) or not isinstance(message["stderr"], str):
         raise ValueError()
@@ -208,7 +205,7 @@ def validate_endpoint_agent_message(message: dict) -> None:
             raise ValueError()
     elif message["exitCode"] is not None or message["exitCodeSource"] is not None:
         raise ValueError()
-    elif message["state"] == "timed_out" and message["invocationOutcome"] != "stopped":
+    elif message["state"] in {"timed_out", "cancelled"} and message["invocationOutcome"] != "stopped":
         raise ValueError()
     elif message["state"] == "outcome_unknown" and message["invocationOutcome"] is not None:
         raise ValueError()
@@ -217,22 +214,19 @@ def validate_endpoint_agent_message(message: dict) -> None:
 class SessionCreation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     device_id: uuid.UUID
-    idle_timeout_ms: int = Field(default=DEFAULT_IDLE_MS, ge=1_000, le=MAX_IDLE_MS)
 
 
 class ExecutionCreation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     script: str = Field(min_length=1, max_length=32768)
-    timeout_ms: int = Field(default=DEFAULT_RUNTIME_MS, ge=100, le=MAX_RUNTIME_MS)
+    timeout_ms: int = Field(ge=100, le=MAX_RUNTIME_MS)
 
 
 def session_view(row):
     return {"session_id": str(row["id"]), "device_id": str(row["device_id"]),
             "caller_id": str(row["caller_id"]), "status": row["state"],
             "created_at": row["created_at"], "ready_at": row["ready_at"],
-            "closed_at": row["closed_at"], "idle_timeout_ms": row["idle_timeout_ms"],
-            "last_activity_at": row["last_activity_at"],
-            "absolute_expires_at": row["absolute_expires_at"]}
+            "closed_at": row["closed_at"]}
 
 
 def execution_view(row):
@@ -246,20 +240,17 @@ def execution_view(row):
             "duration_ms": row["duration_ms"], "capture_truncated": row["capture_truncated"],
             "last_native_exit_code": row["last_native_exit_code"],
             "created_at": row["created_at"], "started_at": row["started_at"],
-            "start_deadline_at": row["start_deadline_at"],
             "finished_at": row["finished_at"]}
 
 
 @app.post("/sessions", status_code=201)
 async def create_session(body: SessionCreation, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
-    await asyncio.to_thread(expire_due_work)
     channel = await endpoint_agents.get_connected_channel(str(body.device_id))
     if channel is None:
         raise HTTPException(409, "device_offline")
     try:
-        row = await asyncio.to_thread(create_starting_session, caller["workspace_id"], caller["id"],
-                                      body.device_id, body.idle_timeout_ms)
+        row = await asyncio.to_thread(create_starting_session, caller["workspace_id"], caller["id"], body.device_id)
     except RuntimeError as error:
         if str(error) == "device_busy":
             raise HTTPException(409, "device_busy") from None
@@ -269,10 +260,8 @@ async def create_session(body: SessionCreation, authorization: str | None = Head
     session_id = str(row["id"])
     ready = channel.expect("session_ready", session_id)
     try:
-        await channel.send({"type": "open_session", "deviceId": str(body.device_id), "sessionId": session_id,
-                            "idleTimeoutMs": body.idle_timeout_ms,
-                            "absoluteDeadlineUnixMs": int((row["absolute_expires_at"].timestamp()) * 1000)})
-        await asyncio.wait_for(ready, START_DEADLINE_MS / 1000)
+        await channel.send({"type": "open_session", "deviceId": str(body.device_id), "sessionId": session_id})
+        await asyncio.wait_for(ready, 20)
         await asyncio.to_thread(mark_session_ready, row["id"])
     except Exception:
         await asyncio.to_thread(mark_session_failed, row["id"])
@@ -283,7 +272,6 @@ async def create_session(body: SessionCreation, authorization: str | None = Head
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: uuid.UUID, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
-    await asyncio.to_thread(expire_due_work)
     row = await asyncio.to_thread(get_workspace_session, caller["workspace_id"], session_id)
     if row is None:
         raise HTTPException(404, "session_not_found")
@@ -302,7 +290,6 @@ async def dispatch_execution(execution_id: uuid.UUID, channel, device_id: str) -
             "type": "execute", "deviceId": device_id, "sessionId": str(row["session_id"]),
             "executionId": str(execution_id), "script": row["script"],
             "scriptSha256": row["script_sha256"], "timeoutMs": row["timeout_ms"],
-            "startDeadlineUnixMs": int(row["start_deadline_at"].timestamp() * 1000),
         })
         running_message = await asyncio.wait_for(running, 10)
         expected = {"deviceId": device_id, "sessionId": str(row["session_id"]),
@@ -327,7 +314,6 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
     if idempotency_key is None or not 1 <= len(idempotency_key) <= 200:
         raise HTTPException(422, "idempotency_key_required")
     script_hash = __import__("hashlib").sha256(body.script.encode()).hexdigest()
-    await asyncio.to_thread(expire_due_work)
     try:
         row, created = await asyncio.to_thread(
             create_or_get_execution, caller["workspace_id"], caller["id"], session_id,
@@ -337,8 +323,6 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
     except RuntimeError as error:
         if str(error) == "idempotency_conflict":
             code = "idempotency_conflict"
-        elif str(error) == "execution_deadline_exceeds_session":
-            code = "execution_deadline_exceeds_session"
         else:
             code = "session_busy"
         raise HTTPException(409, code) from None
@@ -346,8 +330,9 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
         session = await asyncio.to_thread(get_workspace_session, caller["workspace_id"], session_id)
         channel = await endpoint_agents.get_connected_channel(str(session["device_id"]))
         if channel is None:
-            await asyncio.to_thread(mark_execution_unknown, row["id"],
-                                    "device_offline_before_dispatch", "queued")
+            await asyncio.to_thread(mark_execution_failed_to_start, row["id"],
+                                    "device_offline_before_dispatch")
+            row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], row["id"])
         else:
             asyncio.create_task(dispatch_execution(row["id"], channel, str(session["device_id"])))
     return {"execution_id": str(row["id"]), "status": row["status"],
@@ -357,17 +342,43 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
 @app.get("/executions/{execution_id}")
 async def get_execution(execution_id: uuid.UUID, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
-    await asyncio.to_thread(expire_due_work)
     row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
     if row is None:
         raise HTTPException(404, "execution_not_found")
     return execution_view(row)
 
 
+@app.post("/executions/{execution_id}/cancel", status_code=202)
+async def cancel_execution(execution_id: uuid.UUID, authorization: str | None = Header(default=None)):
+    caller = authenticated_caller(authorization, "operator")
+    cancelled = await asyncio.to_thread(mark_queued_execution_cancelled, caller["workspace_id"], execution_id)
+    if cancelled is not None:
+        return execution_view(cancelled)
+    row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
+    if row is None:
+        raise HTTPException(404, "execution_not_found")
+    if row["status"] != "running":
+        return execution_view(row)
+    session = await asyncio.to_thread(get_workspace_session, caller["workspace_id"], row["session_id"])
+    if session is None:
+        raise HTTPException(404, "session_not_found")
+    channel = await endpoint_agents.get_connected_channel(str(session["device_id"]))
+    if channel is None:
+        await asyncio.to_thread(mark_execution_unknown, execution_id,
+                                "cancel_confirmation_lost", "running")
+    else:
+        try:
+            await channel.send({"type": "cancel_execution", "deviceId": str(session["device_id"]),
+                                "sessionId": str(row["session_id"]), "executionId": str(execution_id)})
+        except Exception:
+            await asyncio.to_thread(mark_execution_unknown, execution_id,
+                                    "cancel_confirmation_lost", "running")
+    return execution_view(await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id))
+
+
 @app.post("/sessions/{session_id}/close")
 async def close_session(session_id: uuid.UUID, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
-    await asyncio.to_thread(expire_due_work)
     row = await asyncio.to_thread(begin_session_close, caller["workspace_id"], session_id)
     if row is None:
         raise HTTPException(409, "session_not_active")
