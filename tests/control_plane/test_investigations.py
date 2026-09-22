@@ -111,26 +111,51 @@ class EndpointAgentSimulator:
                                     "type": "result", **common, "executionId": execution,
                                     "state": "cancelled", "invocationOutcome": "stopped",
                                     "exitCode": None, "exitCodeSource": None,
-                                    "hadErrors": False, "stdout": "started", "stderr": "",
-                                    "durationMs": 1.0, "captureTruncated": False, "lastNativeExitCode": None,
+                                    "hadErrors": False, "durationMs": 1.0,
+                                    "captureTruncated": False, "lastNativeExitCode": None,
                                 }))
                                 break
                         continue
                     elif message["script"] == "$trialValue = 42":
-                        variable, stdout = 42, ""
+                        variable = 42
                     elif message["script"] == "$trialValue":
-                        stdout = str(variable)
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": str(variable)}))
+                    elif message["script"] == "PROGRESSIVE_OUTPUT":
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "first\n"}))
+                        time.sleep(0.2)
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stderr", "text": "{\"type\":\"result\"}\n"}))
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "snowman ☃\n"}))
+                    elif message["script"] == "LONG_OUTPUT":
+                        chunk = "α" * 5000 + "\n"
+                        for _ in range(10):
+                            socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                    "stream": "stdout", "text": chunk}))
+                    elif message["script"] == "MEG_OUTPUT":
+                        chunk = "m" * 8192
+                        for _ in range(128):
+                            socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                    "stream": "stdout", "text": chunk}))
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "tail-after-meg"}))
+                    elif message["script"] == "EMPTY_OUTPUT":
+                        pass
                     elif message["script"] == "MARK_ONCE":
                         self.marker_count += 1
-                        stdout = "marked"
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "marked"}))
                     else:
-                        stdout = "ok"
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "ok"}))
                     socket.send(json.dumps({
                         "type": "result", **common, "executionId": execution,
                         "state": "completed", "invocationOutcome": "completed_normally",
                         "exitCode": 0, "exitCodeSource": "normalized_invocation",
-                        "hadErrors": False, "stdout": stdout, "stderr": "",
-                        "durationMs": 1.0, "captureTruncated": False, "lastNativeExitCode": None,
+                        "hadErrors": False, "durationMs": 1.0, "captureTruncated": False,
+                        "lastNativeExitCode": None,
                     }))
 
 
@@ -253,6 +278,121 @@ def test_operator_runs_persistent_investigation_and_idempotent_retry_once():
         assert fresh.status_code == 201 and fresh.json()["session_id"] != session
         fresh_read = submit(operator, fresh.json()["session_id"], "$trialValue", "fresh-read")
         assert wait_for_execution(operator, fresh_read.json()["execution_id"])["stdout"] == "None"
+
+
+def test_execution_output_preview_pages_and_long_poll_are_bounded_and_scoped():
+    admin = bootstrap_admin()
+    other_admin = bootstrap_admin()
+    operator, _ = create_operator(admin)
+    other_operator, _ = create_operator(other_admin)
+    key, public, device = enroll(admin)
+    with EndpointAgentSimulator(key, public):
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
+        assert opened.status_code == 201
+        session = opened.json()["session_id"]
+
+        submitted = submit(operator, session, "PROGRESSIVE_OUTPUT", "progressive")
+        assert submitted.status_code == 202
+        execution = submitted.json()["execution_id"]
+        first_poll = httpx.get(
+            BASE + f"/executions/{execution}/output/stdout/events",
+            headers=operator, params={"after": "0", "wait_ms": 2000}, timeout=5,
+        )
+        assert first_poll.status_code == 200
+        first = first_poll.json()
+        assert first["events"][0]["text"] == "first\n"
+        assert first["next_cursor"] != "0"
+        assert first["gap"] == {"detected": False, "reason": None}
+        assert first["status"] in ("running", "completed")
+        assert first["terminal"] in (False, True)
+        assert first["high_water_cursor"] != "0"
+
+        resumed = httpx.get(
+            BASE + f"/executions/{execution}/output/stdout/events",
+            headers=operator, params={"after": first["next_cursor"], "wait_ms": 2000},
+        )
+        assert resumed.status_code == 200
+        assert resumed.json()["events"][0]["text"] == "snowman ☃\n"
+        assert resumed.json()["unicode"] == {
+            "encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "cursored event text",
+        }
+
+        result = wait_for_execution(operator, execution)
+        assert result["output_preview"]["stdout"]["text"] == "first\nsnowman ☃\n"
+        assert result["output_preview"]["stdout"]["shortened"] is False
+        assert result["capture"]["loss_detected"] is False
+        assert result["stdout"] == result["output_preview"]["stdout"]["text"]
+        assert result["stderr"] == result["output_preview"]["stderr"]["text"] == "{\"type\":\"result\"}\n"
+
+        stderr_events = httpx.get(
+            BASE + f"/executions/{execution}/output/stderr/events",
+            headers=operator, params={"after": "0"},
+        ).json()["events"]
+        assert stderr_events[0]["text"] == "{\"type\":\"result\"}\n"
+
+        long = submit(operator, session, "LONG_OUTPUT", "long-output")
+        assert long.status_code == 202
+        long_id = long.json()["execution_id"]
+        long_result = wait_for_execution(operator, long_id)
+        preview = long_result["output_preview"]["stdout"]
+        assert len(preview["text"].encode()) <= 8192
+        assert preview["shortened"] is True
+        assert preview["capture_lost"] is False
+
+        page = httpx.get(
+            BASE + f"/executions/{long_id}/output/stdout",
+            headers=operator, params={"after": "0", "limit_bytes": 65536},
+        )
+        assert page.status_code == 200
+        body = page.json()
+        assert 0 < len(body["text"].encode()) <= 65536
+        assert body["next_cursor"] != "0"
+        assert body["has_more"] is True
+        assert body["capture_lost"] is False
+        assert "α" in body["text"]
+        invalid = httpx.get(
+            BASE + f"/executions/{long_id}/output/stdout",
+            headers=operator, params={"after": "not-a-cursor"},
+        )
+        assert invalid.status_code == 422
+
+        second = httpx.get(
+            BASE + f"/executions/{long_id}/output/stdout",
+            headers=operator, params={"after": body["next_cursor"], "limit_bytes": 65536},
+        ).json()
+        assert second["text"]
+        assert second["gap"]["detected"] is False
+
+        meg = submit(operator, session, "MEG_OUTPUT", "meg-output")
+        assert meg.status_code == 202
+        meg_id = meg.json()["execution_id"]
+        meg_result = wait_for_execution(operator, meg_id)
+        assert meg_result["output_preview"]["stdout"]["shortened"] is True
+        assert meg_result["capture"]["loss_detected"] is False
+        after_meg = httpx.get(
+            BASE + f"/executions/{meg_id}/output/stdout/events",
+            headers=operator, params={"after": "128", "limit": 1},
+        ).json()
+        assert after_meg["events"][0]["text"] == "tail-after-meg"
+        assert after_meg["gap"]["detected"] is False
+
+        assert httpx.get(BASE + f"/executions/{execution}/output/stdout", headers=other_operator).status_code == 404
+        denied = httpx.get(BASE + f"/executions/{execution}/output/stdout/events", headers=other_operator)
+        assert denied.status_code == 404
+
+        empty = submit(operator, session, "EMPTY_OUTPUT", "empty-output")
+        assert empty.status_code == 202
+        empty_id = empty.json()["execution_id"]
+        assert wait_for_execution(operator, empty_id)["output_preview"]["stdout"]["text"] == ""
+        empty_poll = httpx.get(
+            BASE + f"/executions/{empty_id}/output/stdout/events",
+            headers=operator, params={"after": "0", "wait_ms": 50},
+        ).json()
+        assert empty_poll["events"] == []
+        assert empty_poll["status"] == "completed"
+        assert empty_poll["terminal"] is True
+        assert empty_poll["no_change"] is True
+        assert empty_poll["timed_out"] is False
 
 
 def test_operator_cannot_admin_and_resources_are_workspace_scoped():

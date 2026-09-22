@@ -2,24 +2,35 @@ using System.Text;
 
 namespace EndpointAgent;
 
-// The engine must keep draining after the retention bound is reached.
+// The engine must keep draining while output is forwarded in bounded chunks.
 internal sealed class BoundedOutput : TextWriter {
-    private const int Limit = 32768;
-    private readonly StringBuilder content = new();
+    private const int ChunkLimit = 8192;
     private readonly Action<string>? onRetained;
     public BoundedOutput(Action<string>? onRetained = null) { NewLine = "\n"; this.onRetained = onRetained; }
     public override Encoding Encoding => Encoding.UTF8;
-    public bool Truncated { get; private set; }
     public override void Write(char value) => Write(value.ToString());
     public override void Write(string? value) {
         if (value is null) return;
-        lock (content) {
-            int count = Math.Min(value.Length, Limit - content.Length);
-            if (count > 0 && count < value.Length && char.IsHighSurrogate(value[count - 1])) count--;
-            content.Append(value, 0, count);
-            Truncated |= count != value.Length;
-            if (count > 0) onRetained?.Invoke(value[..count]);
+        lock (this) {
+            foreach (var chunk in Utf8Chunks(value)) onRetained?.Invoke(chunk);
         }
     }
-    public override string ToString() { lock (content) return content.ToString(); }
+
+    private static IEnumerable<string> Utf8Chunks(string value) {
+        var chunk = new StringBuilder();
+        int chunkBytes = 0;
+        for (int index = 0; index < value.Length;) {
+            int charCount = char.IsHighSurrogate(value[index]) && index + 1 < value.Length ? 2 : 1;
+            int byteCount = Encoding.UTF8.GetByteCount(value.AsSpan(index, charCount));
+            if (chunk.Length > 0 && chunkBytes + byteCount > ChunkLimit) {
+                yield return chunk.ToString();
+                chunk.Clear();
+                chunkBytes = 0;
+            }
+            chunk.Append(value, index, charCount);
+            chunkBytes += byteCount;
+            index += charCount;
+        }
+        if (chunk.Length > 0) yield return chunk.ToString();
+    }
 }

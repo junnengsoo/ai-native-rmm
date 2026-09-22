@@ -62,7 +62,7 @@ internal static class PowerShellWorker {
             string outcome = host.ExitCode.HasValue ? "explicit_exit" : terminated ? "terminating_error" : "completed_normally";
             string source = host.ExitCode.HasValue ? "explicit_script_exit" : "normalized_invocation";
             var result = new WorkerResult("completed", outcome, host.ExitCode ?? (terminated ? 1 : 0), source, hadErrors || terminated,
-                stdout.ToString(), stderr.ToString(), watch.Elapsed.TotalMilliseconds, stdout.Truncated || stderr.Truncated, nativeCode);
+                watch.Elapsed.TotalMilliseconds, false, nativeCode);
             await writer.WriteLineAsync(JsonSerializer.Serialize(result));
             if (host.ExitCode.HasValue) break;
         }

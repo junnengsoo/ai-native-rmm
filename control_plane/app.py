@@ -19,8 +19,11 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from .connections import endpoint_agents
 from .database import (
     approve_pairing, authenticate_credential, authenticate_device, begin_session_close,
+    append_execution_output,
     claim_execution, create_caller, create_or_get_execution, create_starting_session,
-    digest, fail_device_investigations, finish_execution, get_workspace_execution, get_workspace_session, increment_rate_limit,
+    digest, fail_device_investigations, finish_execution, get_execution_output_events,
+    get_execution_output_high_water,
+    get_execution_output_page, get_execution_output_preview, get_workspace_execution, get_workspace_session, increment_rate_limit,
     initialize, list_workspace_devices, mark_execution_failed_to_start, mark_execution_unknown,
     mark_queued_execution_cancelled, mark_session_cleanup_unknown, mark_session_closed,
     mark_session_endpoint_closed, mark_session_failed, mark_session_ready, record_heartbeat, recover_interrupted_work,
@@ -39,6 +42,7 @@ async def lifespan(app):
 
 
 app = FastAPI(title="RMM investigation control plane", lifespan=lifespan)
+output_waiters: dict[tuple[str, str], asyncio.Condition] = {}
 
 MAX_RUNTIME_MS = 3_600_000
 CLEANUP_GRACE_SECONDS = 10
@@ -180,19 +184,22 @@ def validate_endpoint_agent_message(message: dict) -> None:
         "session_ready": common,
         "session_closed": common,
         "running": common | {"executionId"},
+        "output": common | {"executionId", "stream", "text"},
         "result": common | {"executionId", "state", "invocationOutcome", "exitCode",
-                            "exitCodeSource", "hadErrors", "stdout", "stderr", "durationMs",
-                            "captureTruncated", "lastNativeExitCode"},
+                            "exitCodeSource", "hadErrors", "durationMs", "captureTruncated",
+                            "lastNativeExitCode"},
     }
     if kind not in expected or set(message) != expected[kind]:
         raise ValueError()
+    if kind == "output":
+        if message["stream"] not in {"stdout", "stderr"} or not isinstance(message["text"], str):
+            raise ValueError()
+        if len(message["text"].encode()) > 65536:
+            raise ValueError()
+        return
     if kind != "result":
         return
     if message["state"] not in {"completed", "timed_out", "cancelled", "outcome_unknown"}:
-        raise ValueError()
-    if not isinstance(message["stdout"], str) or not isinstance(message["stderr"], str):
-        raise ValueError()
-    if len(message["stdout"]) > 32768 or len(message["stderr"]) > 32768:
         raise ValueError()
     if not isinstance(message["hadErrors"], bool) or not isinstance(message["captureTruncated"], bool):
         raise ValueError()
@@ -230,17 +237,65 @@ def session_view(row):
 
 
 def execution_view(row):
+    stdout_preview = get_execution_output_preview(row["id"], "stdout")
+    stderr_preview = get_execution_output_preview(row["id"], "stderr")
+    capture_lost = bool(row["capture_truncated"])
     return {"execution_id": str(row["id"]), "session_id": str(row["session_id"]),
             "caller_id": str(row["caller_id"]), "status": row["status"],
             "script_sha256": row["script_sha256"], "invocation_outcome": row["invocation_outcome"],
             "outcome_reason": row["outcome_reason"],
             "last_confirmed_status": row["last_confirmed_status"],
             "exit_code": row["exit_code"], "exit_code_source": row["exit_code_source"],
-            "had_errors": row["had_errors"], "stdout": row["stdout"], "stderr": row["stderr"],
+            "had_errors": row["had_errors"], "stdout": stdout_preview["text"], "stderr": stderr_preview["text"],
             "duration_ms": row["duration_ms"], "capture_truncated": row["capture_truncated"],
+            "capture": {"loss_detected": capture_lost, "reason": "retention_limit" if capture_lost else None},
+            "output_preview": {
+                "stdout": {**stdout_preview, "capture_lost": capture_lost},
+                "stderr": {**stderr_preview, "capture_lost": capture_lost},
+            },
             "last_native_exit_code": row["last_native_exit_code"],
             "created_at": row["created_at"], "started_at": row["started_at"],
             "finished_at": row["finished_at"]}
+
+
+def parse_output_cursor(after: str) -> int:
+    if not after.isdecimal():
+        raise HTTPException(422, "invalid_cursor")
+    return int(after)
+
+
+def output_gap():
+    return {"detected": False, "reason": None}
+
+
+def unicode_contract():
+    return {"encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "cursored event text"}
+
+
+async def notify_output(execution_id: uuid.UUID | str, stream: str) -> None:
+    condition = output_waiters.get((str(execution_id), stream))
+    if condition is not None:
+        async with condition:
+            condition.notify_all()
+
+
+def execution_is_terminal(row) -> bool:
+    return row["status"] not in {"queued", "running"}
+
+
+async def wait_for_output(execution_id: uuid.UUID, stream: str, after: int, wait_ms: int) -> bool:
+    if wait_ms <= 0:
+        return True
+    key = (str(execution_id), stream)
+    condition = output_waiters.setdefault(key, asyncio.Condition())
+    async with condition:
+        if await asyncio.to_thread(lambda: bool(get_execution_output_events(execution_id, stream, after, 1))):
+            return False
+        try:
+            await asyncio.wait_for(condition.wait(), wait_ms / 1000)
+            return False
+        except (TimeoutError, asyncio.TimeoutError):
+            return True
 
 
 @app.post("/sessions", status_code=201)
@@ -301,9 +356,13 @@ async def dispatch_execution(execution_id: uuid.UUID, channel, device_id: str) -
         if any(evidence.get(key) != value for key, value in expected.items()):
             raise ValueError("mismatched_result_binding")
         await asyncio.to_thread(finish_execution, execution_id, evidence)
+        await notify_output(execution_id, "stdout")
+        await notify_output(execution_id, "stderr")
     except Exception:
         await asyncio.to_thread(mark_execution_unknown, execution_id,
                                 "dispatch_confirmation_lost", last_confirmed_status)
+        await notify_output(execution_id, "stdout")
+        await notify_output(execution_id, "stderr")
 
 
 @app.post("/sessions/{session_id}/executions", status_code=202)
@@ -345,7 +404,70 @@ async def get_execution(execution_id: uuid.UUID, authorization: str | None = Hea
     row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
     if row is None:
         raise HTTPException(404, "execution_not_found")
-    return execution_view(row)
+    return await asyncio.to_thread(execution_view, row)
+
+
+@app.get("/executions/{execution_id}/output/{stream}")
+async def get_execution_output(execution_id: uuid.UUID, stream: str,
+                               authorization: str | None = Header(default=None),
+                               after: str = "0",
+                               limit_bytes: int = Query(default=65536, ge=8192, le=65536)):
+    if stream not in {"stdout", "stderr"}:
+        raise HTTPException(404, "stream_not_found")
+    caller = authenticated_caller(authorization, "operator")
+    row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
+    if row is None:
+        raise HTTPException(404, "execution_not_found")
+    cursor = parse_output_cursor(after)
+    page = await asyncio.to_thread(get_execution_output_page, execution_id, stream, cursor, limit_bytes)
+    capture_lost = bool(row["capture_truncated"])
+    return {**page, "more_available": page["has_more"],
+            "capture_lost": capture_lost, "gap": output_gap(), "unicode": unicode_contract()}
+
+
+@app.get("/executions/{execution_id}/output/{stream}/events")
+async def long_poll_execution_output(execution_id: uuid.UUID, stream: str,
+                                     authorization: str | None = Header(default=None),
+                                     after: str = "0",
+                                     wait_ms: int = Query(default=0, ge=0, le=30000),
+                                     limit: int = Query(default=8, ge=1, le=8)):
+    if stream not in {"stdout", "stderr"}:
+        raise HTTPException(404, "stream_not_found")
+    caller = authenticated_caller(authorization, "operator")
+    row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
+    if row is None:
+        raise HTTPException(404, "execution_not_found")
+    cursor = parse_output_cursor(after)
+    timed_out = False
+    if (not await asyncio.to_thread(lambda: bool(get_execution_output_events(execution_id, stream, cursor, 1)))
+            and not execution_is_terminal(row)):
+        timed_out = await wait_for_output(execution_id, stream, cursor, wait_ms)
+        row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
+    rows = await asyncio.to_thread(get_execution_output_events, execution_id, stream, cursor, limit + 1)
+    visible = rows[:limit]
+    next_cursor = str(visible[-1]["sequence"]) if visible else after
+    high_water = await asyncio.to_thread(get_execution_output_high_water, execution_id, stream)
+    terminal = execution_is_terminal(row)
+    return {
+        "events": [{"cursor": str(event["sequence"]), "text": event["text"],
+                    "byte_count": event["byte_count"], "created_at": event["created_at"]}
+                   for event in visible],
+        "next_cursor": next_cursor,
+        "high_water_cursor": str(high_water),
+        "more_available": len(rows) > limit,
+        "has_more": len(rows) > limit,
+        "status": row["status"],
+        "terminal": terminal,
+        "timed_out": timed_out and not visible and not terminal,
+        "no_change": not visible,
+        "terminal_metadata": {
+            "status": row["status"], "finished_at": row["finished_at"],
+            "capture_lost": bool(row["capture_truncated"]),
+            "loss_reason": "retention_limit" if row["capture_truncated"] else None,
+        },
+        "gap": output_gap(),
+        "unicode": unicode_contract(),
+    }
 
 
 @app.post("/executions/{execution_id}/cancel", status_code=202)
@@ -431,6 +553,16 @@ async def endpoint_agent(socket: WebSocket):
                 validate_endpoint_agent_message(message)
                 if message.get("deviceId") != status["device_id"]:
                     raise ValueError()
+                if message["type"] == "output":
+                    try:
+                        await asyncio.to_thread(
+                            append_execution_output, uuid.UUID(message["executionId"]),
+                            message["stream"], message["text"], uuid.UUID(message["sessionId"]),
+                            uuid.UUID(message["deviceId"]))
+                    except Exception as error:
+                        raise ValueError() from error
+                    await notify_output(message["executionId"], message["stream"])
+                    continue
                 if not channel.deliver(message):
                     if message["type"] == "session_closed":
                         await asyncio.to_thread(mark_session_endpoint_closed, message["sessionId"])

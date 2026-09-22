@@ -62,16 +62,17 @@ internal static class EnrollmentScenario {
                     var running = await ReceiveDispatch(socket);
                     Require(running.GetProperty("type").GetString() == "running"
                         && running.GetProperty("executionId").GetString() == execution, "enrolled correlated running");
-                    var result = await ReceiveDispatch(socket);
-                    Require(result.GetProperty("type").GetString() == "result"
-                        && result.GetProperty("executionId").GetString() == execution
-                        && result.GetProperty("stdout").GetString()!.Contains("enrolled execution"), "enrolled structured result");
+                    var first = await ReceiveResultWithOutput(socket, execution);
+                    Require(first.Stdout.Contains("enrolled execution"), "enrolled output frame");
+                    Require(first.Result.GetProperty("executionId").GetString() == execution
+                        && !first.Result.TryGetProperty("stdout", out _) && !first.Result.TryGetProperty("stderr", out _),
+                        "enrolled terminal metadata omits output preview");
                     string second = Guid.NewGuid().ToString();
                     script = "$global:enrolledValue + 1";
                     await Send(socket, ExecuteRequest(device, session, second, script, 5000));
                     Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "running", "second invocation running");
-                    result = await ReceiveDispatch(socket);
-                    Require(result.GetProperty("stdout").GetString()!.Trim() == "42", "enrolled session state persists");
+                    var result = await ReceiveResultWithOutput(socket, second);
+                    Require(result.Stdout.Trim() == "42", "enrolled session state persists");
                     string slow = Guid.NewGuid().ToString();
                     script = "Start-Sleep -Seconds 2; 'finished'";
                     await Send(socket, ExecuteRequest(device, session, slow, script, 5000));
@@ -80,7 +81,9 @@ internal static class EnrollmentScenario {
                     script = "'must-not-run-while-busy'";
                     await Send(socket, ExecuteRequest(device, session, busy, script, 5000));
                     Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "rejected", "concurrent invocation rejected");
-                    Require((await ReceiveDispatch(socket)).GetProperty("executionId").GetString() == slow, "original invocation completes once");
+                    result = await ReceiveResultWithOutput(socket, slow);
+                    Require(result.Result.GetProperty("executionId").GetString() == slow
+                        && result.Stdout.Contains("finished"), "original invocation completes once");
                     await Send(socket, new { type = "close_session", deviceId = device, sessionId = session });
                     Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "session_closed", "enrolled worker closed");
                     completed.TrySetResult();
@@ -90,6 +93,24 @@ internal static class EnrollmentScenario {
                             var message = await Receive(peer);
                             if (message.GetProperty("type").GetString() != "heartbeat") return message;
                             await Send(peer, new { type = "heartbeat_ack" });
+                        }
+                    }
+
+                    async Task<(JsonElement Result, string Stdout, string Stderr)> ReceiveResultWithOutput(WebSocket peer, string expectedExecution) {
+                        var stdout = new StringBuilder();
+                        var stderr = new StringBuilder();
+                        while (true) {
+                            var message = await ReceiveDispatch(peer);
+                            string type = message.GetProperty("type").GetString()!;
+                            if (type == "output") {
+                                Require(message.GetProperty("executionId").GetString() == expectedExecution, "correlated enrolled output");
+                                string text = message.GetProperty("text").GetString()!;
+                                if (message.GetProperty("stream").GetString() == "stdout") stdout.Append(text);
+                                else stderr.Append(text);
+                                continue;
+                            }
+                            Require(type == "result", "enrolled terminal result after output");
+                            return (message, stdout.ToString(), stderr.ToString());
                         }
                     }
                 }

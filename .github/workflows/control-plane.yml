@@ -21,7 +21,6 @@ jobs:
         options: --health-cmd "pg_isready -U rmm -d rmm" --health-interval 2s --health-timeout 3s --health-retries 20
     env:
       RMM_DATABASE_URL: postgresql://rmm:isolated-ci-password@127.0.0.1:5432/rmm
-      RMM_EXPIRY_TEST: '1'
       RMM_RATE_TEST: '1'
     steps:
       - uses: actions/checkout@v4
