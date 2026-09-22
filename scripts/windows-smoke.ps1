@@ -20,7 +20,8 @@ try {
     $probeName = 'rmm-' + [Guid]::NewGuid().ToString('N')
     $probePipe = New-Object IO.Pipes.NamedPipeServerStream(
         $probeName, [IO.Pipes.PipeDirection]::InOut, 1,
-        [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous
+        [IO.Pipes.PipeTransmissionMode]::Byte,
+        ([IO.Pipes.PipeOptions]::Asynchronous -bor [IO.Pipes.PipeOptions]::CurrentUserOnly)
     )
     $probeError = Join-Path $env:TEMP ($probeName + '.err')
     $probeOutput = Join-Path $env:TEMP ($probeName + '.out')
