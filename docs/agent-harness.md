@@ -125,10 +125,10 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --agent wss://loca
 
 ## Recorded verification and limitations
 
-On 2026-09-21 the Mac wrapper ran the previous embedded-runtime implementation
-on the existing Windows 11 VM with .NET SDK 8.0.425 and hosted PowerShell 7.4.13.
-That recorded run predates the native Windows PowerShell worker change. All three
-scenarios passed at that revision:
+On 2026-09-22 the independent Windows GitHub Actions peer ran the native worker
+contract against 64-bit Windows PowerShell 5.1. It confirmed the `Desktop`
+engine, inbox `CimCmdlets` auto-loading through `Get-CimInstance`, and all three
+external-behavior scenarios:
 
 - Invocation and persistent session: stdout/stderr output frames and
   correlation, terminal result metadata without duplicated output previews,
@@ -145,16 +145,15 @@ scenarios passed at that revision:
   gone, no reuse of retired workers, and abrupt worker exit recorded as
   `outcome_unknown`.
 
-The manual harmless/error smoke also ran in that suite (about 157 ms and 16 ms
-of measured invocation time in the recorded run). These are invocation timings,
-not a cross-network latency claim. The same external-behavior suite runs in the
-Windows GitHub Actions job.
+The same run built and uploaded the unsigned trial MSI after the contract passed.
+Invocation timings are local worker measurements, not a cross-network latency
+claim.
 
 There is no reconnect/replay protocol or durable execution history in this slice.
 In-memory replay protection is bounded to 1,000 execution IDs and 100 session IDs
 per agent connection; the peer must stop when that allowance is exhausted.
-Inbound frames are limited to 80,000 bytes, scripts to 32,768 code units, connect
-waiting to 15 seconds, and idle frame waiting to two minutes. Timeout/cancellation
+Inbound frames are limited to 80,000 bytes, scripts to 32,768 code units, native
+worker startup to 60 seconds, and idle frame waiting to two minutes. Timeout/cancellation
 and worker-loss results conservatively disclose possible capture loss. Outbound
 output frames are chunked before transport. Success output is string rendered
 from PowerShell objects; debug/verbose/progress streams are drained but not
