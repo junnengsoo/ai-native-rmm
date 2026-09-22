@@ -66,14 +66,15 @@ internal static class EnrollmentScenario {
                     var first = await ReceiveResultWithOutput(socket, execution);
                     Require(first.Stdout.Contains("enrolled execution"), "enrolled output frame");
                     Require(first.Result.GetProperty("executionId").GetString() == execution
-                        && first.Result.GetProperty("stdout").GetString()!.Contains("enrolled execution"), "enrolled structured result");
+                        && !first.Result.TryGetProperty("stdout", out _) && !first.Result.TryGetProperty("stderr", out _),
+                        "enrolled terminal metadata omits output preview");
                     string second = Guid.NewGuid().ToString();
                     script = "$global:enrolledValue + 1";
                     await Send(socket, new { type = "execute", deviceId = device, sessionId = session, executionId = second,
                         script, scriptSha256 = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))), timeoutMs = 5000 });
                     Require((await ReceiveDispatch(socket)).GetProperty("type").GetString() == "running", "second invocation running");
                     var result = await ReceiveResultWithOutput(socket, second);
-                    Require(result.Result.GetProperty("stdout").GetString()!.Trim() == "42", "enrolled session state persists");
+                    Require(result.Stdout.Trim() == "42", "enrolled session state persists");
                     string slow = Guid.NewGuid().ToString();
                     script = "Start-Sleep -Seconds 2; 'finished'";
                     await Send(socket, new { type = "execute", deviceId = device, sessionId = session, executionId = slow,

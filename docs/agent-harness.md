@@ -39,10 +39,11 @@ inertly. Completion means invocation completion, not that an IT issue is fixed.
 
 `output` frames carry `stream` (`stdout` or `stderr`) and inert text chunks while
 an execution is still running. The final `result` fields are `state`,
-`invocationOutcome`, `exitCode`, `hadErrors`, compatibility-preview `stdout`,
-compatibility-preview `stderr`, `durationMs`, `captureTruncated`, and
-`lastNativeExitCode`, alongside the three resource bindings. A native exit value
-is evidence about the last native command, not a universal script outcome.
+`invocationOutcome`, `exitCode`, `hadErrors`, `durationMs`, `captureTruncated`,
+and `lastNativeExitCode`, alongside the three resource bindings. Terminal
+results do not include stdout/stderr previews; output text is carried only by
+ordered `output` frames. A native exit value is evidence about the last native
+command, not a universal script outcome.
 `LASTEXITCODE` is reset before every invocation. Ordinary and nonterminating
 error completion normalizes to 0; an unhandled terminating error normalizes to
 1. Explicit exit reports its requested code. Explicit exit deliberately retires
@@ -55,14 +56,13 @@ so Windows tests gate changes to these engine semantics.
 
 Local execution timeouts range from 100 ms to 30 seconds for this harness slice.
 The endpoint continuously drains PowerShell output and forwards UTF-8-safe chunks
-bounded to 8 KiB of text bytes before JSON framing. Terminal `stdout`/`stderr`
-fields are bounded compatibility previews only; the control plane derives API
-previews, 64 KiB pages, and long-poll events from durably stored `output` frames.
-Preview shortening is not capture loss. A session worker is owned by a Windows
-Job Object. Timeout or closure terminates that job, including owned child
-processes; only confirmed zero active processes permits confirmed stopping.
-Stopping never undoes filesystem, registry, network, or other script side
-effects.
+bounded to 8 KiB of text bytes before JSON framing. The control plane derives
+API previews, 64 KiB pages, and long-poll events from durably stored `output`
+frames. Preview shortening is not capture loss. A session worker is owned by a
+Windows Job Object. Timeout or closure terminates that job, including owned
+child processes; only confirmed zero active processes permits confirmed
+stopping. Stopping never undoes filesystem, registry, network, or other script
+side effects.
 
 ## Run from macOS
 
@@ -97,13 +97,14 @@ signing/nonexportability, pending reconnect,
 heartbeat cadence and refusal of execution, then removes that trust and test key.
 The original mTLS worker scenarios and their trust policy remain unchanged.
 
-Expected: `SMOKE` shows a correlated `completed_normally`, exit 0 result with
-`hello from Windows` in stdout. `SMOKE_ERROR` shows `terminating_error`, exit 1,
-and `expected-smoke-error` in stderr. The four scenario PASS lines and final
-`RMM_SUITE_PASSED` mean the full suite passed. The shell wrapper exits nonzero
-if that marker is absent, even if Azure reports the extension invocation itself
-succeeded. Expected negative-authentication attempts print only sanitized
-exception categories; no key/configuration dumps are emitted.
+Expected: `SMOKE` shows a correlated `completed_normally`, exit 0 terminal
+result; the harness verifies `hello from Windows` arrived in preceding output
+frames. `SMOKE_ERROR` shows `terminating_error`, exit 1; the harness verifies
+`expected-smoke-error` arrived in stderr output frames. The four scenario PASS
+lines and final `RMM_SUITE_PASSED` mean the full suite passed. The shell wrapper
+exits nonzero if that marker is absent, even if Azure reports the extension
+invocation itself succeeded. Expected negative-authentication attempts print
+only sanitized exception categories; no key/configuration dumps are emitted.
 
 The agent's manual entry point, when a trusted peer and certificates are already
 configured, is:
@@ -117,11 +118,12 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --agent wss://loca
 On 2026-09-21 the Mac wrapper ran the actual binaries on the existing Windows 11
 VM with .NET SDK 8.0.425 and hosted PowerShell 7.4.13. All three scenarios passed:
 
-- Invocation and persistent session: stdout/stderr and correlation, terminating
-  and nonterminating errors, native exit 7 separated from normalized 0, no stale
-  LASTEXITCODE, variables/functions/directory persistence, printed fake lifecycle
-  kept as data, disclosed capture truncation, explicit exit 23 and 0, and fresh
-  state after replacement.
+- Invocation and persistent session: stdout/stderr output frames and
+  correlation, terminal result metadata without duplicated output previews,
+  terminating and nonterminating errors, native exit 7 separated from normalized
+  0, no stale LASTEXITCODE, variables/functions/directory persistence, printed
+  fake lifecycle kept as data, disclosed capture truncation, explicit exit 23
+  and 0, and fresh state after replacement.
 - Authentication and validation: wrong client key and server pin rejected,
   nonexportable endpoint key, dummy secret/configuration excluded from worker,
   altered hash, wrong device/session, unknown fields, invalid timeout and malformed

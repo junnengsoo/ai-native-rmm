@@ -30,8 +30,8 @@ internal static class AgentRuntime {
                         await Send(socket, sendLock, new { type = "result", deviceId = device,
                             sessionId = completed.Session, executionId = completed.Execution,
                             completed.Result.State, completed.Result.InvocationOutcome, completed.Result.ExitCode,
-                            completed.Result.ExitCodeSource, completed.Result.HadErrors, completed.Result.Stdout,
-                            completed.Result.Stderr, completed.Result.DurationMs, completed.Result.CaptureTruncated,
+                            completed.Result.ExitCodeSource, completed.Result.HadErrors,
+                            completed.Result.DurationMs, completed.Result.CaptureTruncated,
                             completed.Result.LastNativeExitCode });
                         continue;
                     }

@@ -182,8 +182,8 @@ def validate_endpoint_agent_message(message: dict) -> None:
         "running": common | {"executionId"},
         "output": common | {"executionId", "stream", "text"},
         "result": common | {"executionId", "state", "invocationOutcome", "exitCode",
-                            "exitCodeSource", "hadErrors", "stdout", "stderr", "durationMs",
-                            "captureTruncated", "lastNativeExitCode"},
+                            "exitCodeSource", "hadErrors", "durationMs", "captureTruncated",
+                            "lastNativeExitCode"},
     }
     if kind not in expected or set(message) != expected[kind]:
         raise ValueError()
@@ -196,10 +196,6 @@ def validate_endpoint_agent_message(message: dict) -> None:
     if kind != "result":
         return
     if message["state"] not in {"completed", "timed_out", "outcome_unknown"}:
-        raise ValueError()
-    if not isinstance(message["stdout"], str) or not isinstance(message["stderr"], str):
-        raise ValueError()
-    if len(message["stdout"]) > 32768 or len(message["stderr"]) > 32768:
         raise ValueError()
     if not isinstance(message["hadErrors"], bool) or not isinstance(message["captureTruncated"], bool):
         raise ValueError()

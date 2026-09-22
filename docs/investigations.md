@@ -38,10 +38,13 @@ Execution statuses are `queued`, `running`, `completed`, `timed_out`, and
 observed and report a reason plus the last confirmed lifecycle state. Completed
 results distinguish normalized invocation codes from explicit script exits.
 Output is retained incrementally as inert per-stream data, never parsed as
-lifecycle even when it resembles protocol JSON. `GET /executions/{id}` returns
-only the preview; paging and long-poll endpoints expose more retained context
-without rerunning the script. Cursors are per execution stream, monotonically
-ordered by retained UTF-8 text events, and never split a Unicode character.
+lifecycle even when it resembles protocol JSON. Endpoint terminal `result`
+messages carry lifecycle metadata only; stdout/stderr text comes from ordered
+endpoint `output` frames. `GET /executions/{id}` derives and returns only the
+preview from retained events; paging and long-poll endpoints expose more
+retained context without rerunning the script. Cursors are per execution stream,
+monotonically ordered by retained UTF-8 text events, and never split a Unicode
+character.
 Preview shortening is reported separately from capture loss. Capture loss means
 execution ended before all emitted output could be forwarded, such as timeout or
 worker loss; a shortened preview only means more retained output is available
@@ -78,15 +81,17 @@ same requests with an HTTP client:
    terminal completion metadata, or an explicit timeout/no-change result. Resume
    from the returned `next_cursor`; interrupting the client and resuming from the
    last cursor must not rerun the script or lose ordering.
-5. After completion, call `GET /executions/EXECUTION_ID` and confirm `stdout` is
-   only the preview while `output_preview.stdout.shortened` distinguishes hidden
-   retained content from `capture.loss_detected`.
+5. After completion, call `GET /executions/EXECUTION_ID` and confirm API
+   `stdout` is the control-plane-derived preview while
+   `output_preview.stdout.shortened` distinguishes hidden retained content from
+   `capture.loss_detected`.
 6. Page through the retained output with
    `GET /executions/EXECUTION_ID/output/stdout?after=CURSOR&limit_bytes=65536`
    until `more_available` is false.
 7. Submit `$global:trialValue = 41`, then `$global:trialValue + 1` under a new
-   idempotency key. The structured result must have `stdout` containing `42`,
-   exit code `0`, and a duration.
+   idempotency key. `GET /executions/{id}` must show API `stdout` preview
+   containing `42`, exit code `0`, and a duration; that preview is derived from
+   retained output frames, not duplicated endpoint terminal metadata.
 8. Submit a harmless marker-file append, then repeat the identical request with
    the same idempotency key. Both responses must contain the same execution ID,
    and the file must contain only one marker. Reuse that key with different script

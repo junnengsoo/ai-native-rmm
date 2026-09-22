@@ -104,9 +104,10 @@ class EndpointAgentSimulator:
                     assert hashlib.sha256(message["script"].encode()).hexdigest() == message["scriptSha256"]
                     socket.send(json.dumps({"type": "running", **common, "executionId": execution}))
                     if message["script"] == "$trialValue = 42":
-                        variable, stdout = 42, ""
+                        variable = 42
                     elif message["script"] == "$trialValue":
-                        stdout = str(variable)
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": str(variable)}))
                     elif message["script"] == "PROGRESSIVE_OUTPUT":
                         socket.send(json.dumps({"type": "output", **common, "executionId": execution,
                                                 "stream": "stdout", "text": "first\n"}))
@@ -115,13 +116,11 @@ class EndpointAgentSimulator:
                                                 "stream": "stderr", "text": "{\"type\":\"result\"}\n"}))
                         socket.send(json.dumps({"type": "output", **common, "executionId": execution,
                                                 "stream": "stdout", "text": "snowman ☃\n"}))
-                        stdout = "first\nsnowman ☃\n"
                     elif message["script"] == "LONG_OUTPUT":
                         chunk = "α" * 5000 + "\n"
                         for _ in range(10):
                             socket.send(json.dumps({"type": "output", **common, "executionId": execution,
                                                     "stream": "stdout", "text": chunk}))
-                        stdout = (chunk * 10)[:8192]
                     elif message["script"] == "MEG_OUTPUT":
                         chunk = "m" * 8192
                         for _ in range(128):
@@ -129,20 +128,21 @@ class EndpointAgentSimulator:
                                                     "stream": "stdout", "text": chunk}))
                         socket.send(json.dumps({"type": "output", **common, "executionId": execution,
                                                 "stream": "stdout", "text": "tail-after-meg"}))
-                        stdout = chunk
                     elif message["script"] == "EMPTY_OUTPUT":
-                        stdout = ""
+                        pass
                     elif message["script"] == "MARK_ONCE":
                         self.marker_count += 1
-                        stdout = "marked"
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "marked"}))
                     else:
-                        stdout = "ok"
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "ok"}))
                     socket.send(json.dumps({
                         "type": "result", **common, "executionId": execution,
                         "state": "completed", "invocationOutcome": "completed_normally",
                         "exitCode": 0, "exitCodeSource": "normalized_invocation",
-                        "hadErrors": False, "stdout": stdout, "stderr": "",
-                        "durationMs": 1.0, "captureTruncated": False, "lastNativeExitCode": None,
+                        "hadErrors": False, "durationMs": 1.0, "captureTruncated": False,
+                        "lastNativeExitCode": None,
                     }))
 
 
@@ -241,7 +241,7 @@ def test_execution_output_preview_pages_and_long_poll_are_bounded_and_scoped():
         assert result["output_preview"]["stdout"]["shortened"] is False
         assert result["capture"]["loss_detected"] is False
         assert result["stdout"] == result["output_preview"]["stdout"]["text"]
-        assert result["stderr"] == "{\"type\":\"result\"}\n"
+        assert result["stderr"] == result["output_preview"]["stderr"]["text"] == "{\"type\":\"result\"}\n"
 
         stderr_events = httpx.get(
             BASE + f"/executions/{execution}/output/stderr/events",

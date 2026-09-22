@@ -6,7 +6,7 @@ using System.Text.Json;
 namespace EndpointAgent;
 
 internal sealed record WorkerResult(string State, string? InvocationOutcome, int? ExitCode, string? ExitCodeSource, bool HadErrors,
-    string Stdout, string Stderr, double? DurationMs, bool CaptureTruncated, int? LastNativeExitCode);
+    double? DurationMs, bool CaptureTruncated, int? LastNativeExitCode);
 
 internal sealed class WorkerProcess : IAsyncDisposable {
     public bool IsUsable { get; private set; } = true;
@@ -71,8 +71,6 @@ internal sealed class WorkerProcess : IAsyncDisposable {
     }
     public async Task<WorkerResult> Execute(string script, int timeoutMs, Func<string, string, Task> onOutput) {
         var watch = Stopwatch.StartNew();
-        using var stdout = new BoundedOutput();
-        using var stderr = new BoundedOutput();
         using var deadline = new CancellationTokenSource(timeoutMs);
         try {
             await writer.WriteLineAsync(JsonSerializer.Serialize(new { script }).AsMemory(), deadline.Token);
@@ -82,8 +80,6 @@ internal sealed class WorkerProcess : IAsyncDisposable {
                 if (message.RootElement.TryGetProperty("kind", out var kind) && kind.GetString() == "output") {
                     var stream = message.RootElement.GetProperty("stream").GetString() == "stdout" ? "stdout" : "stderr";
                     var text = message.RootElement.GetProperty("text").GetString();
-                    var target = stream == "stdout" ? stdout : stderr;
-                    target.Write(text);
                     if (!string.IsNullOrEmpty(text)) await onOutput(stream, text);
                     continue;
                 }
@@ -96,7 +92,7 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             stopped = await job.Stop();
             bool timeout = error is OperationCanceledException && stopped;
             return new WorkerResult(timeout ? "timed_out" : "outcome_unknown", timeout ? "stopped" : null,
-                null, null, false, stdout.ToString(), stderr.ToString(), watch.Elapsed.TotalMilliseconds, true, null);
+                null, null, false, watch.Elapsed.TotalMilliseconds, true, null);
         }
     }
     public async ValueTask DisposeAsync() {

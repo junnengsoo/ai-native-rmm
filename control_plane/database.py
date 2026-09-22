@@ -377,30 +377,14 @@ def append_execution_output(execution_id: uuid.UUID, stream: str, value: str,
                 text=chunk, byte_count=len(chunk.encode())))
         return sequences
 
-def _append_result_output_if_missing(connection: Connection, execution_id: uuid.UUID,
-                                    stream: str, value: object) -> None:
-    if not isinstance(value, str) or value == "":
-        return
-    exists = connection.execute(select(execution_output_events.c.sequence).where(
-        execution_output_events.c.execution_id == execution_id,
-        execution_output_events.c.stream == stream).limit(1)).first()
-    if exists is not None:
-        return
-    sequence = 1
-    for chunk in split_utf8_chunks(value):
-        connection.execute(insert(execution_output_events).values(
-            execution_id=execution_id, stream=stream, sequence=sequence,
-            text=chunk, byte_count=len(chunk.encode())))
-        sequence += 1
-
 def finish_execution(execution_id: uuid.UUID, result: dict[str, object]) -> None:
     values = {
         "status": result["state"], "invocation_outcome": result.get("invocationOutcome"),
         "outcome_reason": "endpoint_reported_unknown" if result["state"] == "outcome_unknown" else None,
         "last_confirmed_status": "running" if result["state"] == "outcome_unknown" else None,
         "exit_code": result.get("exitCode"), "exit_code_source": result.get("exitCodeSource"),
-        "had_errors": result.get("hadErrors"), "stdout": result.get("stdout"),
-        "stderr": result.get("stderr"), "duration_ms": result.get("durationMs"),
+        "had_errors": result.get("hadErrors"), "stdout": None, "stderr": None,
+        "duration_ms": result.get("durationMs"),
         "capture_truncated": result.get("captureTruncated"),
         "last_native_exit_code": result.get("lastNativeExitCode"), "finished_at": func.now(),
     }
@@ -410,8 +394,6 @@ def finish_execution(execution_id: uuid.UUID, result: dict[str, object]) -> None
         ).values(**values)).rowcount
         if changed != 1:
             raise RuntimeError("invalid_execution_transition")
-        _append_result_output_if_missing(connection, execution_id, "stdout", result.get("stdout"))
-        _append_result_output_if_missing(connection, execution_id, "stderr", result.get("stderr"))
 
 def mark_execution_unknown(execution_id: uuid.UUID, reason: str,
                            last_confirmed_status: str) -> None:
