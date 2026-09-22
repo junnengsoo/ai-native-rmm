@@ -175,7 +175,12 @@ try {
                 Select-Object -First 1
             if ($null -eq $beginInvoke) { throw 'compatible_begin_invoke_missing' }
             $genericBeginInvoke = $beginInvoke.MakeGenericMethod([psobject], [psobject])
-            $pending = $genericBeginInvoke.Invoke($powershell, [object[]]@($pipelineInput, $output))
+            # Array expressions enumerate PSDataCollection instances. Assigning
+            # fixed slots preserves the collection objects MethodInfo expects.
+            $invokeArguments = New-Object 'System.Object[]' 2
+            $invokeArguments[0] = $pipelineInput
+            $invokeArguments[1] = $output
+            $pending = $genericBeginInvoke.Invoke($powershell, $invokeArguments)
             while (-not $pending.IsCompleted) {
                 while ($outputIndex -lt $output.Count) {
                     [RmmProtocol]::WriteOutput($writer, 'stdout', ([string]$output[$outputIndex] + "`n"))
