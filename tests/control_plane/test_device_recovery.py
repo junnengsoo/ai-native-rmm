@@ -143,6 +143,16 @@ def test_recovery_requires_admin_and_fresh_proof_then_rotates_the_credential():
         }
         assert httpx.post(url, headers=admin, json={"code": code}).json() == approved.json()
 
+        with transaction() as connection:
+            credentials = connection.execute(device_credentials.select().where(
+                device_credentials.c.device_id == device_id
+            )).mappings().all()
+        by_public_key = {credential["public_key"]: credential for credential in credentials}
+        assert len(credentials) == 2
+        assert by_public_key[old_public]["replaces_credential_id"] is None
+        assert (by_public_key[new_public]["replaces_credential_id"]
+                == by_public_key[old_public]["id"])
+
         listed = httpx.get(BASE + "/devices", headers=admin).json()["devices"]
         assert listed[0]["id"] == device_id and listed[0]["device_name"] == "Reception PC"
 
@@ -163,6 +173,32 @@ def test_recovery_requires_admin_and_fresh_proof_then_rotates_the_credential():
 
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         assert prove(socket, old_key, old_public) == {"state": "denied"}
+
+    newest_key, newest_public = endpoint_key()
+    newest_code = pending(newest_key, newest_public)["code"]
+    response = httpx.post(
+        BASE + f"/devices/{device_id}/recover",
+        headers=admin,
+        json={"code": newest_code},
+    )
+    assert response.status_code == 200
+    with connect(BASE.replace("http", "ws") + "/agent") as socket:
+        assert prove(socket, newest_key, newest_public)["device_id"] == device_id
+
+    with transaction() as connection:
+        credentials = connection.execute(device_credentials.select().where(
+            device_credentials.c.device_id == device_id
+        )).mappings().all()
+    by_public_key = {credential["public_key"]: credential for credential in credentials}
+    assert len(credentials) == 3
+    assert by_public_key[old_public]["replaces_credential_id"] is None
+    assert (by_public_key[new_public]["replaces_credential_id"]
+            == by_public_key[old_public]["id"])
+    assert (by_public_key[newest_public]["replaces_credential_id"]
+            == by_public_key[new_public]["id"])
+
+    with connect(BASE.replace("http", "ws") + "/agent") as socket:
+        assert prove(socket, new_key, new_public) == {"state": "denied"}
 
 
 def test_recovery_refuses_revoked_devices_and_competing_replacements():
