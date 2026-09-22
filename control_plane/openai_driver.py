@@ -67,6 +67,7 @@ class DiagnosticContext:
     steps: list[StepTiming] = field(default_factory=list)
     scripts_submitted: int = 0
     owned_execution_ids: set[str] = field(default_factory=set)
+    terminal_execution_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -215,10 +216,11 @@ def execution_preview(result: dict[str, Any]) -> dict[str, Any] | None:
 
 
 async def _submit_script(ctx: DiagnosticContext, script: str, timeout_ms: int) -> dict[str, Any]:
-    if ctx.scripts_submitted >= ctx.max_steps:
-        raise DriverError("script_step_budget_exhausted")
     selected_timeout = min(validate_timeout_ms(timeout_ms), int(remaining_seconds(ctx) * 1000))
     script = validate_script(script)
+    if ctx.scripts_submitted >= ctx.max_steps:
+        raise DriverError("script_step_budget_exhausted")
+    ctx.scripts_submitted += 1
     started = time.perf_counter()
     submitted = await ctx.control_plane.submit_execution(
         ctx.session_id,
@@ -229,7 +231,6 @@ async def _submit_script(ctx: DiagnosticContext, script: str, timeout_ms: int) -
     api_ms = (time.perf_counter() - started) * 1000
     execution_id = submitted["execution_id"]
     ctx.owned_execution_ids.add(execution_id)
-    ctx.scripts_submitted += 1
     ctx.steps.append(StepTiming("submit_script", execution_id, api_ms, None, submitted["status"]))
     return {
         "execution_id": execution_id,
@@ -245,6 +246,8 @@ async def _wait_for_execution(ctx: DiagnosticContext, execution_id: str, timeout
     started = time.perf_counter()
     result = await ctx.control_plane.wait_execution(execution_id, selected_wait)
     api_ms = (time.perf_counter() - started) * 1000
+    if result.get("terminal"):
+        ctx.terminal_execution_ids.add(execution_id)
     ctx.steps.append(StepTiming(
         "wait_for_execution",
         execution_id,
@@ -411,9 +414,14 @@ async def drive_diagnostic(
             )
             final_report = str(run_result.final_output or "No final report returned by model.")
             required_scripts = min(2, max_steps)
-            completed = bool(run_result.final_output) and ctx.scripts_submitted >= required_scripts
-            if run_result.final_output and ctx.scripts_submitted < required_scripts:
-                final_report += "\nStopped before the required multi-step diagnostic depth was reached."
+            terminal_depth_met = len(ctx.terminal_execution_ids) >= required_scripts
+            all_submitted_terminal = (
+                ctx.scripts_submitted == len(ctx.owned_execution_ids)
+                and ctx.owned_execution_ids.issubset(ctx.terminal_execution_ids)
+            )
+            completed = bool(run_result.final_output) and terminal_depth_met and all_submitted_terminal
+            if run_result.final_output and not completed:
+                final_report += "\nStopped before terminal evidence for the required diagnostic depth was reached."
             usage = usage_from_run(run_result)
         except (asyncio.TimeoutError, TimeoutError):
             final_report = "Stopped because the configured diagnostic time budget was exhausted."
