@@ -111,6 +111,7 @@ $pipe = $null
 $reader = $null
 $writer = $null
 $runspace = $null
+$stage = 'pipe_connect'
 
 try {
     $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(
@@ -124,8 +125,10 @@ try {
     $writer = New-Object System.IO.StreamWriter($pipe, $utf8, 4096, $true)
     $writer.AutoFlush = $true
 
+    $stage = 'support_compile'
     Add-Type -TypeDefinition $support -Language CSharp
 
+    $stage = 'runspace_open'
     $hostAdapter = New-Object RmmInvocationHost
     $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($hostAdapter)
     $runspace.Open()
@@ -138,6 +141,7 @@ try {
         languageMode = $runspace.SessionStateProxy.LanguageMode.ToString()
     } | ConvertTo-Json -Compress
     [RmmProtocol]::WriteLine($writer, $ready)
+    $stage = 'running'
 
     [Console]::SetOut((New-Object RmmConsoleWriter($writer, 'stdout')))
     [Console]::SetError((New-Object RmmConsoleWriter($writer, 'stderr')))
@@ -238,7 +242,9 @@ try {
     }
 } catch {
     try {
-        if ($null -ne $writer) { $writer.WriteLine('startup_failed:NativePowerShell') }
+        $failure = 'startup_failed:' + $stage
+        if ($null -ne $writer) { $writer.WriteLine($failure) }
+        [Console]::Error.WriteLine($failure)
     } catch { }
     exit 1
 } finally {

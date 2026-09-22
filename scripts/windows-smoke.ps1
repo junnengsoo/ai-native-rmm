@@ -11,6 +11,12 @@ try {
     }
     dotnet build src/EndpointAgent -c Release --nologo
     if ($LASTEXITCODE) { throw 'Agent build failed' }
+    $worker = Join-Path $root 'src\EndpointAgent\bin\Release\net8.0\NativePowerShellWorker.ps1'
+    if (-not (Test-Path $worker)) { throw 'Native PowerShell worker was not copied to build output' }
+    $tokens = $null
+    $parseErrors = $null
+    [void][Management.Automation.Language.Parser]::ParseFile($worker, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw ('Native PowerShell worker parse failed: ' + ($parseErrors.Message -join '; ')) }
     dotnet tests/ProtocolHarness/bin/Release/net8.0/ProtocolHarness.dll "$root/src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll" $certs[0].Thumbprint $certs[1].Thumbprint $certs[2].Thumbprint
     if ($LASTEXITCODE) { throw 'External behavior suite failed' }
 } finally {

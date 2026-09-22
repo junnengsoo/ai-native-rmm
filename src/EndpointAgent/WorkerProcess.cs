@@ -55,7 +55,7 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             job.Dispose(); pipe.Dispose(); throw;
         }
         _ = Drain(process.StandardOutput);
-        _ = Drain(process.StandardError);
+        _ = DrainDiagnostics(process.StandardError);
         WorkerProcess? worker = null;
         try {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -120,6 +120,13 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         var buffer = new char[4096];
         while (await stream.ReadAsync(buffer) is var count && count > 0) {
             // Child diagnostics are not forwarded: scripts can write arbitrary bytes.
+        }
+    }
+
+    private static async Task DrainDiagnostics(StreamReader stream) {
+        while (await stream.ReadLineAsync() is { } line) {
+            if (line.StartsWith("startup_failed:", StringComparison.Ordinal) && line.Length < 100)
+                Console.Error.WriteLine(line);
         }
     }
 
