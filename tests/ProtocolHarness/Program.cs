@@ -49,6 +49,12 @@ try {
     string session = Guid.NewGuid().ToString();
     await Send(socket, OpenSession(device, session));
     Require((await Receive(socket)).GetProperty("type").GetString() == "session_ready", "real worker ready");
+    var engine = await ExecuteWithOutput("$PSVersionTable.PSEdition; $PSVersionTable.PSVersion.ToString(); [Environment]::Is64BitProcess; (Get-CimInstance Win32_OperatingSystem).Caption", 10000);
+    Require(engine.Result.GetProperty("state").GetString() == "completed"
+        && engine.Result.GetProperty("exitCode").GetInt32() == 0
+        && !engine.Result.GetProperty("hadErrors").GetBoolean()
+        && engine.Stdout.Contains("Desktop") && engine.Stdout.Contains("True") && engine.Stdout.Contains("Windows"),
+        "native 64-bit Windows PowerShell loads the inbox CimCmdlets module");
     var result = await ExecuteWithOutput("'hello from Windows'", 5000);
     Require(result.Result.GetProperty("state").GetString() == "completed"
         && result.Result.GetProperty("invocationOutcome").GetString() == "completed_normally"

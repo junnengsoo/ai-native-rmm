@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
@@ -26,15 +27,22 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         writer = new StreamWriter(pipe, new UTF8Encoding(false), 4096, true) { AutoFlush = true };
     }
     public static async Task<WorkerProcess> Start() {
+        string executable = NativeWindowsPowerShell();
+        string workerScript = Path.Combine(AppContext.BaseDirectory, "NativePowerShellWorker.ps1");
+        if (!File.Exists(workerScript)) throw new FileNotFoundException("native_powershell_worker_missing", workerScript);
         // The name is an unguessable local rendezvous, not a network listener.
         var name = "rmm-" + Guid.NewGuid().ToString("N");
         var pipe = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-        var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false,
+        var start = new ProcessStartInfo(executable) { UseShellExecute = false,
             RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
-        if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase))
-            start.ArgumentList.Add(typeof(WorkerProcess).Assembly.Location);
-        start.ArgumentList.Add("--worker"); start.ArgumentList.Add(name);
+        start.ArgumentList.Add("-NoLogo");
+        start.ArgumentList.Add("-NoProfile");
+        start.ArgumentList.Add("-NonInteractive");
+        start.ArgumentList.Add("-File");
+        start.ArgumentList.Add(workerScript);
+        start.ArgumentList.Add("-PipeName");
+        start.ArgumentList.Add(name);
         var allowed = new[] { "SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT", "ComSpec", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)", "ProgramData" };
         var environment = allowed.ToDictionary(key => key, Environment.GetEnvironmentVariable);
         start.Environment.Clear();
@@ -54,7 +62,7 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             await pipe.WaitForConnectionAsync(deadline.Token);
             worker = new WorkerProcess(pipe, process, job);
             var ready = await worker.reader.ReadLineAsync(deadline.Token);
-            if (ready != "ready") {
+            if (!NativeWorkerReady(ready)) {
                 if (ready is not null && ready.StartsWith("startup_failed:") && ready.Length < 100)
                     Console.Error.WriteLine(ready);
                 throw new InvalidDataException();
@@ -114,4 +122,34 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             // Child diagnostics are not forwarded: scripts can write arbitrary bytes.
         }
     }
+
+    private static bool NativeWorkerReady(string? value) {
+        try {
+            using var message = JsonDocument.Parse(value ?? "");
+            var root = message.RootElement;
+            return root.GetProperty("kind").GetString() == "ready"
+                && root.GetProperty("edition").GetString() == "Desktop"
+                && root.GetProperty("is64Bit").GetBoolean()
+                && root.GetProperty("version").GetString() is { Length: > 0 };
+        } catch (Exception error) when (error is JsonException or InvalidOperationException or KeyNotFoundException) {
+            return false;
+        }
+    }
+
+    private static string NativeWindowsPowerShell() {
+        if (!Environment.Is64BitProcess) throw new PlatformNotSupportedException("native_64_bit_powershell_required");
+        var system = new StringBuilder(260);
+        uint length = GetSystemDirectoryW(system, (uint)system.Capacity);
+        if (length >= (uint)system.Capacity) {
+            system.Capacity = checked((int)length);
+            length = GetSystemDirectoryW(system, (uint)system.Capacity);
+        }
+        if (length == 0 || length >= (uint)system.Capacity) throw new InvalidOperationException("system_directory_unavailable");
+        string executable = Path.Combine(system.ToString(), "WindowsPowerShell", "v1.0", "powershell.exe");
+        if (!File.Exists(executable)) throw new FileNotFoundException("native_powershell_unavailable", executable);
+        return executable;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetSystemDirectoryW(StringBuilder buffer, uint size);
 }

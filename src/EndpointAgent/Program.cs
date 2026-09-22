@@ -2,8 +2,7 @@ using EndpointAgent;
 
 try {
     if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
-    if (args is ["--worker", var pipe]) await PowerShellWorker.Run(pipe);
-    else if (args is ["--enroll", var endpoint, var keyName])
+    if (args is ["--enroll", var endpoint, var keyName])
         await Enrollment.Run(new Uri(endpoint), keyName);
     else if (args is ["--service"])
         WindowsServiceHost.RunService();

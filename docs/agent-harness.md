@@ -48,11 +48,15 @@ command, not a universal script outcome.
 error completion normalizes to 0; an unhandled terminating error normalizes to
 1. Explicit exit reports its requested code. Explicit exit deliberately retires
 the worker: close the old session and open a fresh one before further execution.
-The host observes the SDK's
-[`PSHost.SetShouldExit`](https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.host.pshost.setshouldexit?view=powershellsdk-7.4.0)
-callback; it does not infer explicit exit from a native command's exit value.
-The worker pins [Microsoft.PowerShell.SDK 7.4.13](https://www.nuget.org/packages/Microsoft.PowerShell.SDK/7.4.13)
-so Windows tests gate changes to these engine semantics.
+The host observes Windows PowerShell's `PSHost.SetShouldExit` callback; it does
+not infer explicit exit from a native command's exit value. The 64-bit agent
+resolves the canonical inbox engine through the Windows system-directory API
+and launches `System32\WindowsPowerShell\v1.0\powershell.exe` directly with
+`-NoLogo -NoProfile -NonInteractive`. It never searches `PATH` or silently
+falls back to another engine. The worker validates a 64-bit `Desktop` engine at
+startup and uses the native LocalSystem module discovery and policy environment.
+The Windows contract test requires the inbox `CimCmdlets` module to load through
+`Get-CimInstance` before accepting the worker.
 
 Local execution timeouts range from 100 ms to 60 minutes and must be selected by
 the caller on each `execute`. The agent enforces that runtime limit locally,
@@ -118,8 +122,10 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --agent wss://loca
 
 ## Recorded verification and limitations
 
-On 2026-09-21 the Mac wrapper ran the actual binaries on the existing Windows 11
-VM with .NET SDK 8.0.425 and hosted PowerShell 7.4.13. All three scenarios passed:
+On 2026-09-21 the Mac wrapper ran the previous embedded-runtime implementation
+on the existing Windows 11 VM with .NET SDK 8.0.425 and hosted PowerShell 7.4.13.
+That recorded run predates the native Windows PowerShell worker change. All three
+scenarios passed at that revision:
 
 - Invocation and persistent session: stdout/stderr output frames and
   correlation, terminal result metadata without duplicated output previews,
