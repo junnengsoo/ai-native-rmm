@@ -14,10 +14,15 @@ services:
       retries: 20
   control-plane:
     build: .
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
     environment:
       RMM_DATABASE_URL: postgresql://rmm:${RMM_POSTGRES_PASSWORD}@database/rmm
     ports:
-      - 127.0.0.1:18080:8000
+      - 127.0.0.1:${RMM_HTTP_PORT:-18080}:8000
     depends_on:
       database:
         condition: service_healthy

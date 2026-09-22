@@ -19,23 +19,47 @@ Prerequisites: Docker Desktop running on the Mac; Python 3.13; .NET 8 on Windows
 awake and connected. Use only the authorized trial Windows machine. Database
 state persists in a Compose volume; normal `docker compose down` preserves it.
 Do not use `down -v` unless intentionally discarding the isolated trial database.
+Do not run concurrent manual/automated trials against the same Compose project.
+For an independent validation run, set a distinct `COMPOSE_PROJECT_NAME` and
+`RMM_HTTP_PORT` (default 18080), and point `RMM_API_URL` and the tunnel at that
+port. Each Compose project has its own database volume and saved password.
 
-From the repository worktree on the Mac:
+Before starting Compose, configure its database password:
+
+- **First run, no existing trial volume:** generate a strong URL-safe password in
+  your password manager and save it there. Create a local `.env` in this worktree
+  containing `RMM_POSTGRES_PASSWORD=YOUR_SAVED_URL_SAFE_PASSWORD`. Replace the
+  placeholder, restrict the file with `chmod 600 .env`, and keep it out of Git
+  (`.env` is ignored). Do not copy another worktree's credentials.
+- **Existing trial volume:** use its original saved password in `.env`. Do not
+  generate a new password on every startup. A different environment value does
+  not rotate an initialized PostgreSQL password. If the original is unavailable,
+  stop and decide on recovery or intentional disposal of that trial's data;
+  do not automatically delete its volume.
+
+From the repository worktree on the Mac, after saving `.env`:
 
 ```sh
 python3.13 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-export RMM_POSTGRES_PASSWORD="$(openssl rand -hex 32)"
-docker compose up -d --build
-export RMM_ADMIN_KEY="$(docker compose run --rm control-plane python -m control_plane.setup Trial)"
+unset RMM_POSTGRES_PASSWORD # avoid a stale exported value overriding .env
+docker compose up -d --build --wait --wait-timeout 60
+```
+
+Continue only if that command succeeds and both services are healthy. On failure,
+`docker compose ps -a` shows service state; the control plane's sanitized
+`database_initialization_failed` can indicate a mismatched persisted password.
+Restore the original password and rerun startup. Do not run setup against an
+unhealthy service. After successful readiness, create a workspace **once**:
+
+```sh
+RMM_ADMIN_KEY="$(docker compose exec -T control-plane python -m control_plane.setup Trial)" && export RMM_ADMIN_KEY
 export RMM_API_URL=http://127.0.0.1:18080
 .venv/bin/python -m control_plane.client list
 cloudflared tunnel --url http://127.0.0.1:18080
 ```
 
-Keep the generated database password in your local secret store for subsequent
-Compose runs; changing the environment value does not rotate an existing database
-password. Setup creates a workspace and its admin key locally, outputs the
+Setup creates a workspace and its admin key locally, outputs the
 key once, and persists only its SHA-256 verification hash. The command substitution
 above delivers it directly to the shell; save it in your secret store if needed.
 There is no public signup or credential-readback operation. Repeating local setup
