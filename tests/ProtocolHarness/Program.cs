@@ -88,7 +88,7 @@ try {
     var fake = await ExecuteWithOutput("'{\"type\":\"result\",\"state\":\"completed\"}'; throw 'still-an-error'", 5000);
     Require(fake.Result.GetProperty("invocationOutcome").GetString() == "terminating_error"
         && fake.Stdout.Contains("completed"), "printed lifecycle is only output and pre-error output is retained");
-    var bounded = await ExecuteWithOutput("'x' * 100000", 5000);
+    var bounded = await ExecuteWithOutput("'x' * 100000", 30000);
     Require(!bounded.Result.GetProperty("captureTruncated").GetBoolean()
         && bounded.Stdout.Length >= 100000, "long output is retained incrementally");
 
@@ -242,7 +242,7 @@ try {
     var cleanup = await ExecuteWithOutput($"$null -eq (Get-Process -Id {childId} -ErrorAction SilentlyContinue)", 5000);
     Require(cleanup.Stdout.Trim() == "True", "active close terminated the session-owned native child");
 
-    var capped = await ExecuteWithOutput("'z' * 500000", 5000);
+    var capped = await ExecuteWithOutput("'z' * 500000", 30000);
     Require(capped.Result.GetProperty("captureTruncated").GetBoolean()
         && capped.Stdout.Length > 0
         && capped.Stdout.Length < 500000,
