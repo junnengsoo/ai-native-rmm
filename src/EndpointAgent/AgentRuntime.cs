@@ -190,6 +190,7 @@ internal static class AgentRuntime {
             state.SessionDeadline = null;
             transport.Wake();
         } else if (request.Type == "close_session" && request.SessionId == frame.Session && frame.Invocation is not null) {
+            Console.Error.WriteLine("[DEBUG-close] active_close_received");
             frame.CloseAfterInvocation = true;
             frame.InvocationStopReason = "cancelled";
             frame.InvocationStop?.Cancel();

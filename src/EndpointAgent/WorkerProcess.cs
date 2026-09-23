@@ -83,8 +83,10 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             while (true) {
                 var read = reader.ReadLineAsync();
                 var cancelled = Task.Delay(Timeout.InfiniteTimeSpan, stopSignal.Token);
-                if (await Task.WhenAny(read, cancelled) != read)
+                if (await Task.WhenAny(read, cancelled) != read) {
+                    Console.Error.WriteLine("[DEBUG-close] worker_cancellation_observed");
                     throw new OperationCanceledException(stopSignal.Token);
+                }
                 string line = await read ?? throw new EndOfStreamException();
                 using var message = JsonDocument.Parse(line);
                 if (message.RootElement.TryGetProperty("kind", out var kind) && kind.GetString() == "output") {
