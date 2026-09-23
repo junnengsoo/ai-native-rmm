@@ -314,7 +314,7 @@ def build_agent(model: str) -> Agent[DiagnosticContext]:
         model=model,
         instructions=INSTRUCTIONS,
         tools=[submit_script, wait_for_execution, read_output],
-        model_settings=ModelSettings(parallel_tool_calls=False, max_tokens=600, store=False, include_usage=True),
+        model_settings=ModelSettings(parallel_tool_calls=False, store=False, include_usage=True),
     )
 
 

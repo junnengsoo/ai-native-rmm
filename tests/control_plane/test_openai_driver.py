@@ -135,7 +135,7 @@ def test_agent_exposes_exactly_three_script_execution_tools():
     assert [tool.name for tool in agent.tools] == ["submit_script", "wait_for_execution", "read_output"]
     assert "run_diagnostic" not in {tool.name for tool in agent.tools}
     assert agent.model_settings.parallel_tool_calls is False
-    assert agent.model_settings.max_tokens == 600
+    assert agent.model_settings.max_tokens is None
 
     schemas = {tool.name: tool.params_json_schema["properties"] for tool in agent.tools}
     assert set(schemas["submit_script"]) == {"script", "timeout_ms"}
