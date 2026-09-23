@@ -75,11 +75,11 @@ that VM. No Linux VM or Python control plane is required. No SSH/RDP/public IP
 is needed. From this worktree:
 
 ```sh
-bash scripts/azure-smoke.sh
+bash scripts/mac/azure-smoke.sh
 ```
 
 The wrapper archives this checkout's source, deploys it to a unique directory
-under Windows Temp, and starts `scripts/windows-smoke.ps1` using Azure RunCommand.
+under Windows Temp, and starts `scripts/windows/windows-smoke.ps1` using Azure RunCommand.
 That script builds the binaries, creates isolated nonexportable certificates,
 starts the harness which launches the agent, and removes the test certificates
 and private keys afterward. Azure is only the deployment/test launcher: scripts
@@ -90,7 +90,7 @@ public arguments. Retained source/build files under Temp contain no private keys
 From a Windows checkout with .NET 8 on PATH:
 
 ```powershell
-.\scripts\windows-smoke.ps1
+.\scripts\windows\windows-smoke.ps1
 ```
 
 The suite also runs an independent reachability peer for [slice 2](enrollment.md).

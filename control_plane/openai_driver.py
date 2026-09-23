@@ -8,6 +8,8 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
 import httpx
@@ -334,17 +336,53 @@ def empty_sdk_usage() -> Usage:
     )
 
 
-class ModelLatencyHooks(RunHooks[DiagnosticContext]):
-    def __init__(self):
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def render_trace_value(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return inert_text(value)
+    try:
+        rendered = json.dumps(value, indent=2, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    return inert_text(rendered)
+
+
+class DiagnosticHooks(RunHooks[DiagnosticContext]):
+    def __init__(self, event_writer: Callable[[str], None] | None = None):
         self._started: list[float] = []
         self.model_latency_ms = 0.0
+        self.event_writer = event_writer
+
+    def emit(self, event: str, detail: Any | None = None) -> None:
+        if self.event_writer is None:
+            return
+        message = f"[{utc_timestamp()}] {event}"
+        if detail is not None:
+            message += "\n" + render_trace_value(detail)
+        self.event_writer(message)
 
     async def on_llm_start(self, context: RunContextWrapper[DiagnosticContext], agent: Agent[DiagnosticContext], system_prompt: str | None, input_items: list[Any]) -> None:
         self._started.append(time.perf_counter())
+        self.emit("MODEL CALL started", {"model": str(agent.model)})
 
     async def on_llm_end(self, context: RunContextWrapper[DiagnosticContext], agent: Agent[DiagnosticContext], response: Any) -> None:
         if self._started:
-            self.model_latency_ms += (time.perf_counter() - self._started.pop()) * 1000
+            elapsed_ms = (time.perf_counter() - self._started.pop()) * 1000
+            self.model_latency_ms += elapsed_ms
+            self.emit("MODEL CALL completed", {"elapsed_ms": round(elapsed_ms, 1)})
+
+    async def on_tool_start(self, context: RunContextWrapper[DiagnosticContext], agent: Agent[DiagnosticContext], tool: Any) -> None:
+        arguments = getattr(context, "tool_arguments", None)
+        self.emit("TOOL CALL " + tool.name, arguments if arguments is not None else {})
+
+    async def on_tool_end(self, context: RunContextWrapper[DiagnosticContext], agent: Agent[DiagnosticContext], tool: Any, result: object) -> None:
+        self.emit("TOOL RESULT " + tool.name, result)
 
 
 async def drive_diagnostic(
@@ -357,6 +395,7 @@ async def drive_diagnostic(
     max_seconds: int | float = DEFAULT_MAX_SECONDS,
     cleanup_seconds: int = DEFAULT_CLEANUP_SECONDS,
     runner: Callable[..., Any] = Runner.run,
+    event_writer: Callable[[str], None] | None = None,
 ) -> DiagnosticResult:
     if isinstance(max_steps, bool) or not 1 <= max_steps <= 20:
         raise DriverError("invalid_max_steps")
@@ -365,12 +404,14 @@ async def drive_diagnostic(
 
     deadline = time.perf_counter() + float(max_seconds)
     session_id = (await control_plane.open_session(device_id, timeout_seconds=max(MIN_TIMEOUT_SECONDS, max_seconds)))["session_id"]
+    if event_writer is not None:
+        event_writer(f"[{utc_timestamp()}] SESSION opened\n" + render_trace_value({"session_id": session_id, "device_id": device_id}))
     ctx = DiagnosticContext(control_plane, session_id, deadline, max_steps)
     final_report = ""
     completed = False
     usage: dict[str, int] = {}
     started = time.perf_counter()
-    hooks = ModelLatencyHooks()
+    hooks = DiagnosticHooks(event_writer)
     try:
         prompt = (
             f"Problem: {problem}\n"
@@ -414,6 +455,12 @@ async def drive_diagnostic(
             closed, close_error = await control_plane.close_session(session_id, timeout_seconds=cleanup_seconds)
         except Exception as error:
             closed, close_error = False, "transport:" + type(error).__name__
+        if event_writer is not None:
+            event_writer(f"[{utc_timestamp()}] SESSION close\n" + render_trace_value({
+                "session_id": session_id,
+                "closed": closed,
+                "error": close_error,
+            }))
     total_ms = (time.perf_counter() - started) * 1000
     if not closed:
         final_report += "\nCommand failure: closure_unconfirmed."
@@ -438,29 +485,144 @@ def render_result(result: DiagnosticResult) -> str:
     return "\n".join(lines)
 
 
+def load_connection_config(path: str) -> dict[str, str]:
+    value = json.loads(Path(path).read_text())
+    if not isinstance(value, dict):
+        raise ValueError("invalid_connection_config")
+    allowed = {"api_url", "operator_api_key", "device_id"}
+    if set(value) - allowed:
+        raise ValueError("invalid_connection_config")
+    return {key: str(item) for key, item in value.items() if item is not None}
+
+
+async def run_problem(
+    problem: str,
+    *,
+    device_id: str,
+    control_plane: ControlPlaneClient,
+    model: str,
+    max_steps: int,
+    max_seconds: int,
+    verbose: bool,
+) -> DiagnosticResult:
+    writer = print if verbose else None
+    result = await drive_diagnostic(
+        problem=problem,
+        device_id=device_id,
+        control_plane=control_plane,
+        model=model,
+        max_steps=max_steps,
+        max_seconds=max_seconds,
+        event_writer=writer,
+    )
+    print("\n" + render_result(result))
+    return result
+
+
+async def interactive_loop(
+    *,
+    device_id: str,
+    control_plane: ControlPlaneClient,
+    model: str,
+    max_steps: int,
+    max_seconds: int,
+    verbose: bool,
+    initial_problem: str | None = None,
+    prompt: Callable[[str], str] = input,
+) -> int:
+    print("AI-Native RMM diagnostic console")
+    print(f"Endpoint: {device_id}")
+    print(f"Model: {model}")
+    print("Each question uses a fresh endpoint session. Type :help or :quit.\n")
+    last_rendered: str | None = None
+    next_problem = initial_problem
+    failures = 0
+    while True:
+        if next_problem is None:
+            try:
+                problem = await asyncio.to_thread(prompt, "diagnose> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+        else:
+            problem, next_problem = next_problem, None
+        problem = problem.strip()
+        if not problem:
+            continue
+        if problem in {":quit", ":exit"}:
+            break
+        if problem == ":help":
+            print(":help  Show commands\n:last  Reprint the previous report\n:quit  Exit")
+            continue
+        if problem == ":last":
+            print(last_rendered or "No diagnostic has completed yet.")
+            continue
+        if problem.startswith(":"):
+            print("Unknown command. Type :help.")
+            continue
+        try:
+            result = await run_problem(
+                problem,
+                device_id=device_id,
+                control_plane=control_plane,
+                model=model,
+                max_steps=max_steps,
+                max_seconds=max_seconds,
+                verbose=verbose,
+            )
+            last_rendered = render_result(result)
+            if not (result.closed and result.completed):
+                failures += 1
+        except Exception as error:
+            failures += 1
+            print(f"[{utc_timestamp()}] DIAGNOSTIC failed: {type(error).__name__}")
+    print("Diagnostic console closed.")
+    return 1 if failures else 0
+
+
 async def amain(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the caller-side OpenAI diagnostic driver.")
-    parser.add_argument("problem")
+    parser.add_argument("problem", nargs="?")
+    parser.add_argument("--interactive", action="store_true", help="Prompt for multiple independent diagnostics.")
+    parser.add_argument("--quiet", action="store_true", help="Hide timestamped model and tool events.")
+    parser.add_argument("--config", help="Read api_url, operator_api_key, and device_id from a JSON file.")
     parser.add_argument("--base-url", default=os.environ.get("RMM_API_URL", "http://127.0.0.1:18080"))
     parser.add_argument("--device-id", default=os.environ.get("RMM_DEVICE_ID"))
     parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL", DEFAULT_MODEL))
     parser.add_argument("--max-steps", type=int, default=int(os.environ.get("RMM_OPENAI_DRIVER_MAX_STEPS", DEFAULT_MAX_STEPS)))
     parser.add_argument("--max-seconds", type=int, default=int(os.environ.get("RMM_OPENAI_DRIVER_MAX_SECONDS", DEFAULT_MAX_SECONDS)))
     args = parser.parse_args(argv)
-    operator_key = os.environ.get("RMM_OPERATOR_KEY")
+    config = load_connection_config(args.config) if args.config else {}
+    if args.base_url == "http://127.0.0.1:18080" and "api_url" in config and "RMM_API_URL" not in os.environ:
+        args.base_url = config["api_url"]
+    if args.device_id is None:
+        args.device_id = config.get("device_id")
+    operator_key = os.environ.get("RMM_OPERATOR_KEY") or config.get("operator_api_key")
     if not operator_key or not args.device_id:
         raise RuntimeError("set RMM_OPERATOR_KEY and RMM_DEVICE_ID/--device-id")
+    if not args.problem and not args.interactive:
+        parser.error("provide a problem or use --interactive")
     control_plane = ControlPlaneClient(args.base_url, operator_key)
     try:
-        result = await drive_diagnostic(
-            problem=args.problem,
+        if args.interactive:
+            return await interactive_loop(
+                initial_problem=args.problem,
+                device_id=args.device_id,
+                control_plane=control_plane,
+                model=args.model,
+                max_steps=args.max_steps,
+                max_seconds=args.max_seconds,
+                verbose=not args.quiet,
+            )
+        result = await run_problem(
+            args.problem,
             device_id=args.device_id,
             control_plane=control_plane,
             model=args.model,
             max_steps=args.max_steps,
             max_seconds=args.max_seconds,
+            verbose=not args.quiet,
         )
-        print(render_result(result))
         return 0 if result.closed and result.completed else 1
     finally:
         await control_plane.aclose()

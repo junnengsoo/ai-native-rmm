@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $env:PATH = "C:\rmm-test-runtime;$env:PATH"
-$root = Split-Path $PSScriptRoot -Parent
+$root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Set-Location $root
 dotnet build tests/ProtocolHarness -c Release --nologo
 if ($LASTEXITCODE) { throw 'Harness build failed' }

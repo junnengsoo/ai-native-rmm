@@ -25,6 +25,34 @@ The model is instructed to author only read-only diagnostic PowerShell and never
 to remediate. That is a policy boundary, not an enforced PowerShell sandbox:
 this prototype currently runs endpoint scripts as Windows `LocalSystem`.
 
+## Reviewer console
+
+After `demo start`, Windows enrollment, and `demo approve`, launch the guided
+console from the control-plane machine:
+
+```sh
+./demo.sh ai
+```
+
+The Windows control-plane equivalent is `.\Demo.ps1 ai`. The launcher reads the
+generated `.demo/demo-connection.json` and prompts without echoing for an OpenAI
+key when `OPENAI_API_KEY` is not already set. It does not save that key. Use
+`:help`, `:last`, or `:quit` at the prompt.
+
+Each question opens and closes a fresh endpoint debugging session. The console
+prints UTC-timestamped model-call boundaries, session open/close events, every
+model-visible tool's bounded arguments and returned value, per-step timing,
+aggregate model latency, and usage when supplied by the SDK. Endpoint/model text
+is rendered inertly so terminal-control characters cannot act on the caller's
+terminal. Authorization and OpenAI credentials are not part of the model-visible
+tool surface and are not printed.
+
+For a single non-interactive question:
+
+```sh
+./demo.sh ai --once "Why can this Windows machine not reach the file server?"
+```
+
 ## Deterministic tests
 
 Run the driver tests without contacting OpenAI:

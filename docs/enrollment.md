@@ -200,7 +200,7 @@ created inside Compose. Replace the tunnel hostname with the current trusted URL
 
 ```sh
 RMM_WINDOWS_WSS=wss://YOUR-TUNNEL.trycloudflare.com/agent .venv/bin/python -m pytest -q -s tests/control_plane/test_windows.py
-bash scripts/azure-smoke.sh
+bash scripts/mac/azure-smoke.sh
 ```
 
 The smoke creates one retained device record in that workspace and selects its
