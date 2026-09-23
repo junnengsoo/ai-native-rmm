@@ -222,7 +222,7 @@ try {
     var closeCancelled = (await WaitRecord(record => IsRecord(record, "execution_finished", closeExecution))).GetProperty("data");
     Require(closeCancelled.GetProperty("state").GetString() == "cancelled"
         && closeCancelled.GetProperty("invocationOutcome").GetString() == "stopped",
-        "active close cancels the invocation truthfully");
+        "active close cancels the invocation truthfully; actual=" + closeCancelled.GetRawText());
     await WaitRecord(record => record.GetProperty("recordType").GetString() == "session_closed"
         && record.GetProperty("data").GetProperty("sessionId").GetString() == session);
     await OpenReplacementSession();
