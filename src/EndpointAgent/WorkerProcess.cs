@@ -69,10 +69,9 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             throw;
         }
     }
-    public async Task<WorkerResult> Execute(string script, int timeoutMs, Func<string, string, Task> onOutput,
+    public async Task<WorkerResult> Execute(string script, Func<string, string, Task> onOutput,
                                             CancellationToken cancellation) {
         var watch = Stopwatch.StartNew();
-        _ = timeoutMs; // Protocol compatibility only; endpoint execution has no separate per-execution deadline.
         using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         try {
             await writer.WriteLineAsync(JsonSerializer.Serialize(new { script }).AsMemory(), stopSignal.Token);

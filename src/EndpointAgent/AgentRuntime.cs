@@ -209,7 +209,7 @@ internal static class AgentRuntime {
             frame.CurrentScriptHash = scriptHash;
             frame.CloseAfterInvocation = false;
             frame.Invocation = CompleteAndLedger(socket, transport, ledger, device, frame.Worker, frame.Session!, execution,
-                scriptHash, request.Script!, request.TimeoutMs, frame.InvocationStop.Token);
+                scriptHash, request.Script!, frame.InvocationStop.Token);
             state.Invocation = frame.Invocation;
             await TrySendPendingLedger(socket, transport, ledger, device);
         } else if (request.Type == "cancel_execution" && request.SessionId == frame.Session
@@ -224,11 +224,10 @@ internal static class AgentRuntime {
 
     private static async Task<(string Session, string Execution, string ScriptSha256, WorkerResult Result)> CompleteAndLedger(
         WebSocket socket, LedgerTransport transport, EndpointLedger ledger, string device, WorkerProcess worker,
-        string session, string execution, string scriptSha256, string script, int timeoutMs,
-        CancellationToken cancellation) {
+        string session, string execution, string scriptSha256, string script, CancellationToken cancellation) {
         ledger.ExecutionStarted(session, execution, scriptSha256);
         await TrySendPendingLedger(socket, transport, ledger, device);
-        var result = await worker.Execute(script, timeoutMs, async (stream, text) => {
+        var result = await worker.Execute(script, async (stream, text) => {
             ledger.OutputChunk(session, execution, scriptSha256, stream, text);
             await TrySendPendingLedger(socket, transport, ledger, device);
         }, cancellation);

@@ -24,7 +24,7 @@ from .database import (
     get_execution_output_page, get_execution_output_preview, get_live_device_session,
     get_workspace_device, get_workspace_execution, get_workspace_session, increment_rate_limit,
     ingest_endpoint_ledger_batch,
-    initialize, list_workspace_devices, mark_bound_execution_rejected,
+    initialize, list_workspace_devices,
     mark_execution_dispatch_requested, mark_execution_failed_to_start,
     mark_device_revocation_cleanup_unknown,
     mark_queued_execution_cancelled, mark_session_cleanup_unknown,
@@ -58,6 +58,7 @@ terminal_waiters_lock = asyncio.Lock()
 
 MAX_RUNTIME_MS = 3_600_000
 CLEANUP_GRACE_SECONDS = 30
+DISPATCH_RETRY_SECONDS = 1.0
 
 
 @app.middleware("http")
@@ -545,21 +546,25 @@ async def get_session(session_id: uuid.UUID, authorization: str | None = Header(
     return session_view(row)
 
 
-async def send_execution_command(execution_id: uuid.UUID, channel, device_id: str) -> None:
-    row = await asyncio.to_thread(mark_execution_dispatch_requested, execution_id)
-    if row is None:
-        return
-    try:
-        await channel.send({
-            "type": "execute", "deviceId": device_id, "sessionId": str(row["session_id"]),
-            "executionId": str(execution_id), "script": row["script"],
-            "scriptSha256": row["script_sha256"], "timeoutMs": row["timeout_ms"],
-        })
-    except Exception:
-        # After durable dispatch intent, a socket failure is ambiguous: the
-        # endpoint might still accept and run the execution. Ledger replay owns
-        # the eventual materialized state.
-        return
+async def send_execution_command(execution_id: uuid.UUID, device_id: str,
+                                 retry_seconds: float = DISPATCH_RETRY_SECONDS) -> None:
+    while True:
+        row = await asyncio.to_thread(mark_execution_dispatch_requested, execution_id)
+        if row is None:
+            return
+        channel = await endpoint_agents.get_connected_channel(device_id)
+        if channel is not None:
+            try:
+                await channel.send({
+                    "type": "execute", "deviceId": device_id, "sessionId": str(row["session_id"]),
+                    "executionId": str(execution_id), "script": row["script"],
+                    "scriptSha256": row["script_sha256"], "timeoutMs": row["timeout_ms"],
+                })
+            except Exception:
+                pass
+        # Once dispatch intent is durable, delivery remains ambiguous until the
+        # endpoint ledger accepts or terminally reconciles the execution.
+        await asyncio.sleep(retry_seconds)
 
 
 @app.post("/sessions/{session_id}/executions", status_code=202)
@@ -591,7 +596,7 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
             row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], row["id"])
             await notify_terminal(row["id"])
         else:
-            asyncio.create_task(send_execution_command(row["id"], channel, str(session["device_id"])))
+            asyncio.create_task(send_execution_command(row["id"], str(session["device_id"])))
     return {"execution_id": str(row["id"]), "status": row["status"],
             "script_sha256": row["script_sha256"]}
 
@@ -761,15 +766,6 @@ async def endpoint_agent(socket: WebSocket):
                 if message.get("deviceId") != status["device_id"]:
                     raise ValueError()
                 if message["type"] == "rejected":
-                    execution_id = message.get("executionId")
-                    session_id = message.get("sessionId")
-                    if execution_id and session_id and message.get("code") == "reconciliation_pending":
-                        changed = await asyncio.to_thread(
-                            mark_bound_execution_rejected,
-                            uuid.UUID(status["device_id"]), uuid.UUID(str(session_id)),
-                            uuid.UUID(str(execution_id)), "endpoint_rejected_reconciliation_pending")
-                        if changed:
-                            await notify_terminal(execution_id)
                     continue
                 try:
                     applied = await asyncio.to_thread(

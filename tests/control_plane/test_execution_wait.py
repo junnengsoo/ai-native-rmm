@@ -179,3 +179,45 @@ def test_endpoint_disconnect_does_not_finalize_or_wake_terminal_wait(monkeypatch
         asyncio.run(_endpoint_disconnect_does_not_finalize_or_wake_terminal_wait(monkeypatch))
     finally:
         clear_waiters()
+
+
+async def _dispatch_retry_keeps_reconciliation_pending_work_live(monkeypatch):
+    execution_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    device_id = uuid.uuid4()
+    row = {
+        "id": execution_id,
+        "session_id": session_id,
+        "script": "'ok'",
+        "script_sha256": "a" * 64,
+        "timeout_ms": 5000,
+    }
+    attempts = 0
+    sent = []
+
+    def fake_mark_dispatch(requested_execution_id):
+        nonlocal attempts
+        assert requested_execution_id == execution_id
+        attempts += 1
+        return row if attempts <= 2 else None
+
+    class Channel:
+        async def send(self, message):
+            sent.append(message)
+
+    async def fake_connected_channel(requested_device_id):
+        assert requested_device_id == str(device_id)
+        return Channel()
+
+    monkeypatch.setattr(app_module, "mark_execution_dispatch_requested", fake_mark_dispatch)
+    monkeypatch.setattr(app_module.endpoint_agents, "get_connected_channel", fake_connected_channel)
+
+    await app_module.send_execution_command(execution_id, str(device_id), retry_seconds=0.001)
+
+    assert attempts == 3
+    assert [message["executionId"] for message in sent] == [str(execution_id), str(execution_id)]
+    assert all(message["sessionId"] == str(session_id) for message in sent)
+
+
+def test_dispatch_retry_keeps_reconciliation_pending_work_live(monkeypatch):
+    asyncio.run(_dispatch_retry_keeps_reconciliation_pending_work_live(monkeypatch))

@@ -903,25 +903,6 @@ def ingest_endpoint_ledger_batch(device_id: uuid.UUID | str, ledger_id: str,
         "closed_session_ids": closed_session_ids,
     }
 
-def mark_bound_execution_rejected(device_id: uuid.UUID | str, session_id: uuid.UUID | str,
-                                  execution_id: uuid.UUID | str, reason: str) -> bool:
-    with transaction() as connection:
-        row = connection.execute(select(executions.c.id).join(
-            sessions, sessions.c.id == executions.c.session_id).where(
-            executions.c.id == uuid.UUID(str(execution_id)),
-            executions.c.session_id == uuid.UUID(str(session_id)),
-            sessions.c.device_id == uuid.UUID(str(device_id)),
-            executions.c.status == "queued",
-        ).with_for_update()).scalar_one_or_none()
-        if row is None:
-            return False
-        connection.execute(update(executions).where(
-            executions.c.id == row,
-            executions.c.status == "queued",
-        ).values(status="failed_to_start", outcome_reason=reason[:64],
-                 last_confirmed_status="queued", finished_at=func.now()))
-        return True
-
 def mark_execution_failed_to_start(execution_id: uuid.UUID, reason: str) -> None:
     with transaction() as connection:
         connection.execute(update(executions).where(

@@ -199,21 +199,3 @@ def test_startup_recovery_fails_only_provably_undispatched_work():
     database.recover_interrupted_work()
     row = database.get_workspace_execution(workspace_id, replayable_execution["id"])
     assert row["status"] == "queued"
-
-
-def test_rejected_dispatch_is_bound_and_duplicate_rejection_does_not_finalize():
-    ctx = ledger_fixture("bound-rejection")
-    changed = database.mark_bound_execution_rejected(
-        ctx["device_id"], ctx["session_id"], ctx["execution_id"],
-        "endpoint_rejected_reconciliation_pending")
-    assert changed is True
-    row = database.get_workspace_execution(ctx["workspace_id"], ctx["execution_id"])
-    assert row["status"] == "failed_to_start"
-
-    other = ledger_fixture("duplicate-rejection")
-    changed = database.mark_bound_execution_rejected(
-        uuid.uuid4(), other["session_id"], other["execution_id"],
-        "endpoint_rejected_reconciliation_pending")
-    assert changed is False
-    row = database.get_workspace_execution(other["workspace_id"], other["execution_id"])
-    assert row["status"] == "queued"
