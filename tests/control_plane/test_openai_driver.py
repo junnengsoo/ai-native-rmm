@@ -2,16 +2,19 @@ import asyncio
 import ast
 import hashlib
 import json
+import re
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from agents import Model, ModelResponse, RunContextWrapper
+from agents.tool_context import ToolContext
 from agents.usage import InputTokensDetails, OutputTokensDetails, Usage
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
 
 from control_plane.openai_driver import (
     ControlPlaneClient,
+    DiagnosticHooks,
     DiagnosticContext,
     DriverError,
     _inspect_output,
@@ -20,6 +23,8 @@ from control_plane.openai_driver import (
     build_agent,
     drive_diagnostic,
     inert_text,
+    interactive_loop,
+    load_connection_config,
     render_result,
 )
 
@@ -139,7 +144,7 @@ def test_agent_exposes_exactly_three_script_execution_tools():
     assert [tool.name for tool in agent.tools] == ["submit_script", "wait_for_execution", "inspect_output"]
     assert "run_diagnostic" not in {tool.name for tool in agent.tools}
     assert agent.model_settings.parallel_tool_calls is False
-    assert agent.model_settings.max_tokens == 600
+    assert agent.model_settings.max_tokens is None
 
     schemas = {tool.name: tool.params_json_schema["properties"] for tool in agent.tools}
     assert set(schemas["submit_script"]) == {"script"}
@@ -347,6 +352,7 @@ class ScriptedModel(Model):
 def test_real_agents_sdk_runner_loop_submit_wait_read_dependent_script_and_reports():
     model = ScriptedModel()
     control_plane = FakeControlPlane()
+    events = []
     result = asyncio.run(drive_diagnostic(
         problem="Why can Windows not reach the test share?",
         device_id="device-1",
@@ -354,6 +360,7 @@ def test_real_agents_sdk_runner_loop_submit_wait_read_dependent_script_and_repor
         model=model,
         max_steps=2,
         max_seconds=60,
+        event_writer=events.append,
     ))
 
     assert model.calls == 7
@@ -379,6 +386,10 @@ def test_real_agents_sdk_runner_loop_submit_wait_read_dependent_script_and_repor
         "wait_for_execution",
         "inspect_output:search:stdout",
     ]
+    assert any("TOOL CALL submit_script" in event and "Resolve-DnsName" in event for event in events)
+    assert any("TOOL RESULT submit_script" in event and "exec-1" in event for event in events)
+    assert any("TOOL RESULT wait_for_execution" in event and "DNS resolves" in event for event in events)
+    assert any("SESSION close" in event and '"closed": true' in event for event in events)
 
 
 def test_drive_diagnostic_delegates_loop_to_runner_and_closes_session():
@@ -621,3 +632,84 @@ def test_terminal_rendering_escapes_untrusted_control_sequences():
     assert "\r" not in rendered
     assert "\\x1b]0;pwned\\x07\\x0dbad" in rendered
     assert inert_text("a\x1b\rb") == "a\\x1b\\x0db"
+
+
+def test_diagnostic_hooks_render_timestamped_tool_arguments_and_results_safely():
+    events = []
+    hooks = DiagnosticHooks(events.append)
+    agent = build_agent("gpt-5-nano")
+    tool = agent.tools[0]
+    ctx = ToolContext(
+        context(),
+        usage=SimpleNamespace(),
+        tool_name="submit_script",
+        tool_call_id="call-1",
+        tool_arguments=json.dumps({"script": "Get-Date\x1b]0;bad\x07", "timeout_ms": 5000}),
+    )
+
+    asyncio.run(hooks.on_tool_start(ctx, agent, tool))
+    asyncio.run(hooks.on_tool_end(ctx, agent, tool, {"status": "queued\r", "execution_id": "exec-1"}))
+
+    assert len(events) == 2
+    assert all(re.match(r"^\[\d{4}-\d{2}-\d{2}T.*Z\]", event) for event in events)
+    assert "TOOL CALL submit_script" in events[0]
+    assert '"timeout_ms": 5000' in events[0]
+    assert "\x1b" not in events[0]
+    assert "\\u001b]0;bad\\u0007" in events[0]
+    assert "TOOL RESULT submit_script" in events[1]
+    assert "queued\\r" in events[1]
+
+
+def test_connection_config_loads_only_caller_fields(tmp_path):
+    path = tmp_path / "demo-connection.json"
+    path.write_text(json.dumps({
+        "api_url": "https://rmm.example",
+        "operator_api_key": "rmm_operator",
+        "device_id": "device-1",
+    }))
+
+    assert load_connection_config(str(path)) == {
+        "api_url": "https://rmm.example",
+        "operator_api_key": "rmm_operator",
+        "device_id": "device-1",
+    }
+
+    path.write_text(json.dumps({"api_url": "https://rmm.example", "admin_key": "must-not-load"}))
+    with pytest.raises(ValueError, match="invalid_connection_config"):
+        load_connection_config(str(path))
+
+
+def test_interactive_loop_runs_fresh_diagnostics_and_supports_commands(monkeypatch, capsys):
+    prompts = iter([":help", "first problem", ":last", "second problem", ":quit"])
+    calls = []
+
+    async def fake_run_problem(problem, **kwargs):
+        calls.append(problem)
+        return SimpleNamespace(
+            final_report="report for " + problem,
+            steps=[],
+            model_latency_ms=0,
+            total_ms=1,
+            usage={},
+            completed=True,
+            closed=True,
+            close_error=None,
+        )
+
+    monkeypatch.setattr("control_plane.openai_driver.run_problem", fake_run_problem)
+    result = asyncio.run(interactive_loop(
+        device_id="device-1",
+        control_plane=FakeControlPlane(),
+        model="gpt-5-nano",
+        max_steps=2,
+        max_seconds=60,
+        verbose=True,
+        prompt=lambda _: next(prompts),
+    ))
+
+    assert result == 0
+    assert calls == ["first problem", "second problem"]
+    output = capsys.readouterr().out
+    assert "Each question uses a fresh endpoint session" in output
+    assert "report for first problem" in output
+    assert "Diagnostic console closed." in output

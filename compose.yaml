@@ -26,5 +26,12 @@ services:
     depends_on:
       database:
         condition: service_healthy
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://control-plane:8000
+    profiles: [tunnel]
+    depends_on:
+      control-plane:
+        condition: service_healthy
 volumes:
   database:

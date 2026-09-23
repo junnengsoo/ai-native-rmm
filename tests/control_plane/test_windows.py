@@ -154,7 +154,7 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         child_script = "$p=Start-Process -FilePath $env:ComSpec -ArgumentList '/c ping -n 60 127.0.0.1 > nul' -PassThru; $p.Id; Start-Sleep -Seconds 20"
         child_submit = httpx.post(BASE + f"/sessions/{session}/executions", headers={
             **operator, "Idempotency-Key": "active-close-child",
-        }, json={"script": child_script, "timeout_ms": 500})
+        }, json={"script": child_script, "timeout_ms": 30_000})
         child_submit.raise_for_status()
         child_execution = child_submit.json()["execution_id"]
         child_id = None

@@ -111,7 +111,11 @@ internal static class AgentRuntime {
                 if (frame.Invocation is not null) {
                     incoming ??= Receive(socket, ReceiveWait(frame));
                     var ready = await Task.WhenAny(incoming, frame.Invocation);
-                    if (ready == frame.Invocation) {
+                    // When the invocation and a newly received command become ready
+                    // together, finalize the invocation first. The receive task stays
+                    // buffered for the next loop iteration, after CurrentExecution is
+                    // cleared and the worker/session transition has completed.
+                    if (frame.Invocation.IsCompleted) {
                         var completed = await frame.Invocation;
                         await FinalizeCompletedInvocation(ledger, completed, frame, state);
                         transport.Wake();
@@ -208,9 +212,9 @@ internal static class AgentRuntime {
             frame.CurrentExecution = execution;
             frame.CurrentScriptHash = scriptHash;
             frame.CloseAfterInvocation = false;
-            frame.InvocationStopReason = "cancelled";
+            frame.InvocationStopReason = "timed_out";
             RefreshSessionDeadline(frame, state);
-            ArmInvocationDeadline(frame);
+            ArmInvocationDeadline(frame, request.TimeoutMs);
             frame.Invocation = CompleteAndLedger(socket, transport, ledger, device, frame.Worker, frame.Session!, execution,
                 scriptHash, request.Script!, frame.InvocationStop.Token, () => CancellationState(frame));
             state.Invocation = frame.Invocation;
@@ -357,9 +361,11 @@ internal static class AgentRuntime {
         state.SessionDeadline = frame.SessionDeadline;
     }
 
-    private static void ArmInvocationDeadline(RuntimeFrame frame) {
+    private static void ArmInvocationDeadline(RuntimeFrame frame, int timeoutMs) {
         if (frame.InvocationStop is null || frame.SessionDeadline is not { } deadline) return;
-        var remaining = deadline - DateTimeOffset.UtcNow;
+        var remaining = TimeSpan.FromMilliseconds(timeoutMs);
+        var sessionRemaining = deadline - DateTimeOffset.UtcNow;
+        if (sessionRemaining < remaining) remaining = sessionRemaining;
         if (remaining <= TimeSpan.Zero) frame.InvocationStop.Cancel();
         else frame.InvocationStop.CancelAfter(remaining);
     }

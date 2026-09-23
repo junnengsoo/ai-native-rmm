@@ -2,6 +2,8 @@
 !requirements.txt
 !control_plane/
 !control_plane/*.py
+!control_plane/demo/
+!control_plane/demo/*.py
 !alembic.ini
 !migrations/
 !migrations/*.py

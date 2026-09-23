@@ -88,8 +88,9 @@ try {
     var fake = await ExecuteWithOutput("'{\"type\":\"result\",\"state\":\"completed\"}'; throw 'still-an-error'", 5000);
     Require(fake.Result.GetProperty("invocationOutcome").GetString() == "terminating_error"
         && fake.Stdout.Contains("completed"), "printed lifecycle is only output and pre-error output is retained");
-    var bounded = await ExecuteWithOutput("'x' * 100000", 5000);
-    Require(!bounded.Result.GetProperty("captureTruncated").GetBoolean()
+    var bounded = await ExecuteWithOutput("'x' * 100000", 60000);
+    Require(bounded.Result.GetProperty("state").GetString() == "completed"
+        && !bounded.Result.GetProperty("captureTruncated").GetBoolean()
         && bounded.Stdout.Length >= 100000, "long output is retained incrementally");
 
     var explicitExit = await Execute("exit 23", 5000);
@@ -128,6 +129,19 @@ try {
     await Rejected(duplicate, "duplicate execution");
     Require((await ExecuteWithOutput("$global:duplicateCounter", 5000)).Stdout.Trim() == "1",
         "rejected duplicate does not repeat its side effect");
+
+    var timeoutWatch = Stopwatch.StartNew();
+    var timedOut = await ExecuteWithOutput("'started'; Start-Sleep -Seconds 10; 'finished'", 500);
+    timeoutWatch.Stop();
+    Require(timedOut.Result.GetProperty("state").GetString() == "timed_out"
+        && timedOut.Result.GetProperty("invocationOutcome").GetString() == "stopped"
+        && timedOut.Result.GetProperty("exitCode").ValueKind == JsonValueKind.Null
+        && timedOut.Stdout.Contains("started") && !timedOut.Stdout.Contains("finished")
+        && timeoutWatch.Elapsed < TimeSpan.FromSeconds(5),
+        "execution timeout stops the invocation at its requested deadline");
+    await Rejected(Request("'must-not-run'"), "timed-out worker is retired");
+    await OpenReplacementSession();
+    Console.WriteLine("PASS per-execution timeout scenario");
 
     string reconnectExecution = Guid.NewGuid().ToString();
     string reconnectScript = "$global:lateEvidence=1; Start-Sleep -Seconds 3; $global:lateEvidence=2";
@@ -229,8 +243,9 @@ try {
     var cleanup = await ExecuteWithOutput($"$null -eq (Get-Process -Id {childId} -ErrorAction SilentlyContinue)", 5000);
     Require(cleanup.Stdout.Trim() == "True", "active close terminated the session-owned native child");
 
-    var capped = await ExecuteWithOutput("'z' * 500000", 5000);
-    Require(capped.Result.GetProperty("captureTruncated").GetBoolean()
+    var capped = await ExecuteWithOutput("'z' * 500000", 120000);
+    Require(capped.Result.GetProperty("state").GetString() == "completed"
+        && capped.Result.GetProperty("captureTruncated").GetBoolean()
         && capped.Stdout.Length > 0
         && capped.Stdout.Length < 500000,
         "endpoint ledger capacity records output loss without blocking lifecycle records");

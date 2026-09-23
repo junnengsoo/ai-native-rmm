@@ -4,6 +4,7 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 
 ## Project documents
 
+- [Reviewer quick start](QUICKSTART.md) — ZIP setup, Windows transfer, pairing, and caller handoff
 - [Software spec and implementation tickets](https://github.com/junnengsoo/ai-native-rmm/issues/1) — authoritative agreed scope, dependencies, and open assumptions
 - [Delivery and operations checklist](https://github.com/junnengsoo/ai-native-rmm/issues/2) — submission and trial cleanup obligations
 - [Domain glossary](CONTEXT.md) — shared terminology
