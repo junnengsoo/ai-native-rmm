@@ -51,11 +51,12 @@ value is evidence about the last native command, not a universal script outcome.
 error completion normalizes to 0; an unhandled terminating error normalizes to
 1. Explicit exit reports its requested code. Explicit exit deliberately retires
 the worker: close the old session and open a fresh one before further execution.
-The host observes the SDK's
+The native worker host observes PowerShell's
 [`PSHost.SetShouldExit`](https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.host.pshost.setshouldexit?view=powershellsdk-7.4.0)
 callback; it does not infer explicit exit from a native command's exit value.
-The worker pins [Microsoft.PowerShell.SDK 7.4.13](https://www.nuget.org/packages/Microsoft.PowerShell.SDK/7.4.13)
-so Windows tests gate changes to these engine semantics.
+The endpoint launches a private 64-bit Windows PowerShell `Desktop` worker
+process through `NativePowerShellWorker.ps1`; Windows tests gate changes to
+those native engine semantics.
 
 The wire format still accepts bounded `timeoutMs` values for compatibility, but
 the agent does not enforce a separate per-execution deadline. Authenticated
@@ -122,10 +123,11 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --agent wss://loca
 ## Recorded verification and limitations
 
 The most recent recorded real-Windows run for this harness was on 2026-09-21,
-before the issue-10 rebase. For the current issue-10 pass, the harness source
-and endpoint project were build-checked locally, but a fresh authorized Windows
-VM smoke was not run in this environment. The recorded 2026-09-21 run used the
-existing Windows 11 VM with .NET SDK 8.0.425 and hosted PowerShell 7.4.13:
+before the issue-10 rebase and before the native worker-mode restoration in this
+branch. For the current issue-10 pass, the harness source and endpoint project
+were build-checked locally, but a fresh authorized Windows VM smoke was not run
+in this environment. The recorded 2026-09-21 run used the existing Windows 11 VM
+with .NET SDK 8.0.425 and the previous hosted PowerShell 7.4.13 worker:
 
 - Invocation and persistent session: stdout/stderr output frames and
   correlation, terminal result metadata without duplicated output previews,

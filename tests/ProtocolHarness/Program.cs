@@ -25,6 +25,8 @@ builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 1
 var sockets = Channel.CreateUnbounded<(int Accepted, WebSocket Socket)>();
 var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 int acceptedSockets = 0;
+string dataRoot = Path.Combine(Path.GetTempPath(), "rmm-harness-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(dataRoot);
 await using var app = builder.Build();
 app.UseWebSockets();
 app.Map("/agent", async context => {
@@ -144,6 +146,25 @@ try {
         "active invocation survives reconnect and reports ordinary terminal result");
     var reconnectState = await ExecuteWithOutput("$global:lateEvidence", 5000);
     Require(reconnectState.Stdout.Trim() == "2", "reconnected invocation ran exactly once to completion");
+
+    string retransmitExecution = Guid.NewGuid().ToString();
+    var retransmit = Request("$global:ackDropCounter++; $global:ackDropCounter");
+    retransmit["executionId"] = retransmitExecution;
+    await Send(socket, retransmit);
+    var terminalWithoutAck = await WaitRecordWithoutAck(record => IsRecord(record, "execution_finished", retransmitExecution));
+    long retransmitSequence = terminalWithoutAck.GetProperty("sequence").GetInt64();
+    int acceptedBeforeAckDropReconnect = Volatile.Read(ref acceptedSockets);
+    socket.Abort();
+    socket = await NextSocketAfter(acceptedBeforeAckDropReconnect);
+    var ackDropHello = await Receive(socket);
+    Require(ackDropHello.GetProperty("type").GetString() == "hello"
+        && ackDropHello.GetProperty("deviceId").GetString() == device, "agent reconnects after dropped ack");
+    var resentTerminal = await WaitRecord(record => IsRecord(record, "execution_finished", retransmitExecution)
+        && record.GetProperty("sequence").GetInt64() == retransmitSequence);
+    Require(resentTerminal.GetProperty("data").GetProperty("state").GetString() == "completed",
+        "dropped ack retransmits terminal evidence");
+    var counterAfterRetransmit = await ExecuteWithOutput("$global:ackDropCounter", 5000);
+    Require(counterAfterRetransmit.Stdout.Trim() == "1", "dropped ack retransmission does not rerun the script");
 
     string cancelledExecution = Guid.NewGuid().ToString();
     var cancelRequest = Request("'before-cancel'; Start-Sleep -Seconds 20");
@@ -280,10 +301,35 @@ try {
                 ledger_id = message.GetProperty("ledgerId").GetString(),
                 acknowledged_through = acknowledgedThrough
             });
+            JsonElement? matched = null;
             foreach (var record in records) {
+                if (matched is null && predicate(record)) matched = record;
+                else queuedRecords.Enqueue(record);
+            }
+            if (matched is not null) return matched.Value;
+        }
+    }
+
+    async Task<JsonElement> WaitRecordWithoutAck(Func<JsonElement, bool> predicate) {
+        while (true) {
+            int queuedCount = queuedRecords.Count;
+            for (int i = 0; i < queuedCount; i++) {
+                var record = queuedRecords.Dequeue();
                 if (predicate(record)) return record;
                 queuedRecords.Enqueue(record);
             }
+            var message = await Receive(socket);
+            if (message.GetProperty("type").GetString() != "ledger_batch")
+                throw new InvalidOperationException("Expected ledger_batch: " + message.GetRawText());
+            var records = message.GetProperty("records").EnumerateArray().Select(record => record.Clone()).ToArray();
+            if (records.Any(predicate)) return records.First(predicate);
+            long acknowledgedThrough = records.Max(record => record.GetProperty("sequence").GetInt64());
+            await Send(socket, new {
+                type = "ledger_ack",
+                ledger_id = message.GetProperty("ledgerId").GetString(),
+                acknowledged_through = acknowledgedThrough
+            });
+            foreach (var record in records) queuedRecords.Enqueue(record);
         }
     }
 
@@ -306,6 +352,7 @@ try {
         catch (TimeoutException) { agent.Kill(true); await agent.WaitForExitAsync(); }
     }
     await app.StopAsync();
+    try { Directory.Delete(dataRoot, recursive: true); } catch { }
 }
 
 await EnrollmentScenario.Run(args[0], serverCert);
@@ -324,6 +371,7 @@ Process StartAgent(string thumbprint, string? pin = null) => Process.Start(new P
     Environment = {
         ["RMM_TEST_SECRET"] = "isolated-dummy-secret",
         ["RMM_ENDPOINT_LEDGER_CAPACITY_BYTES"] = "2000000",
+        ["RMM_ENDPOINT_DATA_DIR"] = dataRoot,
     },
     ArgumentList = { args[0], "--agent", "wss://localhost:18443/agent", thumbprint,
         pin ?? Convert.ToHexString(SHA256.HashData(serverCert.RawData)).ToLowerInvariant(), "test-device" }

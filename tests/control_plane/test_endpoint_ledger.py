@@ -155,6 +155,24 @@ def test_worker_stopped_preserves_prior_output_loss_reason():
     assert row["output_loss_reason"] == "endpoint_ledger_capacity_exceeded"
 
 
+def test_worker_stopped_without_confirmed_cleanup_marks_session_cleanup_unknown():
+    ctx = ledger_fixture("ledger-worker-stopped-unconfirmed")
+    base = binding(ctx)
+    ingest(ctx,
+           record(2, "execution_accepted", base),
+           record(3, "execution_started", base),
+           record(4, "worker_stopped", {
+               **base,
+               "reason": "cleanup_unconfirmed",
+               "cleanupConfirmed": False,
+               "captureTruncated": True,
+           }))
+    row = database.get_workspace_execution(ctx["workspace_id"], ctx["execution_id"])
+    assert row["status"] == "outcome_unknown"
+    session = database.get_workspace_session(ctx["workspace_id"], ctx["session_id"])
+    assert session["state"] == "cleanup_unknown"
+
+
 def test_startup_recovery_fails_only_provably_undispatched_work():
     database.initialize()
     workspace_id, admin_id = database.create_workspace_with_admin(

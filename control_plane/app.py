@@ -24,7 +24,8 @@ from .database import (
     get_execution_output_page, get_execution_output_preview, get_live_device_session,
     get_workspace_device, get_workspace_execution, get_workspace_session, increment_rate_limit,
     ingest_endpoint_ledger_batch,
-    initialize, list_workspace_devices,
+    initialize, list_retryable_execution_dispatches, list_retryable_session_dispatches,
+    list_workspace_devices,
     mark_execution_dispatch_requested, mark_execution_failed_to_start,
     mark_device_revocation_cleanup_unknown,
     mark_queued_execution_cancelled, mark_session_cleanup_unknown,
@@ -49,6 +50,7 @@ async def lifespan(app):
         recover_interrupted_work()
     except Exception:
         raise RuntimeError("database_initialization_failed") from None
+    await restart_durable_dispatch_retries()
     yield
 
 
@@ -504,6 +506,31 @@ async def fail_device_investigations_and_notify(device_id: uuid.UUID | str) -> N
         await notify_terminal(execution_id)
 
 
+async def restart_durable_dispatch_retries() -> None:
+    session_rows = await asyncio.to_thread(list_retryable_session_dispatches)
+    for row in session_rows:
+        asyncio.create_task(send_session_open_command(row["id"], str(row["device_id"])))
+    execution_rows = await asyncio.to_thread(list_retryable_execution_dispatches)
+    for row in execution_rows:
+        asyncio.create_task(send_execution_command(row["id"], str(row["device_id"])))
+
+
+async def send_session_open_command(session_id: uuid.UUID, device_id: str,
+                                    retry_seconds: float = DISPATCH_RETRY_SECONDS) -> None:
+    while True:
+        row = await asyncio.to_thread(mark_session_dispatch_requested, session_id)
+        if row is None:
+            return
+        channel = await endpoint_agents.get_connected_channel(device_id)
+        if channel is not None:
+            try:
+                await channel.send({"type": "open_session", "deviceId": device_id,
+                                    "sessionId": str(session_id)})
+            except Exception:
+                pass
+        await asyncio.sleep(retry_seconds)
+
+
 @app.post("/sessions", status_code=201)
 async def create_session(body: SessionCreation, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
@@ -526,8 +553,7 @@ async def create_session(body: SessionCreation, authorization: str | None = Head
     session_id = str(row["id"])
     ready = channel.expect("session_ready", session_id)
     try:
-        await asyncio.to_thread(mark_session_dispatch_requested, row["id"])
-        await channel.send({"type": "open_session", "deviceId": str(body.device_id), "sessionId": session_id})
+        asyncio.create_task(send_session_open_command(row["id"], str(body.device_id)))
         await asyncio.wait_for(ready, 20)
     except Exception:
         # Sending and waiting are delivery-ambiguous once dispatch intent is
@@ -596,6 +622,10 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
             row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], row["id"])
             await notify_terminal(row["id"])
         else:
+            asyncio.create_task(send_execution_command(row["id"], str(session["device_id"])))
+    elif row["status"] == "queued":
+        session = await asyncio.to_thread(get_workspace_session, caller["workspace_id"], session_id)
+        if session is not None and await endpoint_agents.get_connected_channel(str(session["device_id"])) is not None:
             asyncio.create_task(send_execution_command(row["id"], str(session["device_id"])))
     return {"execution_id": str(row["id"]), "status": row["status"],
             "script_sha256": row["script_sha256"]}

@@ -6,7 +6,9 @@ using System.Text.Json;
 namespace EndpointAgent;
 
 internal sealed record WorkerResult(string State, string? InvocationOutcome, int? ExitCode, string? ExitCodeSource, bool HadErrors,
-    double? DurationMs, bool CaptureTruncated, int? LastNativeExitCode);
+    double? DurationMs, bool CaptureTruncated, int? LastNativeExitCode) {
+    public bool? CleanupConfirmed { get; init; }
+}
 
 internal sealed class WorkerProcess : IAsyncDisposable {
     public bool IsUsable { get; private set; } = true;
@@ -53,8 +55,8 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             await pipe.WaitForConnectionAsync(deadline.Token);
             worker = new WorkerProcess(pipe, process, job);
-            var ready = await worker.reader.ReadLineAsync(deadline.Token);
-            if (ready != "ready") {
+            string? ready = await worker.reader.ReadLineAsync(deadline.Token);
+            if (!NativeWorkerReady(ready)) {
                 if (ready is not null && ready.StartsWith("startup_failed:") && ready.Length < 100)
                     Console.Error.WriteLine(ready);
                 throw new InvalidDataException();
@@ -70,7 +72,8 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         }
     }
     public async Task<WorkerResult> Execute(string script, Func<string, string, Task> onOutput,
-                                            CancellationToken cancellation) {
+                                            CancellationToken cancellation,
+                                            Func<string> cancellationState) {
         var watch = Stopwatch.StartNew();
         using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         try {
@@ -85,7 +88,11 @@ internal sealed class WorkerProcess : IAsyncDisposable {
                     continue;
                 }
                 var result = JsonSerializer.Deserialize<WorkerResult>(line)!;
-                if (result.InvocationOutcome == "explicit_exit") { IsUsable = false; stopped = await job.Stop(); }
+                if (result.InvocationOutcome == "explicit_exit") {
+                    IsUsable = false;
+                    stopped = await job.Stop();
+                    return result with { CleanupConfirmed = stopped };
+                }
                 return result;
             }
         } catch (Exception error) when (error is OperationCanceledException or IOException or JsonException) {
@@ -93,10 +100,12 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             stopped = await job.Stop();
             bool confirmedCancellation = error is OperationCanceledException && stopped;
             string? state = confirmedCancellation && cancellation.IsCancellationRequested
-                ? "cancelled"
+                ? cancellationState()
                 : "outcome_unknown";
             return new WorkerResult(state, confirmedCancellation ? "stopped" : null,
-                null, null, false, watch.Elapsed.TotalMilliseconds, true, null);
+                null, null, false, watch.Elapsed.TotalMilliseconds, true, null) {
+                CleanupConfirmed = stopped,
+            };
         }
     }
     public async ValueTask DisposeAsync() {
@@ -111,6 +120,19 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         var buffer = new char[4096];
         while (await stream.ReadAsync(buffer) is var count && count > 0) {
             // Child diagnostics are not forwarded: scripts can write arbitrary bytes.
+        }
+    }
+
+    private static bool NativeWorkerReady(string? value) {
+        try {
+            using var message = JsonDocument.Parse(value ?? "");
+            var root = message.RootElement;
+            return root.GetProperty("kind").GetString() == "ready"
+                && root.GetProperty("edition").GetString() == "Desktop"
+                && root.GetProperty("is64Bit").GetBoolean()
+                && root.GetProperty("version").GetString() is { Length: > 0 };
+        } catch (Exception error) when (error is JsonException or InvalidOperationException or KeyNotFoundException) {
+            return false;
         }
     }
 }

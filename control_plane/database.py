@@ -501,14 +501,13 @@ def create_starting_session(workspace_id: uuid.UUID, caller_id: uuid.UUID,
             raise RuntimeError("device_busy") from None
         raise
 
-def mark_session_dispatch_requested(session_id: uuid.UUID) -> None:
+def mark_session_dispatch_requested(session_id: uuid.UUID) -> RowMapping | None:
     with transaction() as connection:
-        changed = connection.execute(update(sessions).where(
+        row = connection.execute(update(sessions).where(
             sessions.c.id == session_id, sessions.c.state == "starting"
         ).values(dispatch_requested_at=func.coalesce(
-            sessions.c.dispatch_requested_at, func.now()))).rowcount
-        if changed != 1:
-            raise RuntimeError("invalid_session_transition")
+            sessions.c.dispatch_requested_at, func.now())).returning(sessions)).mappings().one_or_none()
+        return row
 
 def mark_session_cleanup_unknown(session_id: uuid.UUID) -> None:
     with transaction() as connection:
@@ -582,6 +581,28 @@ def mark_execution_dispatch_requested(execution_id: uuid.UUID) -> RowMapping | N
         ).values(dispatch_requested_at=func.coalesce(
             executions.c.dispatch_requested_at, func.now())).returning(executions)
         ).mappings().one_or_none()
+
+def list_retryable_session_dispatches() -> list[RowMapping]:
+    with transaction() as connection:
+        return list(connection.execute(select(
+            sessions.c.id, sessions.c.device_id,
+        ).join(devices, devices.c.id == sessions.c.device_id).where(
+            sessions.c.state == "starting",
+            sessions.c.dispatch_requested_at.is_not(None),
+            devices.c.authorization_status == "active",
+        )).mappings())
+
+def list_retryable_execution_dispatches() -> list[RowMapping]:
+    with transaction() as connection:
+        return list(connection.execute(select(
+            executions.c.id, sessions.c.device_id,
+        ).join(sessions, sessions.c.id == executions.c.session_id)
+         .join(devices, devices.c.id == sessions.c.device_id).where(
+            executions.c.status == "queued",
+            executions.c.dispatch_requested_at.is_not(None),
+            sessions.c.state == "active",
+            devices.c.authorization_status == "active",
+        )).mappings())
 
 def split_utf8_chunks(value: str, limit: int = 8192) -> list[str]:
     chunks, current, size = [], [], 0
@@ -806,6 +827,12 @@ def _apply_ledger_record(connection: Connection, device_id: uuid.UUID, record_ty
                 sessions.c.device_id == device_id,
                 sessions.c.state.in_(("starting", "active", "closing", "cleanup_unknown")),
             ).values(state="lost", closed_at=func.now()))
+        else:
+            connection.execute(update(sessions).where(
+                sessions.c.id == session_id,
+                sessions.c.device_id == device_id,
+                sessions.c.state.in_(("starting", "active", "closing")),
+            ).values(state="cleanup_unknown", closed_at=func.now()))
     elif record_type == "session_closed":
         _require_fields(data, {"sessionId"})
         session_id = _uuid(data["sessionId"], "session_id")

@@ -221,3 +221,73 @@ async def _dispatch_retry_keeps_reconciliation_pending_work_live(monkeypatch):
 
 def test_dispatch_retry_keeps_reconciliation_pending_work_live(monkeypatch):
     asyncio.run(_dispatch_retry_keeps_reconciliation_pending_work_live(monkeypatch))
+
+
+async def _session_dispatch_retry_keeps_starting_session_live(monkeypatch):
+    session_id = uuid.uuid4()
+    device_id = uuid.uuid4()
+    row = {"id": session_id, "device_id": device_id}
+    attempts = 0
+    sent = []
+
+    def fake_mark_session_dispatch(requested_session_id):
+        nonlocal attempts
+        assert requested_session_id == session_id
+        attempts += 1
+        return row if attempts <= 2 else None
+
+    class Channel:
+        async def send(self, message):
+            sent.append(message)
+
+    async def fake_connected_channel(requested_device_id):
+        assert requested_device_id == str(device_id)
+        return Channel()
+
+    monkeypatch.setattr(app_module, "mark_session_dispatch_requested", fake_mark_session_dispatch)
+    monkeypatch.setattr(app_module.endpoint_agents, "get_connected_channel", fake_connected_channel)
+
+    await app_module.send_session_open_command(session_id, str(device_id), retry_seconds=0.001)
+
+    assert attempts == 3
+    assert [message["sessionId"] for message in sent] == [str(session_id), str(session_id)]
+    assert all(message["type"] == "open_session" for message in sent)
+
+
+def test_session_dispatch_retry_keeps_starting_session_live(monkeypatch):
+    asyncio.run(_session_dispatch_retry_keeps_starting_session_live(monkeypatch))
+
+
+async def _startup_restarts_durable_dispatch_retries(monkeypatch):
+    session_id = uuid.uuid4()
+    execution_id = uuid.uuid4()
+    device_id = uuid.uuid4()
+    restarted_sessions = []
+    restarted_executions = []
+
+    def fake_sessions():
+        return [{"id": session_id, "device_id": device_id}]
+
+    def fake_executions():
+        return [{"id": execution_id, "device_id": device_id}]
+
+    async def fake_session_retry(restarted_session_id, restarted_device_id):
+        restarted_sessions.append((restarted_session_id, restarted_device_id))
+
+    async def fake_execution_retry(restarted_execution_id, restarted_device_id):
+        restarted_executions.append((restarted_execution_id, restarted_device_id))
+
+    monkeypatch.setattr(app_module, "list_retryable_session_dispatches", fake_sessions)
+    monkeypatch.setattr(app_module, "list_retryable_execution_dispatches", fake_executions)
+    monkeypatch.setattr(app_module, "send_session_open_command", fake_session_retry)
+    monkeypatch.setattr(app_module, "send_execution_command", fake_execution_retry)
+
+    await app_module.restart_durable_dispatch_retries()
+    await asyncio.sleep(0)
+
+    assert restarted_sessions == [(session_id, str(device_id))]
+    assert restarted_executions == [(execution_id, str(device_id))]
+
+
+def test_startup_restarts_durable_dispatch_retries(monkeypatch):
+    asyncio.run(_startup_restarts_durable_dispatch_retries(monkeypatch))

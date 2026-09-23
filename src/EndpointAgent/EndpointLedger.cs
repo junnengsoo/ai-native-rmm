@@ -21,6 +21,7 @@ internal sealed class AgentRuntimeState {
     public WorkerProcess? Worker { get; set; }
     public Task<(string Session, string Execution, string ScriptSha256, WorkerResult Result)>? Invocation { get; set; }
     public CancellationTokenSource? InvocationStop { get; set; }
+    public DateTimeOffset? SessionDeadline { get; set; }
 }
 
 internal sealed class EndpointLedger {
@@ -56,9 +57,8 @@ internal sealed class EndpointLedger {
 
     public EndpointLedger(string deviceId) {
         this.deviceId = deviceId;
-        string baseRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "AiNativeRmm");
         string name = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(deviceId))).ToLowerInvariant();
-        root = Path.Combine(baseRoot, "ledger-" + name);
+        root = Path.Combine(EndpointPaths.DataDirectory, "ledger-" + name);
         Directory.CreateDirectory(root);
         checkpointPath = Path.Combine(root, "ack.json");
         executionClaimPath = Path.Combine(root, "execution-claims.jsonl");
@@ -191,7 +191,7 @@ internal sealed class EndpointLedger {
         lock (gate) {
             if (!string.Equals(ledgerId, LedgerId, StringComparison.Ordinal) || acknowledged < acknowledgedThrough)
                 return;
-            long highest = records.Count == 0 ? 0 : records[^1].Sequence;
+            long highest = Math.Max(durableThrough, records.Count == 0 ? 0 : records[^1].Sequence);
             acknowledgedThrough = Math.Min(acknowledged, highest);
             SaveCheckpoint();
             shouldPrune = safePruneThrough > 0 && Math.Min(acknowledgedThrough, safePruneThrough) > 0;
@@ -398,11 +398,11 @@ internal sealed class EndpointLedger {
             if (pruneThrough <= 0) return;
             activeSegment = currentSegmentPath;
         }
-        _ = Task.Run(() => PruneAcknowledgedClosedSegments(root, activeSegment, pruneThrough));
+        _ = Task.Run(() => PruneAcknowledgedClosedSegments(activeSegment, pruneThrough));
     }
 
-    private static void PruneAcknowledgedClosedSegments(string ledgerRoot, string activeSegment, long pruneThrough) {
-        foreach (var file in Directory.GetFiles(ledgerRoot, "segment-*.jsonl").OrderBy(name => name, StringComparer.Ordinal)) {
+    private void PruneAcknowledgedClosedSegments(string activeSegment, long pruneThrough) {
+        foreach (var file in Directory.GetFiles(root, "segment-*.jsonl").OrderBy(name => name, StringComparer.Ordinal)) {
             if (string.Equals(file, activeSegment, StringComparison.Ordinal)) continue;
             long max = SegmentMaxSequence(file);
             if (max > 0 && max <= pruneThrough) {
@@ -410,6 +410,9 @@ internal sealed class EndpointLedger {
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
             }
+        }
+        lock (gate) {
+            records.RemoveAll(record => record.Sequence <= pruneThrough);
         }
     }
 
