@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -54,6 +55,39 @@ def prove(socket, key, public):
         "signature": base64.b64encode(signature).decode(),
     }))
     return json.loads(socket.recv())
+
+
+def recv_command(socket, timeout=None):
+    while True:
+        raw = socket.recv(timeout=timeout) if timeout is not None else socket.recv()
+        message = json.loads(raw)
+        if message["type"] in {"heartbeat_ack", "ledger_ack"}:
+            continue
+        return message
+
+
+def ledger_sender():
+    ledger_id = "revocation-ledger-" + uuid.uuid4().hex
+    sequence = 0
+
+    def send(socket, device_id, records):
+        nonlocal sequence
+        payload = []
+        for record_type, data in records:
+            sequence += 1
+            payload.append({
+                "sequence": sequence,
+                "recordType": record_type,
+                "endpointObservedAt": "2026-09-22T00:00:00Z",
+                "data": data,
+            })
+        socket.send(json.dumps({
+            "type": "ledger_batch",
+            "deviceId": device_id,
+            "ledgerId": ledger_id,
+            "records": payload,
+        }))
+    return send
 
 
 def approve(admin):
@@ -115,24 +149,23 @@ def test_connected_revocation_closes_a_live_session_and_preserves_its_record():
 
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         assert prove(socket, key, public)["state"] == "online"
+        send_ledger = ledger_sender()
 
         def endpoint_peer():
-            opened = json.loads(socket.recv())
+            opened = recv_command(socket)
             assert opened["type"] == "open_session" and opened["deviceId"] == device
-            socket.send(json.dumps({
-                "type": "session_ready", "deviceId": device,
-                "sessionId": opened["sessionId"],
-            }))
+            send_ledger(socket, device, [
+                ("session_started", {"sessionId": opened["sessionId"]}),
+            ])
             endpoint_ready.set()
-            closed = json.loads(socket.recv())
+            closed = recv_command(socket)
             assert closed == {
                 "type": "close_session", "deviceId": device,
                 "sessionId": opened["sessionId"],
             }
-            socket.send(json.dumps({
-                "type": "session_closed", "deviceId": device,
-                "sessionId": opened["sessionId"],
-            }))
+            send_ledger(socket, device, [
+                ("session_closed", {"sessionId": opened["sessionId"]}),
+            ])
             try:
                 socket.recv()
             except ConnectionClosed:
@@ -166,21 +199,25 @@ def test_unconfirmed_revocation_cleanup_is_reported_as_unknown_without_waiting_f
 
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         assert prove(socket, key, public)["state"] == "online"
+        send_ledger = ledger_sender()
 
         def endpoint_peer():
-            opened = json.loads(socket.recv())
-            socket.send(json.dumps({
-                "type": "session_ready", "deviceId": device,
-                "sessionId": opened["sessionId"],
-            }))
-            executed = json.loads(socket.recv())
-            socket.send(json.dumps({
-                "type": "running", "deviceId": device,
+            opened = recv_command(socket)
+            send_ledger(socket, device, [
+                ("session_started", {"sessionId": opened["sessionId"]}),
+            ])
+            executed = recv_command(socket)
+            binding = {
                 "sessionId": opened["sessionId"],
                 "executionId": executed["executionId"],
-            }))
+                "scriptSha256": executed["scriptSha256"],
+            }
+            send_ledger(socket, device, [
+                ("execution_accepted", binding),
+                ("execution_started", binding),
+            ])
             execution_started.set()
-            assert json.loads(socket.recv())["type"] == "close_session"
+            assert recv_command(socket)["type"] == "close_session"
             socket.close()
 
         with ThreadPoolExecutor(1) as pool:

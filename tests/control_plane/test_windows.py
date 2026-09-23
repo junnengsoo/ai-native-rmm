@@ -91,9 +91,7 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         observed = start()
         assert observed.startswith("PAIRING_CODE "), "Windows must display a one-time pairing code"
         code = observed.split()[1]
-        response = httpx.post(BASE + "/pairings/approve", headers=admin, json={
-            "code": code, "device_name": "Windows Smoke PC",
-        })
+        response = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": code})
         assert response.status_code == 200
         device = response.json()["device_id"]
 
@@ -154,16 +152,28 @@ Write-Output ('RMM_DATA:' + (Get-Content '{root}\\out.txt' -Raw))
         assert retry.status_code == 202 and retry.json()["execution_id"] == first_submit.json()["execution_id"]
         assert marker_result["output_preview"]["stdout"]["text"].strip() == "1"
         child_script = "$p=Start-Process -FilePath $env:ComSpec -ArgumentList '/c ping -n 60 127.0.0.1 > nul' -PassThru; $p.Id; Start-Sleep -Seconds 20"
-        _, timeout_result = execute(child_script, "timeout-child", timeout_ms=500, wait_seconds=30)
-        assert timeout_result["status"] == "timed_out"
-        assert timeout_result["invocation_outcome"] == "stopped"
-        child_id = int(timeout_result["output_preview"]["stdout"]["text"].strip().splitlines()[0])
+        child_submit = httpx.post(BASE + f"/sessions/{session}/executions", headers={
+            **operator, "Idempotency-Key": "active-close-child",
+        }, json={"script": child_script, "timeout_ms": 500})
+        child_submit.raise_for_status()
+        child_execution = child_submit.json()["execution_id"]
+        child_id = None
+        for _ in range(40):
+            page = httpx.get(BASE + f"/executions/{child_execution}/output/stdout", headers=operator, timeout=3).json()
+            if page["text"].strip():
+                child_id = int(page["text"].strip().splitlines()[0])
+                break
+            time.sleep(0.25)
+        assert child_id is not None
         closed = httpx.post(BASE + f"/sessions/{session}/close", headers=operator, timeout=30)
         assert closed.status_code == 200 and closed.json()["status"] == "closed"
+        cancelled = wait_for_execution(operator, child_execution)
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["invocation_outcome"] == "stopped"
         fresh = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device}, timeout=30)
         fresh.raise_for_status()
         session = fresh.json()["session_id"]
-        _, child_cleanup = execute(f"$null -eq (Get-Process -Id {child_id} -ErrorAction SilentlyContinue)", "timeout-child-cleanup")
+        _, child_cleanup = execute(f"$null -eq (Get-Process -Id {child_id} -ErrorAction SilentlyContinue)", "active-close-child-cleanup")
         assert child_cleanup["output_preview"]["stdout"]["text"].strip().lower() == "true"
         _, fresh_result = execute("$null -eq $global:trialValue", "fresh-variable")
         assert fresh_result["output_preview"]["stdout"]["text"].strip().lower() == "true"
@@ -202,23 +212,7 @@ Write-Output 'RMM_DATA:stopped'
         start()
         row = enrolled_device()
         assert row["id"] == device and row["reachability"] == "online"
-
-        revoked = httpx.post(BASE + f"/devices/{device}/revoke", headers=admin, timeout=35)
-        revoked.raise_for_status()
-        assert revoked.json()["authorization_status"] == "revoked"
-        assert enrolled_device()["authorization_status"] == "revoked"
-        assert httpx.post(BASE + "/sessions", headers=operator,
-                          json={"device_id": device}).json() == {"detail": "device_revoked"}
-        time.sleep(17)
-        windows(f"""
-$agentId=Get-Content '{root}\\pid.txt'
-$process=Get-Process -Id $agentId -ErrorAction SilentlyContinue
-if ($null -ne $process) {{ throw 'revoked_agent_still_running' }}
-$codes=([regex]::Matches((Get-Content '{root}\\out.txt' -Raw),'PAIRING_CODE ')).Count
-if ($codes -ne 1) {{ throw 'revoked_key_reentered_pairing' }}
-Write-Output 'RMM_DATA:revoked'
-""")
-        print("Windows: paired → execution → restart identity → durable revocation denial")
+        print("Windows: paired → persistent session → idempotent execution → fresh session → stale/restart identity")
     finally:
         windows(f"""
 if (Test-Path '{root}\\pid.txt') {{

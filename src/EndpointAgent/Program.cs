@@ -1,6 +1,10 @@
 using EndpointAgent;
 
 try {
+    if (args is ["--worker", var pipeName]) {
+        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
+        return await NativePowerShellWorkerHost.Run(pipeName);
+    }
     if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
     if (args is ["--enroll", var endpoint, var keyName])
         await Enrollment.Run(new Uri(endpoint), keyName);

@@ -22,6 +22,7 @@ internal static class Enrollment {
             throw new CryptographicException();
         using var signer = new ECDsaCng(key);
         string publicKey = Convert.ToBase64String(signer.ExportSubjectPublicKeyInfo());
+        AgentRuntimeState? runtimeState = null;
         while (!cancellation.IsCancellationRequested) {
             try {
                 using var socket = new ClientWebSocket();
@@ -53,7 +54,8 @@ internal static class Enrollment {
                     if (!Guid.TryParse(status.GetProperty("device_id").GetString(), out var device))
                         throw new InvalidDataException();
                     statusSink.Online(device);
-                    await AgentRuntime.Run(socket, device.ToString(), sendHeartbeats: true, cancellation);
+                    runtimeState ??= new AgentRuntimeState(device.ToString());
+                    await AgentRuntime.Run(socket, device.ToString(), sendHeartbeats: true, runtimeState);
                 } else if (state == "denied") throw new UnauthorizedAccessException();
                 else if (state == "rate_limited") statusSink.Unavailable("rate_limited");
                 else throw new InvalidDataException();
