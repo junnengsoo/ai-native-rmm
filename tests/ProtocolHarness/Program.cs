@@ -229,10 +229,10 @@ try {
     var cleanup = await ExecuteWithOutput($"$null -eq (Get-Process -Id {childId} -ErrorAction SilentlyContinue)", 5000);
     Require(cleanup.Stdout.Trim() == "True", "active close terminated the session-owned native child");
 
-    var capped = await ExecuteWithOutput("'z' * 1500000", 5000);
+    var capped = await ExecuteWithOutput("'z' * 250000", 5000);
     Require(capped.Result.GetProperty("captureTruncated").GetBoolean()
         && capped.Stdout.Length > 0
-        && capped.Stdout.Length < 1500000,
+        && capped.Stdout.Length < 250000,
         "endpoint ledger capacity records output loss without blocking lifecycle records");
 
     var lost = await Execute("[Environment]::Exit(19)", 5000);
@@ -407,7 +407,7 @@ Process StartAgent(string thumbprint, string? pin = null) => Process.Start(new P
     UseShellExecute = false,
     Environment = {
         ["RMM_TEST_SECRET"] = "isolated-dummy-secret",
-        ["RMM_ENDPOINT_LEDGER_CAPACITY_BYTES"] = "2000000",
+        ["RMM_ENDPOINT_LEDGER_CAPACITY_BYTES"] = "1150000",
         ["RMM_ENDPOINT_DATA_DIR"] = dataRoot,
     },
     ArgumentList = { args[0], "--agent", "wss://localhost:18443/agent", thumbprint,
