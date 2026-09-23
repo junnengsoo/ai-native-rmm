@@ -4,8 +4,10 @@ The OpenAI driver is a caller-side demo, not endpoint intelligence. It uses the
 OpenAI Agents SDK with one `Agent`, three model-visible tools, and the SDK
 `Runner` tool loop. The model-visible tools are:
 
-- `submit_script(script, timeout_ms)` — submit model-authored PowerShell to the
-  already-open driver-owned session.
+- `submit_script(script)` — submit model-authored PowerShell to the
+  already-open driver-owned session. The driver and overall diagnostic loop own
+  wait budgets; the endpoint does not receive a model-selected execution
+  deadline.
 - `wait_for_execution(execution_id, timeout_seconds)` — wait for terminal state,
   or return a bounded nonterminal status when the HTTP wait expires.
 - `inspect_output(execution_id, stream, mode, ...)` — inspect centrally retained

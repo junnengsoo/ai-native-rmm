@@ -1,13 +1,14 @@
 using System.Diagnostics;
 using System.IO.Pipes;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
 namespace EndpointAgent;
 
 internal sealed record WorkerResult(string State, string? InvocationOutcome, int? ExitCode, string? ExitCodeSource, bool HadErrors,
-    double? DurationMs, bool CaptureTruncated, int? LastNativeExitCode);
+    double? DurationMs, bool CaptureTruncated, int? LastNativeExitCode) {
+    public bool? CleanupConfirmed { get; init; }
+}
 
 internal sealed class WorkerProcess : IAsyncDisposable {
     public bool IsUsable { get; private set; } = true;
@@ -27,29 +28,15 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         writer = new StreamWriter(pipe, new UTF8Encoding(false), 4096, true) { AutoFlush = true };
     }
     public static async Task<WorkerProcess> Start() {
-        string executable = NativeWindowsPowerShell();
-        string workerScript = Path.Combine(AppContext.BaseDirectory, "NativePowerShellWorker.ps1");
-        if (!File.Exists(workerScript)) throw new FileNotFoundException("native_powershell_worker_missing", workerScript);
         // The name is an unguessable local rendezvous, not a network listener.
         var name = "rmm-" + Guid.NewGuid().ToString("N");
         var pipe = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-        var start = new ProcessStartInfo(executable) { UseShellExecute = false,
+        var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false,
             RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
-        start.ArgumentList.Add("-NoLogo");
-        start.ArgumentList.Add("-NoProfile");
-        start.ArgumentList.Add("-NonInteractive");
-        // The installed bootstrap is product code under Program Files. Execution
-        // policy is not an authorization boundary; AppLocker/WDAC still apply.
-        start.ArgumentList.Add("-ExecutionPolicy");
-        start.ArgumentList.Add("Bypass");
-        start.ArgumentList.Add("-File");
-        start.ArgumentList.Add(workerScript);
-        start.ArgumentList.Add("-PipeName");
-        start.ArgumentList.Add(name);
-        // Keep the standard Windows account environment that the inbox engine
-        // needs for profile and module discovery, without forwarding arbitrary
-        // agent configuration or secrets to remotely supplied scripts.
+        if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase))
+            start.ArgumentList.Add(typeof(WorkerProcess).Assembly.Location);
+        start.ArgumentList.Add("--worker"); start.ArgumentList.Add(name);
         var allowed = new[] { "SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT", "ComSpec", "SystemDrive",
             "ProgramFiles", "ProgramFiles(x86)", "ProgramData", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
             "LOCALAPPDATA", "PSModulePath" };
@@ -64,22 +51,18 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             job.Dispose(); pipe.Dispose(); throw;
         }
         _ = Drain(process.StandardOutput);
-        using var startupDiagnostics = new CancellationTokenSource();
-        _ = DrainDiagnostics(process.StandardError, startupDiagnostics.Token);
+        _ = Drain(process.StandardError);
         WorkerProcess? worker = null;
         try {
-            // Inbox PowerShell can have a slow first launch while endpoint
-            // protection scans it and .NET Framework warms up.
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
             await pipe.WaitForConnectionAsync(deadline.Token);
             worker = new WorkerProcess(pipe, process, job);
-            var ready = await worker.reader.ReadLineAsync(deadline.Token);
+            string? ready = await worker.reader.ReadLineAsync(deadline.Token);
             if (!NativeWorkerReady(ready)) {
                 if (ready is not null && ready.StartsWith("startup_failed:") && ready.Length < 100)
                     Console.Error.WriteLine(ready);
                 throw new InvalidDataException();
             }
-            startupDiagnostics.Cancel();
             return worker;
         } catch {
             if (worker is not null) await worker.DisposeAsync();
@@ -90,15 +73,20 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             throw;
         }
     }
-    public async Task<WorkerResult> Execute(string script, int timeoutMs, Func<string, string, Task> onOutput,
-                                            CancellationToken cancellation) {
+    public async Task<WorkerResult> Execute(string script, Func<string, string, Task> onOutput,
+                                            CancellationToken cancellation,
+                                            Func<string> cancellationState) {
         var watch = Stopwatch.StartNew();
-        using var deadline = new CancellationTokenSource(timeoutMs);
-        using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellation);
+        using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         try {
             await writer.WriteLineAsync(JsonSerializer.Serialize(new { script }).AsMemory(), stopSignal.Token);
             while (true) {
-                string line = await reader.ReadLineAsync(stopSignal.Token) ?? throw new EndOfStreamException();
+                var read = reader.ReadLineAsync();
+                var cancelled = Task.Delay(Timeout.InfiniteTimeSpan, stopSignal.Token);
+                if (await Task.WhenAny(read, cancelled) != read) {
+                    throw new OperationCanceledException(stopSignal.Token);
+                }
+                string line = await read ?? throw new EndOfStreamException();
                 using var message = JsonDocument.Parse(line);
                 if (message.RootElement.TryGetProperty("kind", out var kind) && kind.GetString() == "output") {
                     var stream = message.RootElement.GetProperty("stream").GetString() == "stdout" ? "stdout" : "stderr";
@@ -107,18 +95,24 @@ internal sealed class WorkerProcess : IAsyncDisposable {
                     continue;
                 }
                 var result = JsonSerializer.Deserialize<WorkerResult>(line)!;
-                if (result.InvocationOutcome == "explicit_exit") { IsUsable = false; stopped = await job.Stop(); }
+                if (result.InvocationOutcome == "explicit_exit") {
+                    IsUsable = false;
+                    stopped = await job.Stop();
+                    return result with { CleanupConfirmed = stopped };
+                }
                 return result;
             }
         } catch (Exception error) when (error is OperationCanceledException or IOException or JsonException) {
             IsUsable = false;
             stopped = await job.Stop();
             bool confirmedCancellation = error is OperationCanceledException && stopped;
-            string? state = confirmedCancellation
-                ? cancellation.IsCancellationRequested ? "cancelled" : "timed_out"
+            string? state = confirmedCancellation && cancellation.IsCancellationRequested
+                ? cancellationState()
                 : "outcome_unknown";
             return new WorkerResult(state, confirmedCancellation ? "stopped" : null,
-                null, null, false, watch.Elapsed.TotalMilliseconds, true, null);
+                null, null, false, watch.Elapsed.TotalMilliseconds, true, null) {
+                CleanupConfirmed = stopped,
+            };
         }
     }
     public async ValueTask DisposeAsync() {
@@ -136,15 +130,6 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         }
     }
 
-    private static async Task DrainDiagnostics(StreamReader stream, CancellationToken startup) {
-        while (await stream.ReadLineAsync() is { } line) {
-            if (!startup.IsCancellationRequested && line.Length < 500)
-                Console.Error.WriteLine("worker_startup: " + line);
-            else if (line.StartsWith("startup_failed:", StringComparison.Ordinal) && line.Length < 100)
-                Console.Error.WriteLine(line);
-        }
-    }
-
     private static bool NativeWorkerReady(string? value) {
         try {
             using var message = JsonDocument.Parse(value ?? "");
@@ -157,21 +142,4 @@ internal sealed class WorkerProcess : IAsyncDisposable {
             return false;
         }
     }
-
-    private static string NativeWindowsPowerShell() {
-        if (!Environment.Is64BitProcess) throw new PlatformNotSupportedException("native_64_bit_powershell_required");
-        var system = new StringBuilder(260);
-        uint length = GetSystemDirectoryW(system, (uint)system.Capacity);
-        if (length >= (uint)system.Capacity) {
-            system.Capacity = checked((int)length);
-            length = GetSystemDirectoryW(system, (uint)system.Capacity);
-        }
-        if (length == 0 || length >= (uint)system.Capacity) throw new InvalidOperationException("system_directory_unavailable");
-        string executable = Path.Combine(system.ToString(), "WindowsPowerShell", "v1.0", "powershell.exe");
-        if (!File.Exists(executable)) throw new FileNotFoundException("native_powershell_unavailable", executable);
-        return executable;
-    }
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern uint GetSystemDirectoryW(StringBuilder buffer, uint size);
 }

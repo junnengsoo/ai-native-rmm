@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -52,6 +54,39 @@ def prove(socket, key, public):
     return json.loads(socket.recv())
 
 
+def recv_command(socket, timeout=None):
+    while True:
+        raw = socket.recv(timeout=timeout) if timeout is not None else socket.recv()
+        message = json.loads(raw)
+        if message["type"] in {"heartbeat_ack", "ledger_ack"}:
+            continue
+        return message
+
+
+def ledger_sender():
+    ledger_id = "recovery-ledger-" + uuid.uuid4().hex
+    sequence = 0
+
+    def send(socket, device_id, records):
+        nonlocal sequence
+        payload = []
+        for record_type, data in records:
+            sequence += 1
+            payload.append({
+                "sequence": sequence,
+                "recordType": record_type,
+                "endpointObservedAt": "2026-09-22T00:00:00Z",
+                "data": data,
+            })
+        socket.send(json.dumps({
+            "type": "ledger_batch",
+            "deviceId": device_id,
+            "ledgerId": ledger_id,
+            "records": payload,
+        }))
+    return send
+
+
 def pending(key, public):
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         return prove(socket, key, public)
@@ -78,33 +113,34 @@ def test_recovery_requires_admin_and_fresh_proof_then_rotates_the_credential():
     device_id, old_key, old_public = enroll(admin)
     with connect(BASE.replace("http", "ws") + "/agent") as old_socket:
         assert prove(old_socket, old_key, old_public)["device_id"] == device_id
+        send_ledger = ledger_sender()
 
         def endpoint_peer():
-            opened = json.loads(old_socket.recv())
-            old_socket.send(json.dumps({
-                "type": "session_ready", "deviceId": device_id,
-                "sessionId": opened["sessionId"],
-            }))
-            executed = json.loads(old_socket.recv())
+            opened = recv_command(old_socket)
+            send_ledger(old_socket, device_id, [
+                ("session_started", {"sessionId": opened["sessionId"]}),
+            ])
+            executed = recv_command(old_socket)
             binding = {
-                "deviceId": device_id, "sessionId": opened["sessionId"],
+                "sessionId": opened["sessionId"],
                 "executionId": executed["executionId"],
+                "scriptSha256": executed["scriptSha256"],
             }
-            old_socket.send(json.dumps({"type": "running", **binding}))
-            old_socket.send(json.dumps({
-                "type": "output", **binding, "stream": "stdout", "text": "retained\n",
-            }))
-            old_socket.send(json.dumps({
-                "type": "result", **binding, "state": "completed",
-                "invocationOutcome": "completed_normally", "exitCode": 0,
-                "exitCodeSource": "normalized_invocation", "hadErrors": False,
-                "durationMs": 1, "captureTruncated": False, "lastNativeExitCode": None,
-            }))
-            closed = json.loads(old_socket.recv())
-            old_socket.send(json.dumps({
-                "type": "session_closed", "deviceId": device_id,
-                "sessionId": closed["sessionId"],
-            }))
+            send_ledger(old_socket, device_id, [
+                ("execution_accepted", binding),
+                ("execution_started", binding),
+                ("output_chunk", {**binding, "stream": "stdout", "text": "retained\n"}),
+                ("execution_finished", {
+                    **binding, "state": "completed",
+                    "invocationOutcome": "completed_normally", "exitCode": 0,
+                    "exitCodeSource": "normalized_invocation", "hadErrors": False,
+                    "durationMs": 1, "captureTruncated": False, "lastNativeExitCode": None,
+                }),
+            ])
+            closed = recv_command(old_socket)
+            send_ledger(old_socket, device_id, [
+                ("session_closed", {"sessionId": closed["sessionId"]}),
+            ])
 
         with ThreadPoolExecutor(1) as pool:
             peer = pool.submit(endpoint_peer)
@@ -160,11 +196,16 @@ def test_recovery_requires_admin_and_fresh_proof_then_rotates_the_credential():
             activated = prove(socket, new_key, new_public)
             assert activated["state"] == "online" and activated["device_id"] == device_id
 
-        try:
-            old_socket.recv(timeout=2)
-            raise AssertionError("replaced credential's live channel remained connected")
-        except ConnectionClosed:
-            pass
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                recv_command(old_socket, timeout=0.2)
+                raise AssertionError("replaced credential's live channel remained connected")
+            except TimeoutError:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("replaced credential's live channel remained connected")
+            except ConnectionClosed:
+                break
 
     retained = httpx.get(BASE + f"/sessions/{session_id}", headers=caller)
     assert retained.status_code == 200 and retained.json()["device_id"] == device_id

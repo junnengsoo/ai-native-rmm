@@ -19,15 +19,17 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from .connections import endpoint_agents
 from .database import (
     approve_pairing, authenticate_credential, authenticate_device, begin_session_close,
-    append_execution_output,
-    claim_execution, create_caller, create_or_get_execution, create_starting_session,
-    digest, fail_device_investigations, finish_execution,
+    create_caller, create_or_get_execution, create_starting_session,
+    digest, fail_device_investigations,
     get_execution_output_page, get_execution_output_preview, get_live_device_session,
     get_workspace_device, get_workspace_execution, get_workspace_session, increment_rate_limit,
-    initialize, list_workspace_devices, mark_execution_failed_to_start, mark_execution_unknown,
+    ingest_endpoint_ledger_batch,
+    initialize, list_retryable_execution_dispatches, list_retryable_session_dispatches,
+    list_workspace_devices,
+    mark_execution_dispatch_requested, mark_execution_failed_to_start,
     mark_device_revocation_cleanup_unknown,
-    mark_queued_execution_cancelled, mark_session_cleanup_unknown, mark_session_closed,
-    mark_session_endpoint_closed, mark_session_failed, mark_session_ready, range_execution_output,
+    mark_queued_execution_cancelled, mark_session_cleanup_unknown,
+    mark_session_dispatch_requested, range_execution_output,
     record_heartbeat, recover_device, recover_interrupted_work, rename_workspace_device,
     revoke_workspace_device,
     search_execution_output, tail_execution_output,
@@ -48,6 +50,7 @@ async def lifespan(app):
         recover_interrupted_work()
     except Exception:
         raise RuntimeError("database_initialization_failed") from None
+    await restart_durable_dispatch_retries()
     yield
 
 
@@ -57,6 +60,7 @@ terminal_waiters_lock = asyncio.Lock()
 
 MAX_RUNTIME_MS = 3_600_000
 CLEANUP_GRACE_SECONDS = 30
+DISPATCH_RETRY_SECONDS = 1.0
 
 
 @app.middleware("http")
@@ -147,7 +151,6 @@ async def revoke_device(device_id: uuid.UUID, authorization: str | None = Header
                         await channel.send({"type": "close_session", "deviceId": str(device_id),
                                             "sessionId": str(session["id"])})
                         await asyncio.wait_for(closed, CLEANUP_GRACE_SECONDS)
-                        await asyncio.to_thread(mark_session_closed, session["id"])
                         cleanup = "confirmed"
                     except Exception:
                         cleanup = "unconfirmed"
@@ -306,43 +309,69 @@ async def close(socket, code=1000):
 
 def validate_endpoint_agent_message(message: dict) -> None:
     kind = message.get("type")
-    common = {"type", "deviceId", "sessionId"}
-    expected = {
-        "session_ready": common,
-        "session_closed": common,
-        "running": common | {"executionId"},
-        "output": common | {"executionId", "stream", "text"},
-        "result": common | {"executionId", "state", "invocationOutcome", "exitCode",
-                            "exitCodeSource", "hadErrors", "durationMs", "captureTruncated",
-                            "lastNativeExitCode"},
+    if kind == "rejected":
+        allowed = {"type", "code", "deviceId", "sessionId", "executionId"}
+        if not {"type", "code", "deviceId"}.issubset(message) or set(message) - allowed:
+            raise ValueError()
+        if not isinstance(message["code"], str) or not isinstance(message["deviceId"], str):
+            raise ValueError()
+        for field in ("sessionId", "executionId"):
+            if field in message:
+                uuid.UUID(str(message[field]))
+        return
+    if kind != "ledger_batch" or set(message) != {"type", "deviceId", "ledgerId", "records"}:
+        raise ValueError()
+    if not isinstance(message["deviceId"], str) or not isinstance(message["ledgerId"], str):
+        raise ValueError()
+    if not 1 <= len(message["ledgerId"]) <= 64:
+        raise ValueError()
+    records = message["records"]
+    if not isinstance(records, list) or not 1 <= len(records) <= 256:
+        raise ValueError()
+    allowed_types = {
+        "session_started", "execution_accepted", "execution_started", "output_chunk",
+        "execution_finished", "cancellation_requested", "worker_stopped", "session_closed",
+        "output_dropped",
     }
-    if kind not in expected or set(message) != expected[kind]:
-        raise ValueError()
-    if kind == "output":
-        if message["stream"] not in {"stdout", "stderr"} or not isinstance(message["text"], str):
-            raise ValueError()
-        if len(message["text"].encode()) > 65536:
-            raise ValueError()
-        return
-    if kind != "result":
-        return
-    if message["state"] not in {"completed", "timed_out", "cancelled", "outcome_unknown"}:
-        raise ValueError()
-    if not isinstance(message["hadErrors"], bool) or not isinstance(message["captureTruncated"], bool):
-        raise ValueError()
-    if message["state"] == "completed":
-        if message["invocationOutcome"] not in {"completed_normally", "terminating_error", "explicit_exit"}:
-            raise ValueError()
-        if not isinstance(message["exitCode"], int) or message["exitCodeSource"] not in {
-            "normalized_invocation", "explicit_script_exit",
+    previous = 0
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "sequence", "recordType", "endpointObservedAt", "data",
         }:
             raise ValueError()
-    elif message["exitCode"] is not None or message["exitCodeSource"] is not None:
-        raise ValueError()
-    elif message["state"] in {"timed_out", "cancelled"} and message["invocationOutcome"] != "stopped":
-        raise ValueError()
-    elif message["state"] == "outcome_unknown" and message["invocationOutcome"] is not None:
-        raise ValueError()
+        if not isinstance(record["sequence"], int) or record["sequence"] <= previous:
+            raise ValueError()
+        previous = record["sequence"]
+        if record["recordType"] not in allowed_types:
+            raise ValueError()
+        datetime.fromisoformat(str(record["endpointObservedAt"]).replace("Z", "+00:00"))
+        data = record["data"]
+        if not isinstance(data, dict):
+            raise ValueError()
+        if record["recordType"] == "output_chunk":
+            if data.get("stream") not in {"stdout", "stderr"} or not isinstance(data.get("text"), str):
+                raise ValueError()
+            if len(data["text"].encode()) > 8192:
+                raise ValueError()
+        if record["recordType"] == "execution_finished":
+            state = data.get("state")
+            if state not in {"completed", "timed_out", "cancelled", "outcome_unknown"}:
+                raise ValueError()
+            if not isinstance(data.get("hadErrors"), bool) or not isinstance(data.get("captureTruncated"), bool):
+                raise ValueError()
+            if state == "completed":
+                if data.get("invocationOutcome") not in {"completed_normally", "terminating_error", "explicit_exit"}:
+                    raise ValueError()
+                if not isinstance(data.get("exitCode"), int) or data.get("exitCodeSource") not in {
+                    "normalized_invocation", "explicit_script_exit",
+                }:
+                    raise ValueError()
+            elif data.get("exitCode") is not None or data.get("exitCodeSource") is not None:
+                raise ValueError()
+            elif state in {"timed_out", "cancelled"} and data.get("invocationOutcome") != "stopped":
+                raise ValueError()
+            elif state == "outcome_unknown" and data.get("invocationOutcome") is not None:
+                raise ValueError()
 
 
 class SessionCreation(BaseModel):
@@ -353,7 +382,7 @@ class SessionCreation(BaseModel):
 class ExecutionCreation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     script: str = Field(min_length=1, max_length=32768)
-    timeout_ms: int = Field(ge=100, le=MAX_RUNTIME_MS)
+    timeout_ms: int | None = Field(default=None, ge=100, le=MAX_RUNTIME_MS)
 
 
 def session_view(row):
@@ -367,6 +396,8 @@ def execution_view(row):
     stdout_preview = get_execution_output_preview(row["id"], "stdout")
     stderr_preview = get_execution_output_preview(row["id"], "stderr")
     capture_lost = bool(row["capture_truncated"])
+    output_complete = bool(row["output_complete"])
+    loss_reason = row["output_loss_reason"]
     return {"execution_id": str(row["id"]), "session_id": str(row["session_id"]),
             "caller_id": str(row["caller_id"]), "status": row["status"],
             "script_sha256": row["script_sha256"], "invocation_outcome": row["invocation_outcome"],
@@ -374,13 +405,17 @@ def execution_view(row):
             "last_confirmed_status": row["last_confirmed_status"],
             "exit_code": row["exit_code"], "exit_code_source": row["exit_code_source"],
             "had_errors": row["had_errors"], "duration_ms": row["duration_ms"],
-            "capture_truncated": row["capture_truncated"],
-            "capture": {"loss_detected": capture_lost, "reason": "retention_limit" if capture_lost else None},
+            "capture_truncated": row["capture_truncated"], "output_complete": output_complete,
+            "output_loss_reason": loss_reason,
+            "capture": {"loss_detected": capture_lost, "reason": loss_reason if capture_lost else None},
             "output_preview": {
                 "stdout": {**stdout_preview, "capture_lost": capture_lost},
                 "stderr": {**stderr_preview, "capture_lost": capture_lost},
             },
             "last_native_exit_code": row["last_native_exit_code"],
+            "endpoint_accepted_at": row["endpoint_accepted_at"],
+            "endpoint_started_at": row["endpoint_started_at"],
+            "endpoint_finished_at": row["endpoint_finished_at"],
             "created_at": row["created_at"], "started_at": row["started_at"],
             "finished_at": row["finished_at"]}
 
@@ -471,6 +506,31 @@ async def fail_device_investigations_and_notify(device_id: uuid.UUID | str) -> N
         await notify_terminal(execution_id)
 
 
+async def restart_durable_dispatch_retries() -> None:
+    session_rows = await asyncio.to_thread(list_retryable_session_dispatches)
+    for row in session_rows:
+        asyncio.create_task(send_session_open_command(row["id"], str(row["device_id"])))
+    execution_rows = await asyncio.to_thread(list_retryable_execution_dispatches)
+    for row in execution_rows:
+        asyncio.create_task(send_execution_command(row["id"], str(row["device_id"])))
+
+
+async def send_session_open_command(session_id: uuid.UUID, device_id: str,
+                                    retry_seconds: float = DISPATCH_RETRY_SECONDS) -> None:
+    while True:
+        row = await asyncio.to_thread(mark_session_dispatch_requested, session_id)
+        if row is None:
+            return
+        channel = await endpoint_agents.get_connected_channel(device_id)
+        if channel is not None:
+            try:
+                await channel.send({"type": "open_session", "deviceId": device_id,
+                                    "sessionId": str(session_id)})
+            except Exception:
+                pass
+        await asyncio.sleep(retry_seconds)
+
+
 @app.post("/sessions", status_code=201)
 async def create_session(body: SessionCreation, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
@@ -493,11 +553,12 @@ async def create_session(body: SessionCreation, authorization: str | None = Head
     session_id = str(row["id"])
     ready = channel.expect("session_ready", session_id)
     try:
-        await channel.send({"type": "open_session", "deviceId": str(body.device_id), "sessionId": session_id})
+        asyncio.create_task(send_session_open_command(row["id"], str(body.device_id)))
         await asyncio.wait_for(ready, 20)
-        await asyncio.to_thread(mark_session_ready, row["id"])
     except Exception:
-        await asyncio.to_thread(mark_session_failed, row["id"])
+        # Sending and waiting are delivery-ambiguous once dispatch intent is
+        # durable. Leave the starting session for authenticated ledger replay
+        # instead of falsely finalizing it.
         raise HTTPException(503, "session_start_failed") from None
     return session_view(await asyncio.to_thread(get_workspace_session, caller["workspace_id"], row["id"]))
 
@@ -511,34 +572,25 @@ async def get_session(session_id: uuid.UUID, authorization: str | None = Header(
     return session_view(row)
 
 
-async def dispatch_execution(execution_id: uuid.UUID, channel, device_id: str) -> None:
-    row = await asyncio.to_thread(claim_execution, execution_id)
-    if row is None:
-        return
-    running = channel.expect("running", str(execution_id))
-    result = channel.expect("result", str(execution_id))
-    last_confirmed_status = "queued"
-    try:
-        await channel.send({
-            "type": "execute", "deviceId": device_id, "sessionId": str(row["session_id"]),
-            "executionId": str(execution_id), "script": row["script"],
-            "scriptSha256": row["script_sha256"], "timeoutMs": row["timeout_ms"],
-        })
-        running_message = await asyncio.wait_for(running, 10)
-        expected = {"deviceId": device_id, "sessionId": str(row["session_id"]),
-                    "executionId": str(execution_id)}
-        if any(running_message.get(key) != value for key, value in expected.items()):
-            raise ValueError("mismatched_running_binding")
-        last_confirmed_status = "running"
-        evidence = await asyncio.wait_for(result, row["timeout_ms"] / 1000 + 15)
-        if any(evidence.get(key) != value for key, value in expected.items()):
-            raise ValueError("mismatched_result_binding")
-        await asyncio.to_thread(finish_execution, execution_id, evidence)
-        await notify_terminal(execution_id)
-    except Exception:
-        await asyncio.to_thread(mark_execution_unknown, execution_id,
-                                "dispatch_confirmation_lost", last_confirmed_status)
-        await notify_terminal(execution_id)
+async def send_execution_command(execution_id: uuid.UUID, device_id: str,
+                                 retry_seconds: float = DISPATCH_RETRY_SECONDS) -> None:
+    while True:
+        row = await asyncio.to_thread(mark_execution_dispatch_requested, execution_id)
+        if row is None:
+            return
+        channel = await endpoint_agents.get_connected_channel(device_id)
+        if channel is not None:
+            try:
+                await channel.send({
+                    "type": "execute", "deviceId": device_id, "sessionId": str(row["session_id"]),
+                    "executionId": str(execution_id), "script": row["script"],
+                    "scriptSha256": row["script_sha256"], "timeoutMs": row["timeout_ms"],
+                })
+            except Exception:
+                pass
+        # Once dispatch intent is durable, delivery remains ambiguous until the
+        # endpoint ledger accepts or terminally reconciles the execution.
+        await asyncio.sleep(retry_seconds)
 
 
 @app.post("/sessions/{session_id}/executions", status_code=202)
@@ -552,7 +604,7 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
     try:
         row, created = await asyncio.to_thread(
             create_or_get_execution, caller["workspace_id"], caller["id"], session_id,
-            idempotency_key, body.script, script_hash, body.timeout_ms)
+            idempotency_key, body.script, script_hash, body.timeout_ms or MAX_RUNTIME_MS)
     except LookupError:
         raise HTTPException(404, "active_session_not_found") from None
     except RuntimeError as error:
@@ -570,7 +622,11 @@ async def submit_execution(body: ExecutionCreation, session_id: uuid.UUID,
             row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], row["id"])
             await notify_terminal(row["id"])
         else:
-            asyncio.create_task(dispatch_execution(row["id"], channel, str(session["device_id"])))
+            asyncio.create_task(send_execution_command(row["id"], str(session["device_id"])))
+    elif row["status"] == "queued":
+        session = await asyncio.to_thread(get_workspace_session, caller["workspace_id"], session_id)
+        if session is not None and await endpoint_agents.get_connected_channel(str(session["device_id"])) is not None:
+            asyncio.create_task(send_execution_command(row["id"], str(session["device_id"])))
     return {"execution_id": str(row["id"]), "status": row["status"],
             "script_sha256": row["script_sha256"]}
 
@@ -667,17 +723,13 @@ async def cancel_execution(execution_id: uuid.UUID, authorization: str | None = 
         raise HTTPException(404, "session_not_found")
     channel = await endpoint_agents.get_connected_channel(str(session["device_id"]))
     if channel is None:
-        await asyncio.to_thread(mark_execution_unknown, execution_id,
-                                "cancel_confirmation_lost", "running")
-        await notify_terminal(execution_id)
+        return execution_view(row)
     else:
         try:
             await channel.send({"type": "cancel_execution", "deviceId": str(session["device_id"]),
                                 "sessionId": str(row["session_id"]), "executionId": str(execution_id)})
         except Exception:
-            await asyncio.to_thread(mark_execution_unknown, execution_id,
-                                    "cancel_confirmation_lost", "running")
-            await notify_terminal(execution_id)
+            return execution_view(row)
     return execution_view(await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id))
 
 
@@ -696,7 +748,6 @@ async def close_session(session_id: uuid.UUID, authorization: str | None = Heade
         await channel.send({"type": "close_session", "deviceId": str(row["device_id"]),
                             "sessionId": str(session_id)})
         await asyncio.wait_for(closed, CLEANUP_GRACE_SECONDS)
-        await asyncio.to_thread(mark_session_closed, session_id)
     except Exception:
         await asyncio.to_thread(mark_session_cleanup_unknown, session_id)
         raise HTTPException(503, "session_close_unconfirmed") from None
@@ -744,21 +795,27 @@ async def endpoint_agent(socket: WebSocket):
                 validate_endpoint_agent_message(message)
                 if message.get("deviceId") != status["device_id"]:
                     raise ValueError()
-                if message["type"] == "output":
-                    try:
-                        await asyncio.to_thread(
-                            append_execution_output, uuid.UUID(message["executionId"]),
-                            message["stream"], message["text"], uuid.UUID(message["sessionId"]),
-                            uuid.UUID(message["deviceId"]))
-                    except Exception as error:
-                        raise ValueError() from error
+                if message["type"] == "rejected":
                     continue
-                if not channel.deliver(message):
-                    if message["type"] == "session_closed":
-                        await asyncio.to_thread(mark_session_endpoint_closed, message["sessionId"])
-                        continue
-                    # Late or unsolicited evidence is never attached to another claim.
-                    continue
+                try:
+                    applied = await asyncio.to_thread(
+                        ingest_endpoint_ledger_batch,
+                        uuid.UUID(message["deviceId"]), message["ledgerId"], message["records"])
+                except Exception as error:
+                    raise ValueError() from error
+                for session_id in applied["ready_session_ids"]:
+                    channel.deliver({"type": "session_ready", "deviceId": status["device_id"],
+                                     "sessionId": str(session_id)})
+                for session_id in applied["closed_session_ids"]:
+                    channel.deliver({"type": "session_closed", "deviceId": status["device_id"],
+                                     "sessionId": str(session_id)})
+                for execution_id in applied["terminal_execution_ids"]:
+                    await notify_terminal(execution_id)
+                await channel.send({
+                    "type": "ledger_ack",
+                    "ledger_id": applied["ledger_id"],
+                    "acknowledged_through": applied["acknowledged_through"],
+                })
         finally:
             if await endpoint_agents.unregister(channel):
                 await fail_device_investigations_and_notify(status["device_id"])

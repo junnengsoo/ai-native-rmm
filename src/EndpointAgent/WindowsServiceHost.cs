@@ -10,10 +10,8 @@ internal sealed class WindowsServiceHost : ServiceBase {
     public const string ServiceNameValue = "SquashEndpointAgent";
     public const string RegistryPath = @"SOFTWARE\Prosper\AiNativeRmm";
     public const string DefaultKeyName = "SquashEndpointAgent";
-    public static readonly string DataDirectory = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-        "Prosper", "AiNativeRmm");
-    public static readonly string StatusPath = Path.Combine(DataDirectory, "status.json");
+    public static string DataDirectory => EndpointPaths.DataDirectory;
+    public static string StatusPath => EndpointPaths.StatusPath;
 
     private CancellationTokenSource? cancellation;
     private Task? runTask;

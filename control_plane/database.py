@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from sqlalchemy import (BigInteger, Boolean, CheckConstraint, Column, DateTime, 
                         MetaData, String, Table, Text, UniqueConstraint, case,
                         create_engine, delete, func, inspect, insert, or_, select,
                         text, update)
-from sqlalchemy.dialects.postgresql import UUID, insert as postgresql_insert
+from sqlalchemy.dialects.postgresql import JSONB, UUID, insert as postgresql_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
 from sqlalchemy.exc import IntegrityError
 
@@ -91,9 +92,10 @@ sessions = Table("sessions", metadata,
     Column("device_id", UUID(as_uuid=True), ForeignKey("devices.id"), nullable=False),
     Column("caller_id", UUID(as_uuid=True), ForeignKey("callers.id"), nullable=False),
     Column("state", String(16), nullable=False),
+    Column("dispatch_requested_at", DateTime(timezone=True)),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("ready_at", DateTime(timezone=True)), Column("closed_at", DateTime(timezone=True)),
-    CheckConstraint("state IN ('starting', 'active', 'closing', 'closed', 'failed', 'cleanup_unknown')", name="sessions_state_valid"))
+    CheckConstraint("state IN ('starting', 'active', 'closing', 'closed', 'failed', 'cleanup_unknown', 'lost')", name="sessions_state_valid"))
 Index("sessions_one_live_per_device", sessions.c.device_id, unique=True,
       postgresql_where=sessions.c.state.in_(("starting", "active", "closing", "cleanup_unknown")))
 executions = Table("executions", metadata,
@@ -108,7 +110,13 @@ executions = Table("executions", metadata,
     Column("exit_code", Integer), Column("exit_code_source", String(32)),
     Column("had_errors", Boolean), Column("stdout", Text), Column("stderr", Text),
     Column("duration_ms", Float), Column("capture_truncated", Boolean),
+    Column("output_complete", Boolean, nullable=False, server_default="true"),
+    Column("output_loss_reason", String(80)),
     Column("last_native_exit_code", Integer),
+    Column("dispatch_requested_at", DateTime(timezone=True)),
+    Column("endpoint_accepted_at", DateTime(timezone=True)),
+    Column("endpoint_started_at", DateTime(timezone=True)),
+    Column("endpoint_finished_at", DateTime(timezone=True)),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("started_at", DateTime(timezone=True)), Column("finished_at", DateTime(timezone=True)),
     CheckConstraint("timeout_ms > 0", name="executions_timeout_positive"),
@@ -122,6 +130,7 @@ execution_output_events = Table("execution_output_events", metadata,
     Column("stream", String(8), nullable=False),
     Column("sequence", Integer, nullable=False), Column("text", Text, nullable=False),
     Column("byte_count", Integer, nullable=False),
+    Column("endpoint_observed_at", DateTime(timezone=True)),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     CheckConstraint("stream IN ('stdout', 'stderr')", name="execution_output_stream_valid"),
     CheckConstraint("sequence > 0", name="execution_output_sequence_positive"),
@@ -129,6 +138,30 @@ execution_output_events = Table("execution_output_events", metadata,
     UniqueConstraint("execution_id", "stream", "sequence", name="execution_output_sequence_key"))
 Index("execution_output_execution_stream_sequence", execution_output_events.c.execution_id,
       execution_output_events.c.stream, execution_output_events.c.sequence)
+endpoint_ledger_cursors = Table("endpoint_ledger_cursors", metadata,
+    Column("device_id", UUID(as_uuid=True), ForeignKey("devices.id"), primary_key=True),
+    Column("ledger_id", String(64), nullable=False),
+    Column("acknowledged_through", BigInteger, nullable=False, server_default="0"),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    CheckConstraint("acknowledged_through >= 0", name="endpoint_ledger_ack_nonnegative"))
+endpoint_ledger_records = Table("endpoint_ledger_records", metadata,
+    Column("device_id", UUID(as_uuid=True), ForeignKey("devices.id"), nullable=False),
+    Column("ledger_id", String(64), nullable=False),
+    Column("sequence", BigInteger, nullable=False),
+    Column("record_type", String(40), nullable=False),
+    Column("record_hash", String(64), nullable=False),
+    Column("record", JSONB, nullable=False),
+    Column("endpoint_observed_at", DateTime(timezone=True), nullable=False),
+    Column("control_plane_received_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    CheckConstraint("sequence > 0", name="endpoint_ledger_sequence_positive"),
+    CheckConstraint(
+        "record_type IN ('session_started','execution_accepted','execution_started','output_chunk',"
+        "'execution_finished','cancellation_requested','worker_stopped','session_closed','output_dropped')",
+        name="endpoint_ledger_record_type_valid"),
+    UniqueConstraint("device_id", "ledger_id", "sequence", name="endpoint_ledger_record_sequence_key"))
+Index("endpoint_ledger_records_device_ledger_sequence", endpoint_ledger_records.c.device_id,
+      endpoint_ledger_records.c.ledger_id, endpoint_ledger_records.c.sequence)
 audit_records = Table("audit_records", metadata,
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("workspace_id", UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=False),
@@ -468,19 +501,13 @@ def create_starting_session(workspace_id: uuid.UUID, caller_id: uuid.UUID,
             raise RuntimeError("device_busy") from None
         raise
 
-def mark_session_ready(session_id: uuid.UUID) -> None:
+def mark_session_dispatch_requested(session_id: uuid.UUID) -> RowMapping | None:
     with transaction() as connection:
-        changed = connection.execute(update(sessions).where(
+        row = connection.execute(update(sessions).where(
             sessions.c.id == session_id, sessions.c.state == "starting"
-        ).values(state="active", ready_at=func.now())).rowcount
-        if changed != 1:
-            raise RuntimeError("invalid_session_transition")
-
-def mark_session_failed(session_id: uuid.UUID) -> None:
-    with transaction() as connection:
-        connection.execute(update(sessions).where(
-            sessions.c.id == session_id, sessions.c.state.in_(("starting", "active", "closing"))
-        ).values(state="failed", closed_at=func.now()))
+        ).values(dispatch_requested_at=func.coalesce(
+            sessions.c.dispatch_requested_at, func.now())).returning(sessions)).mappings().one_or_none()
+        return row
 
 def mark_session_cleanup_unknown(session_id: uuid.UUID) -> None:
     with transaction() as connection:
@@ -499,20 +526,6 @@ def begin_session_close(workspace_id: uuid.UUID, session_id: uuid.UUID) -> RowMa
             sessions.c.id == session_id, sessions.c.workspace_id == workspace_id,
             sessions.c.state == "active"
         ).values(state="closing").returning(sessions)).mappings().one_or_none()
-
-def mark_session_closed(session_id: uuid.UUID) -> None:
-    with transaction() as connection:
-        changed = connection.execute(update(sessions).where(
-            sessions.c.id == session_id, sessions.c.state == "closing"
-        ).values(state="closed", closed_at=func.now())).rowcount
-        if changed != 1:
-            raise RuntimeError("invalid_session_transition")
-
-def mark_session_endpoint_closed(session_id: uuid.UUID) -> None:
-    with transaction() as connection:
-        connection.execute(update(sessions).where(
-            sessions.c.id == session_id, sessions.c.state.in_(("active", "closing"))
-        ).values(state="closed", closed_at=func.now()))
 
 def create_or_get_execution(workspace_id: uuid.UUID, caller_id: uuid.UUID,
                             session_id: uuid.UUID, idempotency_key: str, script: str,
@@ -560,11 +573,36 @@ def create_or_get_execution(workspace_id: uuid.UUID, caller_id: uuid.UUID,
         return connection.execute(select(executions).where(
             executions.c.id == execution_id)).mappings().one(), True
 
-def claim_execution(execution_id: uuid.UUID) -> RowMapping | None:
+def mark_execution_dispatch_requested(execution_id: uuid.UUID) -> RowMapping | None:
     with transaction() as connection:
         return connection.execute(update(executions).where(
-            executions.c.id == execution_id, executions.c.status == "queued"
-        ).values(status="running", started_at=func.now()).returning(executions)).mappings().one_or_none()
+            executions.c.id == execution_id,
+            executions.c.status == "queued",
+        ).values(dispatch_requested_at=func.coalesce(
+            executions.c.dispatch_requested_at, func.now())).returning(executions)
+        ).mappings().one_or_none()
+
+def list_retryable_session_dispatches() -> list[RowMapping]:
+    with transaction() as connection:
+        return list(connection.execute(select(
+            sessions.c.id, sessions.c.device_id,
+        ).join(devices, devices.c.id == sessions.c.device_id).where(
+            sessions.c.state == "starting",
+            sessions.c.dispatch_requested_at.is_not(None),
+            devices.c.authorization_status == "active",
+        )).mappings())
+
+def list_retryable_execution_dispatches() -> list[RowMapping]:
+    with transaction() as connection:
+        return list(connection.execute(select(
+            executions.c.id, sessions.c.device_id,
+        ).join(sessions, sessions.c.id == executions.c.session_id)
+         .join(devices, devices.c.id == sessions.c.device_id).where(
+            executions.c.status == "queued",
+            executions.c.dispatch_requested_at.is_not(None),
+            sessions.c.state == "active",
+            devices.c.authorization_status == "active",
+        )).mappings())
 
 def split_utf8_chunks(value: str, limit: int = 8192) -> list[str]:
     chunks, current, size = [], [], 0
@@ -579,62 +617,318 @@ def split_utf8_chunks(value: str, limit: int = 8192) -> list[str]:
         chunks.append("".join(current))
     return chunks
 
-def append_execution_output(execution_id: uuid.UUID, stream: str, value: str,
-                            session_id: uuid.UUID | str | None = None,
-                            device_id: uuid.UUID | str | None = None) -> list[int]:
-    if stream not in {"stdout", "stderr"}:
-        raise ValueError("invalid_stream")
-    chunks = split_utf8_chunks(value)
-    if not chunks:
-        return []
-    with transaction() as connection:
-        statement = select(executions.c.id).where(executions.c.id == execution_id).with_for_update()
-        if session_id is not None or device_id is not None:
-            statement = statement.join(sessions, sessions.c.id == executions.c.session_id).where(
-                executions.c.status == "running")
-        if session_id is not None:
-            statement = statement.where(executions.c.session_id == session_id)
-        if device_id is not None:
-            statement = statement.where(sessions.c.device_id == device_id)
-        connection.execute(statement).scalar_one()
-        next_sequence = (connection.execute(select(func.coalesce(func.max(execution_output_events.c.sequence), 0)).where(
-            execution_output_events.c.execution_id == execution_id,
-            execution_output_events.c.stream == stream)).scalar_one() + 1)
-        sequences = []
-        for offset, chunk in enumerate(chunks):
-            sequence = next_sequence + offset
-            sequences.append(sequence)
-            connection.execute(insert(execution_output_events).values(
-                execution_id=execution_id, stream=stream, sequence=sequence,
-                text=chunk, byte_count=len(chunk.encode())))
-        return sequences
+def _canonical_record_hash(record: dict[str, object]) -> str:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
 
-def finish_execution(execution_id: uuid.UUID, result: dict[str, object]) -> None:
-    values = {
-        "status": result["state"], "invocation_outcome": result.get("invocationOutcome"),
-        "outcome_reason": "endpoint_reported_unknown" if result["state"] == "outcome_unknown" else None,
-        "last_confirmed_status": "running" if result["state"] == "outcome_unknown" else None,
-        "exit_code": result.get("exitCode"), "exit_code_source": result.get("exitCodeSource"),
-        "had_errors": result.get("hadErrors"), "stdout": None, "stderr": None,
-        "duration_ms": result.get("durationMs"),
-        "capture_truncated": result.get("captureTruncated"),
-        "last_native_exit_code": result.get("lastNativeExitCode"), "finished_at": func.now(),
+def _uuid(value: object, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("invalid_" + field) from error
+
+def _require_fields(data: dict[str, object], fields: set[str]) -> None:
+    if set(data) != fields:
+        raise RuntimeError("invalid_record_fields")
+
+def _execution_binding(connection: Connection, device_id: uuid.UUID, session_id: uuid.UUID,
+                       execution_id: uuid.UUID, script_sha256: str) -> RowMapping:
+    row = connection.execute(select(
+        executions.c.id, executions.c.workspace_id, executions.c.caller_id,
+        executions.c.status, executions.c.script_sha256, executions.c.output_complete,
+        sessions.c.id.label("session_id"), sessions.c.device_id, sessions.c.state.label("session_state"),
+    ).join(sessions, sessions.c.id == executions.c.session_id).where(
+        executions.c.id == execution_id,
+    ).with_for_update()).mappings().one_or_none()
+    valid = (row is not None
+             and row["device_id"] == device_id
+             and row["session_id"] == session_id
+             and row["script_sha256"] == script_sha256)
+    if not valid:
+        raise RuntimeError("ledger_binding_mismatch")
+    return row
+
+def _session_binding(connection: Connection, device_id: uuid.UUID,
+                     session_id: uuid.UUID) -> RowMapping:
+    row = connection.execute(select(
+        sessions.c.id, sessions.c.workspace_id, sessions.c.caller_id,
+        sessions.c.device_id, sessions.c.state,
+    ).where(
+        sessions.c.id == session_id,
+    ).with_for_update()).mappings().one_or_none()
+    if row is None or row["device_id"] != device_id:
+        raise RuntimeError("ledger_session_binding_mismatch")
+    return row
+
+def _terminal_values(data: dict[str, object], endpoint_observed_at: datetime) -> dict[str, object]:
+    state = data.get("state")
+    if state not in {"completed", "timed_out", "cancelled", "outcome_unknown"}:
+        raise RuntimeError("invalid_terminal_state")
+    return {
+        "status": state,
+        "invocation_outcome": data.get("invocationOutcome"),
+        "outcome_reason": data.get("outcomeReason") if state == "outcome_unknown" else None,
+        "last_confirmed_status": data.get("lastConfirmedStatus") if state == "outcome_unknown" else "running",
+        "exit_code": data.get("exitCode"),
+        "exit_code_source": data.get("exitCodeSource"),
+        "had_errors": data.get("hadErrors"),
+        "stdout": None,
+        "stderr": None,
+        "duration_ms": data.get("durationMs"),
+        "capture_truncated": data.get("captureTruncated"),
+        "last_native_exit_code": data.get("lastNativeExitCode"),
+        "endpoint_finished_at": endpoint_observed_at,
+        "finished_at": func.now(),
     }
-    with transaction() as connection:
+
+def _collect_output(pending: list[dict[str, object]], execution_id: uuid.UUID,
+                    stream: str, text_value: str, endpoint_observed_at: datetime) -> None:
+    if stream not in {"stdout", "stderr"}:
+        raise RuntimeError("invalid_stream")
+    for chunk in split_utf8_chunks(text_value):
+        pending.append({
+            "execution_id": execution_id,
+            "stream": stream,
+            "text": chunk,
+            "byte_count": len(chunk.encode()),
+            "endpoint_observed_at": endpoint_observed_at,
+        })
+
+def _bulk_insert_output(connection: Connection, pending: list[dict[str, object]]) -> None:
+    if not pending:
+        return
+    grouped: dict[tuple[uuid.UUID, str], list[dict[str, object]]] = {}
+    for row in pending:
+        grouped.setdefault((row["execution_id"], row["stream"]), []).append(row)
+    rows: list[dict[str, object]] = []
+    for (execution_id, stream), values in grouped.items():
+        next_sequence = (connection.execute(select(
+            func.coalesce(func.max(execution_output_events.c.sequence), 0)
+        ).where(
+            execution_output_events.c.execution_id == execution_id,
+            execution_output_events.c.stream == stream,
+        )).scalar_one() + 1)
+        for offset, value in enumerate(values):
+            rows.append({
+                **value,
+                "sequence": next_sequence + offset,
+            })
+    connection.execute(insert(execution_output_events), rows)
+
+def _apply_ledger_record(connection: Connection, device_id: uuid.UUID, record_type: str,
+                         data: dict[str, object], endpoint_observed_at: datetime,
+                         pending_output: list[dict[str, object]]) -> dict[str, object]:
+    terminal_execution_ids: list[uuid.UUID] = []
+    ready_session_ids: list[uuid.UUID] = []
+    closed_session_ids: list[uuid.UUID] = []
+    if record_type == "session_started":
+        _require_fields(data, {"sessionId"})
+        session_id = _uuid(data["sessionId"], "session_id")
+        _session_binding(connection, device_id, session_id)
+        changed = connection.execute(update(sessions).where(
+            sessions.c.id == session_id,
+            sessions.c.device_id == device_id,
+            sessions.c.state.in_(("starting", "active")),
+        ).values(state="active", ready_at=func.coalesce(sessions.c.ready_at, func.now()))
+         .returning(sessions.c.id)).scalar_one_or_none()
+        if changed is None:
+            raise RuntimeError("ledger_session_binding_mismatch")
+        ready_session_ids.append(session_id)
+    elif record_type in {"execution_accepted", "execution_started"}:
+        _require_fields(data, {"sessionId", "executionId", "scriptSha256"})
+        session_id = _uuid(data["sessionId"], "session_id")
+        execution_id = _uuid(data["executionId"], "execution_id")
+        script_sha256 = str(data["scriptSha256"])
+        row = _execution_binding(connection, device_id, session_id, execution_id, script_sha256)
+        if row["status"] not in {"queued", "running"}:
+            raise RuntimeError("ledger_execution_not_live")
+        values = {
+            "status": "running",
+            "last_confirmed_status": "accepted" if record_type == "execution_accepted" else "running",
+        }
+        if record_type == "execution_accepted":
+            values["endpoint_accepted_at"] = endpoint_observed_at
+        else:
+            values["endpoint_started_at"] = endpoint_observed_at
+            values["started_at"] = func.coalesce(executions.c.started_at, func.now())
+        connection.execute(update(executions).where(executions.c.id == execution_id).values(**values))
+    elif record_type == "output_chunk":
+        _require_fields(data, {"sessionId", "executionId", "scriptSha256", "stream", "text"})
+        session_id = _uuid(data["sessionId"], "session_id")
+        execution_id = _uuid(data["executionId"], "execution_id")
+        script_sha256 = str(data["scriptSha256"])
+        _execution_binding(connection, device_id, session_id, execution_id, script_sha256)
+        _collect_output(pending_output, execution_id, str(data["stream"]), str(data["text"]), endpoint_observed_at)
+    elif record_type == "output_dropped":
+        _require_fields(data, {"sessionId", "executionId", "scriptSha256", "reason"})
+        session_id = _uuid(data["sessionId"], "session_id")
+        execution_id = _uuid(data["executionId"], "execution_id")
+        script_sha256 = str(data["scriptSha256"])
+        _execution_binding(connection, device_id, session_id, execution_id, script_sha256)
+        connection.execute(update(executions).where(executions.c.id == execution_id).values(
+            output_complete=False, output_loss_reason=str(data["reason"])[:80], capture_truncated=True))
+    elif record_type == "execution_finished":
+        _require_fields(data, {"sessionId", "executionId", "scriptSha256", "state",
+                               "invocationOutcome", "exitCode", "exitCodeSource", "hadErrors",
+                               "durationMs", "captureTruncated", "lastNativeExitCode"})
+        session_id = _uuid(data["sessionId"], "session_id")
+        execution_id = _uuid(data["executionId"], "execution_id")
+        script_sha256 = str(data["scriptSha256"])
+        row = _execution_binding(connection, device_id, session_id, execution_id, script_sha256)
+        if row["status"] not in {"queued", "running"}:
+            raise RuntimeError("ledger_execution_not_live")
+        values = _terminal_values(data, endpoint_observed_at)
+        if row["output_complete"] is False:
+            values["capture_truncated"] = True
         changed = connection.execute(update(executions).where(
-            executions.c.id == execution_id, executions.c.status == "running"
+            executions.c.id == execution_id,
+            executions.c.status.in_(("queued", "running")),
         ).values(**values)).rowcount
         if changed != 1:
             raise RuntimeError("invalid_execution_transition")
+        terminal_execution_ids.append(execution_id)
+    elif record_type == "cancellation_requested":
+        _require_fields(data, {"sessionId", "executionId", "scriptSha256"})
+        session_id = _uuid(data["sessionId"], "session_id")
+        execution_id = _uuid(data["executionId"], "execution_id")
+        script_sha256 = str(data["scriptSha256"])
+        row = _execution_binding(connection, device_id, session_id, execution_id, script_sha256)
+        connection.execute(insert(audit_records).values(
+            id=uuid.uuid4(), workspace_id=row["workspace_id"], caller_id=row["caller_id"],
+            action="execution.cancellation_observed", resource_type="execution", resource_id=execution_id))
+    elif record_type == "worker_stopped":
+        _require_fields(data, {"sessionId", "executionId", "scriptSha256", "reason",
+                               "cleanupConfirmed", "captureTruncated"})
+        session_id = _uuid(data["sessionId"], "session_id")
+        _session_binding(connection, device_id, session_id)
+        execution_raw = data["executionId"]
+        execution_id = None if execution_raw is None else _uuid(execution_raw, "execution_id")
+        if execution_id is not None:
+            script_sha256 = str(data["scriptSha256"])
+            row = _execution_binding(connection, device_id, session_id, execution_id, script_sha256)
+            if row["status"] in {"queued", "running"}:
+                capture_truncated = bool(data["captureTruncated"]) or row["output_complete"] is False
+                connection.execute(update(executions).where(
+                    executions.c.id == execution_id,
+                    executions.c.status.in_(("queued", "running")),
+                ).values(status="outcome_unknown", outcome_reason=str(data["reason"])[:64],
+                         last_confirmed_status=executions.c.status, endpoint_finished_at=endpoint_observed_at,
+                         finished_at=func.now(), capture_truncated=capture_truncated,
+                         output_complete=False if capture_truncated else executions.c.output_complete,
+                         output_loss_reason=func.coalesce(
+                             executions.c.output_loss_reason, str(data["reason"])[:80])
+                         if capture_truncated else executions.c.output_loss_reason))
+                terminal_execution_ids.append(execution_id)
+        elif data["scriptSha256"] is not None:
+            raise RuntimeError("ledger_binding_mismatch")
+        if data.get("cleanupConfirmed") is True:
+            connection.execute(update(sessions).where(
+                sessions.c.id == session_id,
+                sessions.c.device_id == device_id,
+                sessions.c.state.in_(("starting", "active", "closing", "cleanup_unknown")),
+            ).values(state="lost", closed_at=func.now()))
+        else:
+            connection.execute(update(sessions).where(
+                sessions.c.id == session_id,
+                sessions.c.device_id == device_id,
+                sessions.c.state.in_(("starting", "active", "closing")),
+            ).values(state="cleanup_unknown", closed_at=func.now()))
+    elif record_type == "session_closed":
+        _require_fields(data, {"sessionId"})
+        session_id = _uuid(data["sessionId"], "session_id")
+        _session_binding(connection, device_id, session_id)
+        changed = connection.execute(update(sessions).where(
+            sessions.c.id == session_id,
+            sessions.c.device_id == device_id,
+            sessions.c.state.in_(("starting", "active", "closing", "cleanup_unknown", "lost")),
+        ).values(state="closed", closed_at=func.now()).returning(sessions.c.id)).scalar_one_or_none()
+        if changed is None:
+            raise RuntimeError("ledger_session_binding_mismatch")
+        closed_session_ids.append(session_id)
+    else:
+        raise RuntimeError("invalid_record_type")
+    return {
+        "terminal_execution_ids": terminal_execution_ids,
+        "ready_session_ids": ready_session_ids,
+        "closed_session_ids": closed_session_ids,
+    }
 
-def mark_execution_unknown(execution_id: uuid.UUID, reason: str,
-                           last_confirmed_status: str) -> None:
+def ingest_endpoint_ledger_batch(device_id: uuid.UUID | str, ledger_id: str,
+                                 records: list[dict[str, object]]) -> dict[str, object]:
+    if not records:
+        raise RuntimeError("empty_ledger_batch")
+    device_uuid = uuid.UUID(str(device_id))
+    terminal_execution_ids: list[uuid.UUID] = []
+    ready_session_ids: list[uuid.UUID] = []
+    closed_session_ids: list[uuid.UUID] = []
+    pending_output: list[dict[str, object]] = []
     with transaction() as connection:
-        connection.execute(update(executions).where(
-            executions.c.id == execution_id,
-            executions.c.status.in_(("queued", "running")),
-        ).values(status="outcome_unknown", outcome_reason=reason,
-                 last_confirmed_status=last_confirmed_status, finished_at=func.now()))
+        owned = connection.execute(select(devices.c.id).where(
+            devices.c.id == device_uuid,
+        ).with_for_update()).scalar_one_or_none()
+        if owned is None:
+            raise RuntimeError("unknown_device")
+        cursor = connection.execute(select(endpoint_ledger_cursors).where(
+            endpoint_ledger_cursors.c.device_id == device_uuid).with_for_update()).mappings().one_or_none()
+        if cursor is None:
+            connection.execute(insert(endpoint_ledger_cursors).values(
+                device_id=device_uuid, ledger_id=ledger_id, acknowledged_through=0))
+            acknowledged_through = 0
+        else:
+            if cursor["ledger_id"] != ledger_id:
+                raise RuntimeError("ledger_generation_mismatch")
+            acknowledged_through = int(cursor["acknowledged_through"])
+        expected = acknowledged_through + 1
+        for record in records:
+            sequence = int(record["sequence"])
+            if sequence <= 0:
+                raise RuntimeError("invalid_ledger_sequence")
+            record_type = str(record["recordType"])
+            endpoint_observed_at = datetime.fromisoformat(
+                str(record["endpointObservedAt"]).replace("Z", "+00:00"))
+            data = record["data"]
+            if not isinstance(data, dict):
+                raise RuntimeError("invalid_ledger_record")
+            canonical = {
+                "sequence": sequence,
+                "recordType": record_type,
+                "endpointObservedAt": endpoint_observed_at.isoformat(),
+                "data": data,
+            }
+            record_hash = _canonical_record_hash(canonical)
+            existing = connection.execute(select(endpoint_ledger_records.c.record_hash).where(
+                endpoint_ledger_records.c.device_id == device_uuid,
+                endpoint_ledger_records.c.ledger_id == ledger_id,
+                endpoint_ledger_records.c.sequence == sequence,
+            )).scalar_one_or_none()
+            if existing is not None:
+                if existing != record_hash:
+                    raise RuntimeError("ledger_conflicting_duplicate")
+                continue
+            if sequence != expected:
+                raise RuntimeError("ledger_gap")
+            outcome = _apply_ledger_record(connection, device_uuid, record_type, data,
+                                           endpoint_observed_at, pending_output)
+            terminal_execution_ids.extend(outcome["terminal_execution_ids"])
+            ready_session_ids.extend(outcome["ready_session_ids"])
+            closed_session_ids.extend(outcome["closed_session_ids"])
+            connection.execute(insert(endpoint_ledger_records).values(
+                device_id=device_uuid, ledger_id=ledger_id, sequence=sequence,
+                record_type=record_type, record_hash=record_hash, record=canonical,
+                endpoint_observed_at=endpoint_observed_at))
+            acknowledged_through = sequence
+            expected = sequence + 1
+        _bulk_insert_output(connection, pending_output)
+        connection.execute(update(endpoint_ledger_cursors).where(
+            endpoint_ledger_cursors.c.device_id == device_uuid,
+        ).values(acknowledged_through=acknowledged_through, updated_at=func.now()))
+    return {
+        "ledger_id": ledger_id,
+        "acknowledged_through": acknowledged_through,
+        "terminal_execution_ids": terminal_execution_ids,
+        "ready_session_ids": ready_session_ids,
+        "closed_session_ids": closed_session_ids,
+    }
 
 def mark_execution_failed_to_start(execution_id: uuid.UUID, reason: str) -> None:
     with transaction() as connection:
@@ -731,22 +1025,29 @@ def get_execution_output_preview(execution_id: uuid.UUID, stream: str, limit_byt
     return {"text": page["text"], "shortened": page["has_more"]}
 
 def recover_interrupted_work() -> None:
-    """A process restart destroys every live socket/worker claim."""
+    """Resolve only work the restarted control plane provably never dispatched.
+
+    Once a dispatch intent is durable, endpoint delivery is ambiguous. Those
+    rows remain live so the endpoint ledger can replay accepted/running/terminal
+    evidence after reconnect.
+    """
     with transaction() as connection:
         connection.execute(update(executions).where(
-            executions.c.status.in_(("queued", "running"))).values(
-            status="outcome_unknown", outcome_reason="control_plane_restart",
-            last_confirmed_status=executions.c.status, finished_at=func.now()))
+            executions.c.status == "queued",
+            executions.c.dispatch_requested_at.is_(None),
+        ).values(status="failed_to_start", outcome_reason="control_plane_restart_before_dispatch",
+                 last_confirmed_status="queued", finished_at=func.now()))
         connection.execute(update(sessions).where(
-            sessions.c.state.in_(("starting", "active", "closing"))).values(
-            state="failed", closed_at=func.now()))
+            sessions.c.state == "starting",
+            sessions.c.dispatch_requested_at.is_(None),
+        ).values(state="failed", closed_at=func.now()))
 
 def fail_device_investigations(device_id: uuid.UUID | str) -> list[uuid.UUID]:
     with transaction() as connection:
         authorization_status = connection.execute(select(devices.c.authorization_status).where(
             devices.c.id == device_id)).scalar_one_or_none()
-        reason = ("device_revoked_cleanup_unconfirmed"
-                  if authorization_status == "revoked" else "endpoint_disconnected")
+        if authorization_status != "revoked":
+            return []
         live_sessions = select(sessions.c.id).where(
             sessions.c.device_id == device_id,
             sessions.c.state.in_(("starting", "active", "closing")))
@@ -756,7 +1057,7 @@ def fail_device_investigations(device_id: uuid.UUID | str) -> list[uuid.UUID]:
         connection.execute(update(executions).where(
             executions.c.session_id.in_(live_sessions),
             executions.c.status.in_(("queued", "running"))).values(
-            status="outcome_unknown", outcome_reason=reason,
+            status="outcome_unknown", outcome_reason="device_revoked_cleanup_unconfirmed",
             last_confirmed_status=executions.c.status, finished_at=func.now()))
         connection.execute(update(sessions).where(
             sessions.c.device_id == device_id,

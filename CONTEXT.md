@@ -58,11 +58,14 @@ _Avoid_: Safe mode or read-only mode unless those guarantees are enforced
 **Invocation outcome**:
 The observed manner in which a submitted PowerShell invocation ended, distinct from whether the underlying IT problem was resolved.
 
-**Late result**:
-Execution evidence received after an execution was finalized with an unknown outcome; it supplements that record without erasing the earlier uncertainty.
+**Endpoint ledger**:
+The endpoint agent's durable append-only record of accepted session/execution lifecycle, retained output chunks, output-loss markers, and terminal evidence. The control plane acknowledges only the contiguous records committed to PostgreSQL.
 
 **Output preview**:
 The limited portion of retained execution output returned initially to a caller.
 
 **Capture truncation**:
 Loss of emitted output because it exceeds the retention boundary, distinct from merely hiding retained content behind a preview.
+
+**Output completeness**:
+Whether the endpoint believes retained output evidence is complete. `output_complete: false` means output was explicitly lost, such as endpoint ledger capacity exhaustion, even if the invocation's terminal result was preserved.
