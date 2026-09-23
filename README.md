@@ -7,6 +7,7 @@ Two-day work-trial project: a Windows endpoint agent and control plane designed 
 - [Software spec and implementation tickets](https://github.com/junnengsoo/ai-native-rmm/issues/1) — authoritative agreed scope, dependencies, and open assumptions
 - [Delivery and operations checklist](https://github.com/junnengsoo/ai-native-rmm/issues/2) — submission and trial cleanup obligations
 - [Domain glossary](CONTEXT.md) — shared terminology
+- [Threat model](docs/threat-model.md) — trust boundaries, implemented defences, and deferred risks
 - [Windows test environment](docs/windows-test-environment.md) — existing VM access and operating constraints
 - [Original assignment](https://squash.ai/interview-projects/ai-native-rmm)
 
