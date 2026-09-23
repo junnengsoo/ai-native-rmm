@@ -155,6 +155,11 @@ internal static class AgentRuntime {
     private static async Task HandleMessage(WebSocket socket, LedgerTransport transport, EndpointLedger ledger,
                                             string device, JsonElement message, RuntimeFrame frame,
                                             AgentRuntimeState state) {
+        string observedType = message.TryGetProperty("type", out var observedTypeElement)
+            && observedTypeElement.ValueKind == JsonValueKind.String
+            ? observedTypeElement.GetString() ?? "<null>"
+            : "<missing>";
+        Console.Error.WriteLine($"[DEBUG-close] received={observedType} invocation={frame.Invocation is not null}");
         if (TryApplyAck(ledger, transport, message)) return;
         if (message.TryGetProperty("type", out var typeElement)
             && typeElement.ValueKind == JsonValueKind.String
@@ -163,6 +168,7 @@ internal static class AgentRuntime {
         Dispatch? request;
         try { request = Dispatch.Parse(message, device); }
         catch (JsonException) { request = null; }
+        Console.Error.WriteLine($"[DEBUG-close] parsed={request?.Type ?? "<invalid>"} session_match={request?.SessionId == frame.Session}");
         if (request is null) {
             await Reject(socket, transport.SendLock, device, "invalid_request");
             return;
