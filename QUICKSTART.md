@@ -38,22 +38,59 @@ It prints the API and OpenAPI URLs. PostgreSQL is never published.
 ## 2. Install the Windows MSI
 
 Get `SquashEndpointAgent.msi` onto the Windows machine using any file-transfer
-method available in that environment. File transfer is deliberately outside
-this demo bundle; you do not need to copy any of this repository's scripts to
-Windows.
+method available in that environment. You do not need to copy any of this
+repository's scripts to Windows.
 
-From the Windows desktop (including an Azure Bastion or RDP session), open
-PowerShell as Administrator. Replace both placeholders below, then run the MSI
-directly with the `RMM_ENDPOINT` printed by `demo start`:
+### Optional: copy from macOS over direct RDP
 
-```powershell
-msiexec.exe /i 'C:\path\to\SquashEndpointAgent.msi' /qn /norestart `
-  /l*v "$env:TEMP\SquashEndpointAgent-install.log" `
-  RMM_ENDPOINT='wss://YOUR-TUNNEL.trycloudflare.com/agent'
+Azure's browser-based Bastion Developer session does not transfer files. If the
+Windows machine permits direct RDP, install Microsoft Windows App on the Mac:
+
+```sh
+brew install --cask windows-app
 ```
 
-Accept exit code `0` or `3010`. The command installs and starts the automatic
-`SquashEndpointAgent` Windows service. Confirm it is running:
+Add the Windows machine in Windows App, redirect the Mac folder containing the
+MSI, and reconnect. For example, redirect `/Users/YOU/Desktop`; it appears in
+Windows beneath `\\tsclient`. In Windows PowerShell, inspect the redirected
+folders and copy the installer locally:
+
+```powershell
+Get-ChildItem '\\tsclient'
+Copy-Item `
+  -LiteralPath '\\tsclient\Desktop\SquashEndpointAgent.msi' `
+  -Destination "$env:USERPROFILE\Desktop\SquashEndpointAgent.msi"
+Get-FileHash "$env:USERPROFILE\Desktop\SquashEndpointAgent.msi" -Algorithm SHA256
+```
+
+If the redirected folder has a different name, use the name printed by
+`Get-ChildItem`. Compare the Windows hash with the source hash printed on macOS
+by `shasum -a 256 /absolute/path/SquashEndpointAgent.msi`.
+
+From the Windows desktop (including an Azure Bastion or RDP session), open
+PowerShell as Administrator. Set the local MSI path and replace the endpoint
+placeholder with the `RMM_ENDPOINT` printed by `demo start`, then install:
+
+```powershell
+$MsiPath = "$env:USERPROFILE\Desktop\SquashEndpointAgent.msi"
+$Endpoint = 'wss://YOUR-TUNNEL.trycloudflare.com/agent'
+$LogPath = "$env:TEMP\SquashEndpointAgent-install.log"
+
+$install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+  '/i', "`"$MsiPath`"",
+  '/qn', '/norestart',
+  '/l*v', "`"$LogPath`"",
+  "RMM_ENDPOINT=$Endpoint"
+)
+
+if ($install.ExitCode -notin @(0, 3010)) {
+  throw "Installation failed with exit code $($install.ExitCode). See $LogPath"
+}
+```
+
+Exit code `0` means success; `3010` means success with a reboot required. The
+command installs and starts the automatic `SquashEndpointAgent` Windows service.
+Confirm it is running:
 
 ```powershell
 Get-Service SquashEndpointAgent
