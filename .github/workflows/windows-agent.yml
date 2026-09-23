@@ -3,7 +3,7 @@ on:
   push:
     branches: [main, codex/issue-3-windows-agent]
   pull_request:
-    paths: ['src/EndpointAgent/**', 'tests/ProtocolHarness/**', 'scripts/windows-smoke.ps1', '.github/workflows/windows-agent.yml']
+    paths: ['src/EndpointAgent/**', 'installer/**', 'tests/ProtocolHarness/**', 'scripts/windows-smoke.ps1', 'scripts/package-windows-agent.ps1', '.github/workflows/windows-agent.yml']
 permissions:
   contents: read
 jobs:
@@ -18,3 +18,13 @@ jobs:
       - name: Real agent and independent authenticated peer
         shell: powershell
         run: .\scripts\windows-smoke.ps1
+      - name: Build unsigned trial MSI
+        shell: powershell
+        run: .\scripts\package-windows-agent.ps1
+      - name: Upload unsigned trial MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: squash-endpoint-agent-msi
+          path: artifacts/windows-agent/SquashEndpointAgent.msi
+          if-no-files-found: error
+          retention-days: 7

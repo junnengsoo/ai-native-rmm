@@ -30,7 +30,7 @@ MIN_TIMEOUT_SECONDS = 0.1
 
 INSTRUCTIONS = """You are a caller-side RMM diagnostic driver.
 You may author PowerShell scripts, submit them to the already-open Windows
-session, wait for terminal results, and read retained output pages. Use this
+session, wait for terminal results, and inspect retained output. Use this
 freedom only for read-only diagnosis: inspect networking, DNS, routes, SMB
 connectivity, service state, logs, and configuration; do not remediate, mutate,
 delete, install, restart, reconfigure, exfiltrate secrets, or weaken security.
@@ -118,11 +118,14 @@ class ControlPlaneClient:
             timeout_seconds=max(MIN_TIMEOUT_SECONDS, bounded_wait + 1),
         )
 
-    async def output_page(self, execution_id: str, stream: str, after: str, *, timeout_seconds: float) -> dict[str, Any]:
+    async def inspect_output(self, execution_id: str, stream: str, mode: str,
+                             params: dict[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
+        if mode not in {"search", "tail", "range"}:
+            raise DriverError("invalid_inspection_mode")
         return await self.request_json(
             "GET",
-            f"/executions/{execution_id}/output/{stream}",
-            params={"after": after, "limit_bytes": DEFAULT_PAGE_LIMIT_BYTES},
+            f"/executions/{execution_id}/output/{stream}/{mode}",
+            params=params,
             timeout_seconds=timeout_seconds,
         )
 
@@ -176,10 +179,16 @@ def validate_wait_seconds(timeout_seconds: float) -> float:
     return float(timeout_seconds)
 
 
-def validate_cursor(cursor: str) -> str:
-    if not isinstance(cursor, str) or not cursor.isdecimal():
-        raise DriverError("invalid_cursor")
-    return cursor
+def validate_stream(stream: str) -> str:
+    if stream not in {"stdout", "stderr"}:
+        raise DriverError("invalid_stream")
+    return stream
+
+
+def validate_nonnegative_int(value: int | None, code: str) -> int:
+    if isinstance(value, bool) or value is None or value < 0:
+        raise DriverError(code)
+    return value
 
 
 def require_owned_execution(ctx: DiagnosticContext, execution_id: str) -> str:
@@ -256,25 +265,65 @@ async def _wait_for_execution(ctx: DiagnosticContext, execution_id: str, timeout
     }
 
 
-async def _read_output(ctx: DiagnosticContext, execution_id: str, stream: str, cursor: str) -> dict[str, Any]:
+def bounded_inspection(result: dict[str, Any]) -> dict[str, Any]:
+    bounded = dict(result)
+    if "text" in bounded:
+        bounded["text"] = bounded_text(str(bounded["text"]))
+    if isinstance(bounded.get("matches"), list):
+        matches = []
+        for match in bounded["matches"]:
+            copied = dict(match)
+            copied["text"] = bounded_text(str(copied.get("text", "")))
+            context = copied.get("context") if isinstance(copied.get("context"), dict) else {}
+            copied["context"] = {
+                "before": bounded_text(str(context.get("before", ""))),
+                "after": bounded_text(str(context.get("after", ""))),
+            }
+            matches.append(copied)
+        bounded["matches"] = matches
+    return bounded
+
+
+async def _inspect_output(ctx: DiagnosticContext, execution_id: str, stream: str, mode: str,
+                          query: str | None = None, case_sensitive: bool = False,
+                          context_lines: int = 0, limit_matches: int = 20,
+                          after_byte: int = 0, lines: int = 50,
+                          start_byte: int | None = None, end_byte: int | None = None) -> dict[str, Any]:
     execution_id = require_owned_execution(ctx, execution_id)
-    if stream not in {"stdout", "stderr"}:
-        raise DriverError("invalid_stream")
-    cursor = validate_cursor(cursor)
+    stream = validate_stream(stream)
+    if mode == "search":
+        if not isinstance(query, str) or not 1 <= len(query) <= 1024:
+            raise DriverError("invalid_query")
+        if isinstance(context_lines, bool) or not 0 <= context_lines <= 5:
+            raise DriverError("invalid_context_lines")
+        if isinstance(limit_matches, bool) or not 1 <= limit_matches <= 50:
+            raise DriverError("invalid_limit_matches")
+        params = {
+            "query": query,
+            "case_sensitive": bool(case_sensitive),
+            "context_lines": context_lines,
+            "limit_matches": limit_matches,
+            "after_byte": validate_nonnegative_int(after_byte, "invalid_after_byte"),
+        }
+    elif mode == "tail":
+        if isinstance(lines, bool) or not 1 <= lines <= 200:
+            raise DriverError("invalid_lines")
+        params = {"lines": lines}
+    elif mode == "range":
+        start = validate_nonnegative_int(start_byte, "invalid_start_byte")
+        end = validate_nonnegative_int(end_byte, "invalid_end_byte")
+        if end <= start:
+            raise DriverError("invalid_range")
+        params = {"start_byte": start, "end_byte": end}
+    else:
+        raise DriverError("invalid_inspection_mode")
     started = time.perf_counter()
-    page = await ctx.control_plane.output_page(execution_id, stream, cursor, timeout_seconds=remaining_seconds(ctx))
+    result = await ctx.control_plane.inspect_output(
+        execution_id, stream, mode, params, timeout_seconds=remaining_seconds(ctx),
+    )
     api_ms = (time.perf_counter() - started) * 1000
-    ctx.steps.append(StepTiming("read_output:" + stream, execution_id, api_ms, None, "page"))
-    return {
-        "execution_id": execution_id,
-        "stream": stream,
-        "cursor": cursor,
-        "text": bounded_text(page["text"]),
-        "next_cursor": page["next_cursor"],
-        "more_available": bool(page["more_available"]),
-        "capture_lost": bool(page["capture_lost"]),
-        "gap": page["gap"],
-    }
+    ctx.steps.append(StepTiming("inspect_output:" + mode + ":" + stream, execution_id, api_ms, None, "read"))
+    return {"execution_id": execution_id, "mode": mode, **bounded_inspection(result)}
 
 
 @function_tool
@@ -298,14 +347,26 @@ async def wait_for_execution(
 
 
 @function_tool
-async def read_output(
+async def inspect_output(
     wrapper: RunContextWrapper[DiagnosticContext],
     execution_id: str,
     stream: Literal["stdout", "stderr"],
-    cursor: Annotated[str, Field(pattern=r"^\d+$")] = "0",
+    mode: Literal["search", "tail", "range"],
+    query: Annotated[str | None, Field(min_length=1, max_length=1024)] = None,
+    case_sensitive: bool = False,
+    context_lines: Annotated[int, Field(ge=0, le=5)] = 0,
+    limit_matches: Annotated[int, Field(ge=1, le=50)] = 20,
+    after_byte: Annotated[int, Field(ge=0)] = 0,
+    lines: Annotated[int, Field(ge=1, le=200)] = 50,
+    start_byte: Annotated[int | None, Field(ge=0)] = None,
+    end_byte: Annotated[int | None, Field(ge=0)] = None,
 ) -> dict[str, Any]:
-    """Read one bounded retained output page from a driver-owned execution."""
-    return await _read_output(wrapper.context, execution_id, stream, cursor)
+    """Search, tail, or expand a range of retained output from a driver-owned execution."""
+    return await _inspect_output(
+        wrapper.context, execution_id, stream, mode, query=query, case_sensitive=case_sensitive,
+        context_lines=context_lines, limit_matches=limit_matches, after_byte=after_byte,
+        lines=lines, start_byte=start_byte, end_byte=end_byte,
+    )
 
 
 def build_agent(model: str) -> Agent[DiagnosticContext]:
@@ -313,7 +374,7 @@ def build_agent(model: str) -> Agent[DiagnosticContext]:
         name="Windows file-server diagnostic driver",
         model=model,
         instructions=INSTRUCTIONS,
-        tools=[submit_script, wait_for_execution, read_output],
+        tools=[submit_script, wait_for_execution, inspect_output],
         model_settings=ModelSettings(parallel_tool_calls=False, store=False, include_usage=True),
     )
 
@@ -416,10 +477,10 @@ async def drive_diagnostic(
         prompt = (
             f"Problem: {problem}\n"
             f"Budget: at most {max_steps} submitted PowerShell scripts and {max_seconds} seconds. "
-            "Use submit_script, wait_for_execution, and read_output as needed. "
+            "Use submit_script, wait_for_execution, and inspect_output as needed. "
             "The control plane allows only one active script in this session: after submit_script, "
             "call wait_for_execution for that returned execution ID until terminal before submitting another script. "
-            "Read output pages only for execution IDs returned by this run. "
+            "Inspect retained output only for execution IDs returned by this run. "
             "Run at least two dependent read-only diagnostic scripts before finalizing when the budget allows. "
             "Remember: read-only diagnosis is policy, not sandbox enforcement; scripts currently run as LocalSystem."
         )

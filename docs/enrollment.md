@@ -2,7 +2,8 @@
 
 This document covers enrollment and reachability. The next implemented slice
 adds authenticated script dispatch; see [persistent investigations](investigations.md).
-The project does not yet install a service or recover/revoke devices.
+The [Windows service installer](windows-service-installer.md) now covers the
+trial service packaging path. Recovery/revocation remain later work.
 The older `--agent` entry point remains an isolated, manually provisioned mTLS
 execution harness; never deploy it to customer endpoints as an enrollment bypass.
 
@@ -80,13 +81,14 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOU
    P-256 signing key in the launching account's Windows key store. This console
    output is deliberate one-time delivery; do not collect it as an operational
    log. While pending, the device list remains empty.
-2. On the Mac run `.venv/bin/python -m control_plane.client approve` and enter the
-   code from that trusted Windows view. Expect `approved` plus a stable device
+2. On the Mac run `.venv/bin/python -m control_plane.client approve`, enter the
+   code from that trusted Windows view, and choose a workspace-unique device
+   name. Expect `approved` plus a stable device
    UUID. The approval HTTP request carries the code in its JSON body.
 3. Run `.venv/bin/python -m control_plane.client list`. Within about 15 seconds,
    Windows prints `online` and the list reports `online` with the same UUID.
-   Repeat after 15–20 seconds; `last_seen` advances. `approved` means admin
-   approval exists but the endpoint has not yet completed a fresh key proof.
+   Repeat after 15–20 seconds; `last_seen` advances. `awaiting_activation` means
+   admin approval exists but the endpoint has not yet completed a fresh key proof.
 4. Stop the Windows agent with Ctrl+C. After 46 seconds, list again: reachability
    is `stale`. Staleness describes missing recent evidence, not device power state.
    Restart with the same account/key name; expect the same UUID and `online`.
@@ -96,11 +98,12 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --enroll wss://YOU
    admin approval and cannot claim the original UUID.
 6. Stop the tunnel when finished and run `docker compose down`. Unset the
    admin environment variable. Keep the endpoint key only if continuing the
-   trial; uninstall and recovery approved by an admin belong to later tickets.
+   trial. A clean uninstall deliberately removes it; use technician recovery
+   after reinstall as described below.
 
 An approved key must first activate before the original ten-minute code deadline;
-otherwise it reports `approval_expired` and cannot authenticate. There is no key
-replacement/recovery operation yet. If the one-time code display is lost, allow
+otherwise it reports `activation_expired` and cannot authenticate. If the
+one-time code display is lost, allow
 the pending request to expire; reconnect then receives a fresh code. Do not
 silently enroll a replacement key as the same logical device.
 
@@ -117,8 +120,9 @@ device ID or forwarded certificate header establishes identity.
 An unknown proven key receives `pending`, a one-time 12-character base32 code,
 and `expires_in_seconds: 600`. Reconnecting with that key before expiry returns
 `pending` without disclosing the code again. The database binds the code hash
-immutably to that public key. Admin `POST /pairings/approve` atomically
-consumes a live code and assigns a UUID in the admin's workspace. Pending
+immutably to that public key. Admin `POST /pairings/approve` accepts the code
+and `device_name`, atomically consumes a live code, and assigns a UUID in the
+admin's workspace. Pending
 keys never appear in device lists and this mode has no execution path.
 
 After approval, a new connection and nonce proof activates the key. `online`
@@ -127,13 +131,24 @@ sends `{"type":"heartbeat"}` and the server acknowledges it. The same authentica
 channel also carries strictly bound session/execution dispatch. Reconnect proves the persisted key again;
 there are no reusable bearer tokens on Windows. `GET /devices` scopes every row
 to the authenticated workspace; `limit` is 1–100 and `after` accepts the prior
-`next_cursor` UUID. Reachability is `approved`, `online`, `stale`, or
-`approval_expired`. Times come from PostgreSQL, not endpoint claims. A small typed
+`next_cursor` UUID. Reachability is `awaiting_activation`, `online`, `stale`, or
+`activation_expired`. Device authorization status is a separate concern from
+reachability; `authorization_status` is `active` or `revoked` and is described in
+[device revocation](device-revocation.md). Times come from PostgreSQL, not endpoint
+claims. A small typed
 Python policy classifies each page against one database-supplied `observed_at`:
 contact strictly newer than 45 seconds is online; contact exactly 45 seconds old
 is stale. Without contact, the activation deadline is expired at equality.
 Previously activated devices remain stale/online regardless of that deadline.
 Workspace filtering, ordering and pagination remain in PostgreSQL.
+
+Ordinary authenticated reconnection and technician recovery are distinct.
+A known active credential reconnects without approval. After clean uninstall,
+the replacement installation generates a fresh key and pairing code. An admin
+explicitly selects the existing Device and submits that code to
+`POST /devices/DEVICE_ID/recover`. Fresh proof activates the pending replacement,
+invalidates the old credential, and preserves Device identity and history. See
+[technician recovery](device-recovery.md).
 
 The new reachability protocol uses application-level possession proof because a
 TLS-terminating development tunnel need not forward client certificates. The
@@ -222,8 +237,8 @@ contract tests remain in place.
 Not covered by manual smoke: replayed nonce proofs, concurrent competing
 approvals, cross-workspace reads, request/attempt limits and real code expiry
 are automated gates; maximum pending-pool bound and hash-only persistence are
-also reviewed in code. Installer/service lifecycle, output streaming,
-recovery/revocation, SSE and production deployment remain later tickets.
+ also reviewed in code. Output streaming, recovery/revocation, SSE and
+ production deployment remain later tickets.
 
 ## Recorded results
 

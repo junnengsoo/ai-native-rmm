@@ -7,7 +7,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Iterator
+from typing import Iterator, Literal
 
 from alembic import command
 from alembic.config import Config
@@ -19,7 +19,17 @@ from sqlalchemy.dialects.postgresql import UUID, insert as postgresql_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
 from sqlalchemy.exc import IntegrityError
 
+from .output_queries import (
+    MAX_QUERY_SCAN_EVENTS,
+    query_retained_output,
+    range_retained_output,
+    tail_retained_output,
+)
+
 metadata = MetaData()
+UNRESOLVED_SESSION_STATES = ("starting", "active", "closing", "cleanup_unknown")
+RecoveryOutcome = Literal["pending", "not_found", "revoked", "device_busy",
+                          "recovery_pending", "invalid_code"]
 workspaces = Table("workspaces", metadata,
     Column("id", UUID(as_uuid=True), primary_key=True), Column("name", Text, nullable=False))
 callers = Table("callers", metadata,
@@ -40,9 +50,35 @@ caller_credentials = Table("caller_credentials", metadata,
 devices = Table("devices", metadata,
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("workspace_id", UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=False),
-    Column("public_key", Text, nullable=False, unique=True),
+    Column("device_name", String(100), nullable=False),
     Column("approved_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-    Column("last_seen", DateTime(timezone=True)), Column("activate_before", DateTime(timezone=True)))
+    Column("last_seen", DateTime(timezone=True)),
+    Column("authorization_status", String(16), nullable=False, server_default="active"),
+    Column("revoked_at", DateTime(timezone=True)),
+    Column("revoked_by", UUID(as_uuid=True), ForeignKey("callers.id")),
+    CheckConstraint("authorization_status IN ('active', 'revoked')", name="devices_authorization_status_valid"),
+    CheckConstraint("(authorization_status = 'active' AND revoked_at IS NULL AND revoked_by IS NULL) OR "
+                    "(authorization_status = 'revoked' AND revoked_at IS NOT NULL AND revoked_by IS NOT NULL)",
+                    name="devices_revocation_fields_consistent"))
+Index("devices_workspace_name_key", devices.c.workspace_id, func.lower(devices.c.device_name), unique=True)
+device_credentials = Table("device_credentials", metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("device_id", UUID(as_uuid=True), ForeignKey("devices.id"), nullable=False),
+    Column("public_key", Text, nullable=False, unique=True),
+    Column("state", String(16), nullable=False),
+    Column("activate_before", DateTime(timezone=True), nullable=False),
+    Column("approved_by", UUID(as_uuid=True), ForeignKey("callers.id")),
+    Column("approval_code_hash", Text, unique=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("activated_at", DateTime(timezone=True)),
+    Column("invalidated_at", DateTime(timezone=True)),
+    Column("replaces_credential_id", UUID(as_uuid=True), ForeignKey("device_credentials.id")),
+    CheckConstraint("state IN ('pending', 'active', 'replaced', 'expired')",
+                    name="device_credentials_state_valid"))
+Index("device_credentials_one_active", device_credentials.c.device_id, unique=True,
+      postgresql_where=device_credentials.c.state == "active")
+Index("device_credentials_one_pending", device_credentials.c.device_id, unique=True,
+      postgresql_where=device_credentials.c.state == "pending")
 pairings = Table("pairings", metadata, Column("public_key", Text, primary_key=True),
     Column("code_hash", Text, nullable=False, unique=True),
     Column("expires_at", DateTime(timezone=True), nullable=False))
@@ -158,14 +194,20 @@ def authenticate_credential(credential_hash: str) -> RowMapping | None:
         return connection.execute(statement).mappings().one_or_none()
 
 def list_workspace_devices(workspace_id: uuid.UUID, after: uuid.UUID | None, limit: int) -> list[RowMapping]:
-    statement = select(devices.c.id, devices.c.approved_at, devices.c.last_seen,
-                       devices.c.activate_before).where(devices.c.workspace_id == workspace_id)
+    activation_deadline = select(func.max(device_credentials.c.activate_before)).where(
+        device_credentials.c.device_id == devices.c.id,
+        device_credentials.c.state == "pending").scalar_subquery()
+    statement = select(devices.c.id, devices.c.device_name, devices.c.approved_at, devices.c.last_seen,
+                       activation_deadline.label("activate_before"), devices.c.authorization_status,
+                       devices.c.revoked_at, devices.c.revoked_by).where(
+                           devices.c.workspace_id == workspace_id)
     if after is not None:
         statement = statement.where(devices.c.id > after)
     with transaction() as connection:
         return list(connection.execute(statement.order_by(devices.c.id).limit(limit)).mappings())
 
-def approve_pairing(code_hash: str, workspace_id: uuid.UUID) -> uuid.UUID | None:
+def approve_pairing(code_hash: str, workspace_id: uuid.UUID, actor_id: uuid.UUID,
+                    device_name: str) -> uuid.UUID | None:
     with transaction() as connection:
         acquire_enrollment_lock(connection)
         pending = connection.execute(delete(pairings).where(
@@ -175,21 +217,123 @@ def approve_pairing(code_hash: str, workspace_id: uuid.UUID) -> uuid.UUID | None
             return None
         device_id = uuid.uuid4()
         connection.execute(insert(devices).values(id=device_id, workspace_id=workspace_id,
-            public_key=pending["public_key"], activate_before=pending["expires_at"]))
+            device_name=device_name))
+        connection.execute(insert(device_credentials).values(
+            id=uuid.uuid4(), device_id=device_id, public_key=pending["public_key"],
+            state="pending", activate_before=pending["expires_at"], approved_by=actor_id,
+            approval_code_hash=code_hash))
         return device_id
+
+def recover_device(code_hash: str, workspace_id: uuid.UUID, actor_id: uuid.UUID,
+                   device_id: uuid.UUID) -> tuple[RecoveryOutcome, RowMapping | None]:
+    """Bind one freshly proven pending key to an existing device without activating it."""
+    with transaction() as connection:
+        acquire_enrollment_lock(connection)
+        device = connection.execute(select(devices).where(
+            devices.c.id == device_id, devices.c.workspace_id == workspace_id
+        ).with_for_update()).mappings().one_or_none()
+        if device is None:
+            return "not_found", None
+        if device["authorization_status"] == "revoked":
+            return "revoked", device
+        connection.execute(update(device_credentials).where(
+            device_credentials.c.device_id == device_id,
+            device_credentials.c.state == "pending",
+            device_credentials.c.activate_before <= func.now()
+        ).values(state="expired", invalidated_at=func.now()))
+        retry = connection.execute(select(device_credentials).where(
+            device_credentials.c.device_id == device_id,
+            device_credentials.c.approval_code_hash == code_hash,
+            device_credentials.c.approved_by == actor_id,
+            device_credentials.c.state == "pending")).mappings().one_or_none()
+        if retry is not None:
+            return "pending", device
+        unresolved = connection.execute(select(sessions.c.id).where(
+            sessions.c.device_id == device_id,
+            sessions.c.state.in_(UNRESOLVED_SESSION_STATES))
+        ).first()
+        if unresolved is not None:
+            return "device_busy", device
+        if connection.execute(select(device_credentials.c.id).where(
+            device_credentials.c.device_id == device_id,
+            device_credentials.c.state == "pending")).first():
+            return "recovery_pending", device
+        pending = connection.execute(delete(pairings).where(
+            pairings.c.code_hash == code_hash, pairings.c.expires_at > func.now()
+        ).returning(pairings.c.public_key, pairings.c.expires_at)).mappings().one_or_none()
+        if pending is None:
+            return "invalid_code", device
+        predecessor_id = connection.execute(select(device_credentials.c.id).where(
+            device_credentials.c.device_id == device_id
+        ).order_by(
+            (device_credentials.c.state == "active").desc(),
+            device_credentials.c.created_at.desc(),
+            device_credentials.c.id.desc(),
+        ).limit(1).with_for_update()).scalar_one()
+        connection.execute(insert(device_credentials).values(
+            id=uuid.uuid4(), device_id=device_id, public_key=pending["public_key"],
+            state="pending", activate_before=pending["expires_at"], approved_by=actor_id,
+            approval_code_hash=code_hash, replaces_credential_id=predecessor_id))
+        connection.execute(insert(audit_records).values(
+            id=uuid.uuid4(), workspace_id=workspace_id, caller_id=actor_id,
+            action="device.recovery_approved", resource_type="device", resource_id=device_id))
+        return "pending", device
+
+def rename_workspace_device(workspace_id: uuid.UUID, device_id: uuid.UUID,
+                            device_name: str) -> RowMapping | None:
+    with transaction() as connection:
+        return connection.execute(update(devices).where(
+            devices.c.id == device_id, devices.c.workspace_id == workspace_id
+        ).values(device_name=device_name).returning(devices.c.id, devices.c.device_name)
+        ).mappings().one_or_none()
 
 def authenticate_device(public_key: str, pairing_code: str) -> dict[str, object]:
     with transaction() as connection:
         acquire_enrollment_lock(connection)
-        device = connection.execute(select(devices).where(
-            devices.c.public_key == public_key).with_for_update()).mappings().one_or_none()
-        if device is not None:
-            activated = connection.execute(update(devices).where(devices.c.id == device["id"],
-                or_(devices.c.last_seen.is_not(None), devices.c.activate_before > func.now()))
-                .values(last_seen=func.now()).returning(devices.c.id)).scalar_one_or_none()
-            if activated is None:
+        credential = connection.execute(select(
+            device_credentials, devices.c.workspace_id, devices.c.authorization_status
+        ).join(devices, devices.c.id == device_credentials.c.device_id).where(
+            device_credentials.c.public_key == public_key).with_for_update()
+        ).mappings().one_or_none()
+        if credential is not None:
+            device_id = credential["device_id"]
+            device = connection.execute(select(devices).where(
+                devices.c.id == device_id).with_for_update()).mappings().one()
+            if device["authorization_status"] == "revoked":
                 return {"state": "denied"}
-            return {"state": "online", "device_id": str(device["id"]),
+            if credential["state"] in ("replaced", "expired"):
+                return {"state": "denied"}
+            replaced = False
+            if credential["state"] == "pending":
+                if credential["activate_before"] <= datetime.now(timezone.utc):
+                    connection.execute(update(device_credentials).where(
+                        device_credentials.c.id == credential["id"]
+                    ).values(state="expired", invalidated_at=func.now()))
+                    return {"state": "denied"}
+                if credential["replaces_credential_id"] is not None:
+                    if connection.execute(select(sessions.c.id).where(
+                        sessions.c.device_id == device_id,
+                        sessions.c.state.in_(UNRESOLVED_SESSION_STATES)
+                    )).first():
+                        return {"state": "denied"}
+                    connection.execute(update(device_credentials).where(
+                        device_credentials.c.device_id == device_id,
+                        device_credentials.c.state == "active"
+                    ).values(state="replaced", invalidated_at=func.now()))
+                    connection.execute(insert(audit_records).values(
+                        id=uuid.uuid4(), workspace_id=device["workspace_id"],
+                        caller_id=credential["approved_by"], action="device.recovered",
+                        resource_type="device", resource_id=device_id))
+                    replaced = True
+                connection.execute(update(device_credentials).where(
+                    device_credentials.c.id == credential["id"],
+                    device_credentials.c.state == "pending"
+                ).values(state="active", activated_at=func.now()))
+            connection.execute(update(devices).where(
+                devices.c.id == device_id, devices.c.authorization_status == "active"
+            ).values(last_seen=func.now()))
+            return {"state": "online", "device_id": str(device_id),
+                    "credential_id": str(credential["id"]), "replaced": replaced,
                     "heartbeat_seconds": 15, "stale_seconds": 45}
         connection.execute(delete(pairings).where(pairings.c.expires_at <= func.now()))
         if connection.execute(select(pairings.c.public_key).where(pairings.c.public_key == public_key)).first():
@@ -200,9 +344,78 @@ def authenticate_device(public_key: str, pairing_code: str) -> dict[str, object]
             expires_at=func.now() + text("interval '10 minutes'")))
         return {"state": "pending", "code": pairing_code, "expires_in_seconds": 600}
 
-def record_heartbeat(device_id: uuid.UUID | str) -> None:
+def record_heartbeat(device_id: uuid.UUID | str, credential_id: uuid.UUID | str) -> bool:
     with transaction() as connection:
-        connection.execute(update(devices).where(devices.c.id == device_id).values(last_seen=func.now()))
+        return connection.execute(update(devices).where(
+            devices.c.id == device_id, devices.c.authorization_status == "active",
+            select(device_credentials.c.id).where(
+                device_credentials.c.id == credential_id,
+                device_credentials.c.device_id == devices.c.id,
+                device_credentials.c.state == "active").exists()
+        ).values(last_seen=func.now())).rowcount == 1
+
+def get_workspace_device(workspace_id: uuid.UUID, device_id: uuid.UUID) -> RowMapping | None:
+    with transaction() as connection:
+        return connection.execute(select(devices).where(
+            devices.c.id == device_id, devices.c.workspace_id == workspace_id
+        )).mappings().one_or_none()
+
+def revoke_workspace_device(workspace_id: uuid.UUID, actor_id: uuid.UUID,
+                            device_id: uuid.UUID) -> tuple[RowMapping, bool] | None:
+    """Persist revocation exactly once before any best-effort remote cleanup."""
+    with transaction() as connection:
+        device = connection.execute(select(devices).where(
+            devices.c.id == device_id, devices.c.workspace_id == workspace_id
+        ).with_for_update()).mappings().one_or_none()
+        if device is None:
+            return None
+        changed = device["authorization_status"] == "active"
+        if changed:
+            device = connection.execute(update(devices).where(
+                devices.c.id == device_id, devices.c.authorization_status == "active"
+            ).values(authorization_status="revoked", revoked_at=func.now(), revoked_by=actor_id)
+             .returning(devices)).mappings().one()
+            connection.execute(insert(audit_records).values(
+                id=uuid.uuid4(), workspace_id=workspace_id, caller_id=actor_id,
+                action="device.revoked", resource_type="device", resource_id=device_id))
+        return device, changed
+
+def get_live_device_session(workspace_id: uuid.UUID, device_id: uuid.UUID) -> RowMapping | None:
+    with transaction() as connection:
+        return connection.execute(select(sessions).where(
+            sessions.c.workspace_id == workspace_id, sessions.c.device_id == device_id,
+            sessions.c.state.in_(("starting", "active", "closing"))
+        ).order_by(sessions.c.created_at.desc()).limit(1)).mappings().one_or_none()
+
+def mark_device_revocation_cleanup_unknown(device_id: uuid.UUID) -> list[uuid.UUID]:
+    """Finalize live work conservatively when endpoint cleanup cannot be proven."""
+    with transaction() as connection:
+        live_sessions = select(sessions.c.id).where(
+            sessions.c.device_id == device_id,
+            sessions.c.state.in_(("starting", "active", "closing")))
+        uncertain = or_(
+            executions.c.status.in_(("queued", "running")),
+            (executions.c.status == "outcome_unknown") & executions.c.outcome_reason.in_((
+                "endpoint_disconnected", "dispatch_confirmation_lost")),
+        )
+        affected = list(connection.execute(select(executions.c.id).where(
+            executions.c.session_id.in_(live_sessions), uncertain)).scalars())
+        connection.execute(update(executions).where(
+            executions.c.session_id.in_(live_sessions),
+            uncertain).values(
+                status="outcome_unknown", outcome_reason="device_revoked_cleanup_unconfirmed",
+                last_confirmed_status=case(
+                    (executions.c.status == "outcome_unknown", executions.c.last_confirmed_status),
+                    else_=executions.c.status),
+                finished_at=func.now()))
+        connection.execute(update(sessions).where(
+            sessions.c.device_id == device_id,
+            sessions.c.state == "starting").values(state="failed", closed_at=func.now()))
+        connection.execute(update(sessions).where(
+            sessions.c.device_id == device_id,
+            sessions.c.state.in_(("active", "closing"))).values(
+                state="cleanup_unknown", closed_at=func.now()))
+        return affected
 
 def create_workspace_with_admin(name: str, credential_hash: str) -> tuple[uuid.UUID, uuid.UUID]:
     workspace_id, caller_id = uuid.uuid4(), uuid.uuid4()
@@ -234,7 +447,12 @@ def create_starting_session(workspace_id: uuid.UUID, caller_id: uuid.UUID,
         with transaction() as connection:
             owned = connection.execute(select(devices.c.id).where(
                 devices.c.id == device_id, devices.c.workspace_id == workspace_id,
-                devices.c.last_seen > func.now() - text("interval '45 seconds'")
+                devices.c.authorization_status == "active",
+                devices.c.last_seen > func.now() - text("interval '45 seconds'"),
+                ~select(device_credentials.c.id).where(
+                    device_credentials.c.device_id == devices.c.id,
+                    device_credentials.c.state == "pending",
+                    device_credentials.c.replaces_credential_id.is_not(None)).exists()
             ).with_for_update()).scalar_one_or_none()
             if owned is None:
                 return None
@@ -318,9 +536,11 @@ def create_or_get_execution(workspace_id: uuid.UUID, caller_id: uuid.UUID,
             if not same:
                 raise RuntimeError("idempotency_conflict")
             return existing, False
-        session = connection.execute(select(sessions).where(
+        session = connection.execute(select(sessions).join(
+            devices, devices.c.id == sessions.c.device_id).where(
             sessions.c.id == session_id, sessions.c.workspace_id == workspace_id,
-            sessions.c.state == "active").with_for_update()).mappings().one_or_none()
+            sessions.c.state == "active", devices.c.authorization_status == "active"
+        ).with_for_update()).mappings().one_or_none()
         if session is None:
             raise LookupError("active_session_not_found")
         execution_id = uuid.uuid4()
@@ -457,6 +677,40 @@ def get_execution_output_high_water(execution_id: uuid.UUID, stream: str) -> int
             execution_output_events.c.execution_id == execution_id,
             execution_output_events.c.stream == stream)).scalar_one()
 
+def get_execution_output_scan_events(execution_id: uuid.UUID, stream: str,
+                                     high_water: int) -> list[RowMapping]:
+    with transaction() as connection:
+        return list(connection.execute(select(
+            execution_output_events.c.sequence, execution_output_events.c.text,
+            execution_output_events.c.byte_count, execution_output_events.c.created_at,
+        ).where(
+            execution_output_events.c.execution_id == execution_id,
+            execution_output_events.c.stream == stream,
+            execution_output_events.c.sequence <= high_water,
+        ).order_by(execution_output_events.c.sequence).limit(MAX_QUERY_SCAN_EVENTS + 1)).mappings())
+
+def get_execution_output_snapshot_events(execution_id: uuid.UUID, stream: str) -> tuple[int, list[RowMapping]]:
+    high_water = get_execution_output_high_water(execution_id, stream)
+    return high_water, get_execution_output_scan_events(execution_id, stream, high_water)
+
+def search_execution_output(execution_id: uuid.UUID, stream: str, query: str, *,
+                            case_sensitive: bool, context_lines: int,
+                            limit_matches: int, after_byte: int) -> dict[str, object]:
+    high_water, rows = get_execution_output_snapshot_events(execution_id, stream)
+    return query_retained_output(rows, query=query, case_sensitive=case_sensitive,
+                                 context_lines=context_lines, limit_matches=limit_matches,
+                                 after_byte=after_byte, high_water_cursor=high_water)
+
+def tail_execution_output(execution_id: uuid.UUID, stream: str, lines: int) -> dict[str, object]:
+    high_water, rows = get_execution_output_snapshot_events(execution_id, stream)
+    return tail_retained_output(rows, lines=lines, high_water_cursor=high_water)
+
+def range_execution_output(execution_id: uuid.UUID, stream: str,
+                           start_byte: int, end_byte: int) -> dict[str, object]:
+    high_water, rows = get_execution_output_snapshot_events(execution_id, stream)
+    return range_retained_output(rows, start_byte=start_byte, end_byte=end_byte,
+                                 high_water_cursor=high_water)
+
 def get_execution_output_page(execution_id: uuid.UUID, stream: str, after: int,
                               limit_bytes: int) -> dict[str, object]:
     rows = get_execution_output_events(execution_id, stream, after, 1000)
@@ -489,6 +743,10 @@ def recover_interrupted_work() -> None:
 
 def fail_device_investigations(device_id: uuid.UUID | str) -> list[uuid.UUID]:
     with transaction() as connection:
+        authorization_status = connection.execute(select(devices.c.authorization_status).where(
+            devices.c.id == device_id)).scalar_one_or_none()
+        reason = ("device_revoked_cleanup_unconfirmed"
+                  if authorization_status == "revoked" else "endpoint_disconnected")
         live_sessions = select(sessions.c.id).where(
             sessions.c.device_id == device_id,
             sessions.c.state.in_(("starting", "active", "closing")))
@@ -498,7 +756,7 @@ def fail_device_investigations(device_id: uuid.UUID | str) -> list[uuid.UUID]:
         connection.execute(update(executions).where(
             executions.c.session_id.in_(live_sessions),
             executions.c.status.in_(("queued", "running"))).values(
-            status="outcome_unknown", outcome_reason="endpoint_disconnected",
+            status="outcome_unknown", outcome_reason=reason,
             last_confirmed_status=executions.c.status, finished_at=func.now()))
         connection.execute(update(sessions).where(
             sessions.c.device_id == device_id,

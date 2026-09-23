@@ -13,12 +13,11 @@ from agents.usage import InputTokensDetails, OutputTokensDetails, Usage
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
 
 from control_plane.openai_driver import (
-    DEFAULT_PAGE_LIMIT_BYTES,
     ControlPlaneClient,
     DiagnosticHooks,
     DiagnosticContext,
     DriverError,
-    _read_output,
+    _inspect_output,
     _submit_script,
     _wait_for_execution,
     build_agent,
@@ -37,7 +36,7 @@ class FakeControlPlane:
         self.close_raises = False
         self.submitted = []
         self.waits = []
-        self.pages = []
+        self.inspections = []
         self.next_execution = 1
         self.wait_counts = {}
         self.fail_submit = False
@@ -109,30 +108,41 @@ class FakeControlPlane:
             },
         }
 
-    async def output_page(self, execution_id, stream, after, *, timeout_seconds):
-        self.pages.append((execution_id, stream, after))
-        if after == "0":
+    async def inspect_output(self, execution_id, stream, mode, params, *, timeout_seconds):
+        self.inspections.append((execution_id, stream, mode, params))
+        if mode == "search":
             return {
-                "text": "full tcp page 1",
-                "next_cursor": "2",
-                "more_available": True,
+                "stream": stream,
+                "query": params["query"],
+                "case_sensitive": params["case_sensitive"],
+                "matches": [{
+                    "text": "TcpTestSucceeded: False",
+                    "context": {"before": "ComputerName: rmm-test-fileserver\n", "after": ""},
+                    "range": {"start_byte": 31, "end_byte": 54},
+                    "line_range": {"start_line": 2, "end_line": 2},
+                }],
+                "match_count": 1,
+                "limit_reached": False,
+                "next_after_byte": None,
+                "partial": False,
                 "capture_lost": False,
                 "gap": {"detected": False, "reason": None},
             }
-        return {
-            "text": "full tcp page 2",
-            "next_cursor": "3",
-            "more_available": False,
-            "capture_lost": False,
-            "gap": {"detected": False, "reason": None},
-        }
+        if mode == "tail":
+            return {"stream": stream, "text": "stderr tail", "line_range": {"start_line": 1, "end_line": 1},
+                    "range": {"start_byte": 0, "end_byte": 11}, "partial": False,
+                    "capture_lost": False, "gap": {"detected": False, "reason": None}}
+        return {"stream": stream, "text": "TcpTestSucceeded: False",
+                "range": {"start_byte": params["start_byte"], "end_byte": params["end_byte"]},
+                "requested_range": {"start_byte": params["start_byte"], "end_byte": params["end_byte"]},
+                "partial": False, "capture_lost": False, "gap": {"detected": False, "reason": None}}
 
 
 def test_agent_exposes_exactly_three_script_execution_tools():
     agent = build_agent("gpt-5-nano")
 
     assert agent.model == "gpt-5-nano"
-    assert [tool.name for tool in agent.tools] == ["submit_script", "wait_for_execution", "read_output"]
+    assert [tool.name for tool in agent.tools] == ["submit_script", "wait_for_execution", "inspect_output"]
     assert "run_diagnostic" not in {tool.name for tool in agent.tools}
     assert agent.model_settings.parallel_tool_calls is False
     assert agent.model_settings.max_tokens is None
@@ -144,7 +154,10 @@ def test_agent_exposes_exactly_three_script_execution_tools():
     assert schemas["submit_script"]["timeout_ms"]["maximum"] == 60000
     assert set(schemas["wait_for_execution"]) == {"execution_id", "timeout_seconds"}
     assert schemas["wait_for_execution"]["timeout_seconds"]["maximum"] == 60
-    assert set(schemas["read_output"]) == {"execution_id", "stream", "cursor"}
+    assert set(schemas["inspect_output"]) == {
+        "execution_id", "stream", "mode", "query", "case_sensitive", "context_lines",
+        "limit_matches", "after_byte", "lines", "start_byte", "end_byte",
+    }
 
 
 def context(max_steps=2):
@@ -171,13 +184,13 @@ def test_real_agents_sdk_submit_tool_invokes_bound_session_and_schema():
     assert ctx.control_plane.submitted == [("exec-1", "Resolve-DnsName rmm-test-fileserver", 5000)]
 
 
-def test_wait_and_read_reject_unknown_execution_ids():
+def test_wait_and_inspect_reject_unknown_execution_ids():
     ctx = context()
 
     with pytest.raises(DriverError, match="unknown_execution_id"):
         asyncio.run(_wait_for_execution(ctx, "not-created-here", 1))
     with pytest.raises(DriverError, match="unknown_execution_id"):
-        asyncio.run(_read_output(ctx, "not-created-here", "stdout", "0"))
+        asyncio.run(_inspect_output(ctx, "not-created-here", "stdout", "search", query="Tcp"))
 
 
 def test_submit_enforces_driver_owned_script_budget():
@@ -201,15 +214,18 @@ def test_submit_consumes_budget_before_ambiguous_post_result():
         asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver", 5000))
 
 
-def test_three_tools_handle_repeated_wait_and_paged_output():
+def test_three_tools_handle_repeated_wait_and_retained_output_inspection():
     ctx = context(max_steps=2)
     first = asyncio.run(_submit_script(ctx, "Resolve-DnsName rmm-test-fileserver", 5000))
     running = asyncio.run(_wait_for_execution(ctx, first["execution_id"], 0.1))
     complete = asyncio.run(_wait_for_execution(ctx, first["execution_id"], 5))
     second = asyncio.run(_submit_script(ctx, "Test-NetConnection rmm-test-fileserver -Port 445", 5000))
     tcp = asyncio.run(_wait_for_execution(ctx, second["execution_id"], 5))
-    first_page = asyncio.run(_read_output(ctx, second["execution_id"], "stdout", "0"))
-    second_page = asyncio.run(_read_output(ctx, second["execution_id"], "stdout", first_page["next_cursor"]))
+    search = asyncio.run(_inspect_output(ctx, second["execution_id"], "stdout", "search",
+                                         query="TcpTestSucceeded", context_lines=1, limit_matches=5))
+    tail = asyncio.run(_inspect_output(ctx, second["execution_id"], "stderr", "tail", lines=5))
+    expanded = asyncio.run(_inspect_output(ctx, second["execution_id"], "stdout", "range",
+                                           start_byte=31, end_byte=54))
 
     assert running == {
         "execution_id": "exec-1",
@@ -224,19 +240,19 @@ def test_three_tools_handle_repeated_wait_and_paged_output():
     }
     assert complete["output_preview"]["stdout"]["text"] == "DNS resolves to 10.0.0.5\n"
     assert tcp["output_preview"]["stdout"]["more_available"] is True
-    assert first_page["text"]["text"] == "full tcp page 1"
-    assert first_page["more_available"] is True
-    assert first_page["next_cursor"] == "2"
-    assert second_page["text"]["text"] == "full tcp page 2"
-    assert second_page["more_available"] is False
+    assert search["matches"][0]["text"]["text"] == "TcpTestSucceeded: False"
+    assert search["matches"][0]["context"]["before"]["text"] == "ComputerName: rmm-test-fileserver\n"
+    assert tail["text"]["text"] == "stderr tail"
+    assert expanded["text"]["text"] == "TcpTestSucceeded: False"
     assert [step.tool for step in ctx.steps] == [
         "submit_script",
         "wait_for_execution",
         "wait_for_execution",
         "submit_script",
         "wait_for_execution",
-        "read_output:stdout",
-        "read_output:stdout",
+        "inspect_output:search:stdout",
+        "inspect_output:tail:stderr",
+        "inspect_output:range:stdout",
     ]
 
 
@@ -311,11 +327,18 @@ class ScriptedModel(Model):
             output = [ResponseFunctionToolCall(
                 type="function_call",
                 call_id="call-6",
-                name="read_output",
-                arguments=json.dumps({"execution_id": second_execution, "stream": "stdout", "cursor": "0"}),
+                name="inspect_output",
+                arguments=json.dumps({
+                    "execution_id": second_execution,
+                    "stream": "stdout",
+                    "mode": "search",
+                    "query": "TcpTestSucceeded",
+                    "context_lines": 1,
+                    "limit_matches": 5,
+                }),
             )]
         else:
-            assert "full tcp page 1" in self.tool_outputs["call-6"]["text"]["text"]
+            assert self.tool_outputs["call-6"]["matches"][0]["text"]["text"] == "TcpTestSucceeded: False"
             output = [ResponseOutputMessage(
                 id="msg-1",
                 type="message",
@@ -351,14 +374,20 @@ def test_real_agents_sdk_runner_loop_submit_wait_read_dependent_script_and_repor
         "Test-NetConnection rmm-test-fileserver -Port 445",
     ]
     assert control_plane.waits == [("exec-1", 0.1), ("exec-1", 5.0), ("exec-2", 5.0)]
-    assert control_plane.pages == [("exec-2", "stdout", "0")]
+    assert control_plane.inspections == [("exec-2", "stdout", "search", {
+        "query": "TcpTestSucceeded",
+        "case_sensitive": False,
+        "context_lines": 1,
+        "limit_matches": 5,
+        "after_byte": 0,
+    })]
     assert [step.tool for step in result.steps] == [
         "submit_script",
         "wait_for_execution",
         "wait_for_execution",
         "submit_script",
         "wait_for_execution",
-        "read_output:stdout",
+        "inspect_output:search:stdout",
     ]
     assert any("TOOL CALL submit_script" in event and "Resolve-DnsName" in event for event in events)
     assert any("TOOL RESULT submit_script" in event and "exec-1" in event for event in events)
@@ -368,7 +397,7 @@ def test_real_agents_sdk_runner_loop_submit_wait_read_dependent_script_and_repor
 
 def test_drive_diagnostic_delegates_loop_to_runner_and_closes_session():
     async def fake_runner(agent, prompt, *, context, max_turns, hooks, run_config):
-        assert [tool.name for tool in agent.tools] == ["submit_script", "wait_for_execution", "read_output"]
+        assert [tool.name for tool in agent.tools] == ["submit_script", "wait_for_execution", "inspect_output"]
         assert "Budget: at most 2 submitted PowerShell scripts" in prompt
         assert "only one active script" in prompt
         assert "policy, not sandbox enforcement" in prompt
@@ -558,12 +587,15 @@ def test_control_plane_client_authenticates_public_api_without_openai_key():
             return httpx.Response(202, json={"execution_id": "exec-1", "status": "queued"})
         if request.url.path == "/executions/exec-1/wait":
             return httpx.Response(200, json={"execution_id": "exec-1", "status": "completed", "terminal": True, "wait_timed_out": False})
-        if request.url.path == "/executions/exec-1/output/stdout":
-            assert request.url.params["limit_bytes"] == str(DEFAULT_PAGE_LIMIT_BYTES)
+        if request.url.path == "/executions/exec-1/output/stdout/search":
+            assert request.url.params["query"] == "Tcp"
+            assert request.url.params["after_byte"] == "0"
             return httpx.Response(200, json={
-                "text": "page",
-                "next_cursor": "1",
-                "more_available": False,
+                "matches": [{"text": "TcpTestSucceeded: False", "context": {"before": "", "after": ""}}],
+                "match_count": 1,
+                "limit_reached": False,
+                "next_after_byte": None,
+                "partial": False,
                 "capture_lost": False,
                 "gap": {"detected": False, "reason": None},
             })
@@ -578,7 +610,10 @@ def test_control_plane_client_authenticates_public_api_without_openai_key():
 
     assert asyncio.run(client.submit_execution("session-1", "Get-Date", 1000, timeout_seconds=1))["execution_id"] == "exec-1"
     assert asyncio.run(client.wait_execution("exec-1", 1))["terminal"] is True
-    assert asyncio.run(client.output_page("exec-1", "stdout", "0", timeout_seconds=1))["text"] == "page"
+    inspected = asyncio.run(client.inspect_output(
+        "exec-1", "stdout", "search", {"query": "Tcp", "after_byte": 0}, timeout_seconds=1,
+    ))
+    assert inspected["matches"][0]["text"] == "TcpTestSucceeded: False"
     assert len(requests) == 3
 
 

@@ -64,7 +64,9 @@ def enroll(admin):
     key, public = endpoint_key()
     with connect(BASE.replace("http", "ws") + "/agent") as socket:
         pending = prove(socket, key, public)
-    approved = httpx.post(BASE + "/pairings/approve", headers=admin, json={"code": pending["code"]})
+    approved = httpx.post(BASE + "/pairings/approve", headers=admin, json={
+        "code": pending["code"], "device_name": "Investigation PC " + pending["code"],
+    })
     assert approved.status_code == 200
     return key, public, approved.json()["device_id"]
 
@@ -151,6 +153,15 @@ class EndpointAgentSimulator:
                                                 "stream": "stdout", "text": "tail-after-meg"}))
                     elif message["script"] == "EMPTY_OUTPUT":
                         pass
+                    elif message["script"] == "SEARCHABLE_RETAINED_OUTPUT":
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "start\nERR"}))
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stdout", "text": "OR café\nnext line\n"}))
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stderr", "text": "warn one\n"}))
+                        socket.send(json.dumps({"type": "output", **common, "executionId": execution,
+                                                "stream": "stderr", "text": "fatal two\ndone three\n"}))
                     elif message["script"] == "MARK_ONCE":
                         self.marker_count += 1
                         socket.send(json.dumps({"type": "output", **common, "executionId": execution,
@@ -437,6 +448,81 @@ def test_execution_output_preview_pages_and_terminal_wait_are_bounded_and_scoped
         assert still_running["status"] == "running"
         assert httpx.post(BASE + f"/executions/{hanging_id}/cancel", headers=operator).status_code == 202
         assert wait_for_execution(operator, hanging_id)["status"] == "cancelled"
+
+
+def test_retained_output_search_tail_and_range_work_while_endpoint_offline():
+    admin = bootstrap_admin()
+    other_admin = bootstrap_admin()
+    operator, _ = create_operator(admin, "output-investigator")
+    other_operator, _ = create_operator(other_admin, "output-intruder")
+    key, public, device = enroll(admin)
+    with EndpointAgentSimulator(key, public):
+        opened = httpx.post(BASE + "/sessions", headers=operator, json={"device_id": device})
+        assert opened.status_code == 201
+        session = opened.json()["session_id"]
+        submitted = submit(operator, session, "SEARCHABLE_RETAINED_OUTPUT", "searchable-retained-output")
+        assert submitted.status_code == 202
+        execution = submitted.json()["execution_id"]
+        assert wait_for_execution(operator, execution)["status"] == "completed"
+
+    search = httpx.get(
+        BASE + f"/executions/{execution}/output/stdout/search",
+        headers=operator,
+        params={"query": "error café", "context_lines": 1, "limit_matches": 1},
+    )
+    assert search.status_code == 200
+    found = search.json()
+    assert found["matches"][0]["text"] == "ERROR café"
+    assert found["matches"][0]["context"] == {"before": "start\n", "after": "next line\n"}
+    assert found["matches"][0]["range"]["start_byte"] == len("start\n".encode())
+    assert found["partial"] is False
+
+    no_match = httpx.get(
+        BASE + f"/executions/{execution}/output/stdout/search",
+        headers=operator,
+        params={"query": "not present"},
+    ).json()
+    assert no_match["matches"] == []
+    assert no_match["partial"] is False
+
+    match_range = found["matches"][0]["range"]
+    expanded = httpx.get(
+        BASE + f"/executions/{execution}/output/stdout/range",
+        headers=operator,
+        params={"start_byte": match_range["start_byte"], "end_byte": match_range["end_byte"]},
+    ).json()
+    assert expanded["text"] == "ERROR café"
+    assert expanded["unicode"]["unit"] == "utf-8 byte offsets"
+
+    stderr_tail = httpx.get(
+        BASE + f"/executions/{execution}/output/stderr/tail",
+        headers=operator,
+        params={"lines": 2},
+    ).json()
+    assert stderr_tail["text"] == "fatal two\ndone three\n"
+    assert stderr_tail["line_range"] == {"start_line": 2, "end_line": 3}
+
+    assert httpx.get(
+        BASE + f"/executions/{execution}/output/stdout/search",
+        headers=other_operator,
+        params={"query": "error"},
+    ).status_code == 404
+    assert httpx.get(
+        BASE + f"/executions/{execution}/output/stdout/search",
+        headers=operator,
+        params={"query": ""},
+    ).status_code == 422
+    assert httpx.get(
+        BASE + f"/executions/{execution}/output/stdout/range",
+        headers=operator,
+        params={"start_byte": 10, "end_byte": 5},
+    ).status_code == 422
+
+    offline_submission = submit(operator, session, "MARK_ONCE", "offline-proof-no-read-dispatch")
+    assert offline_submission.status_code == 202
+    offline_result = wait_for_execution(operator, offline_submission.json()["execution_id"])
+    assert offline_result["status"] == "failed_to_start"
+    assert offline_result["outcome_reason"] == "device_offline_before_dispatch"
 
 
 def test_operator_cannot_admin_and_resources_are_workspace_scoped():

@@ -48,11 +48,18 @@ command, not a universal script outcome.
 error completion normalizes to 0; an unhandled terminating error normalizes to
 1. Explicit exit reports its requested code. Explicit exit deliberately retires
 the worker: close the old session and open a fresh one before further execution.
-The host observes the SDK's
-[`PSHost.SetShouldExit`](https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.host.pshost.setshouldexit?view=powershellsdk-7.4.0)
-callback; it does not infer explicit exit from a native command's exit value.
-The worker pins [Microsoft.PowerShell.SDK 7.4.13](https://www.nuget.org/packages/Microsoft.PowerShell.SDK/7.4.13)
-so Windows tests gate changes to these engine semantics.
+The host observes Windows PowerShell's `PSHost.SetShouldExit` callback; it does
+not infer explicit exit from a native command's exit value. The 64-bit agent
+resolves the canonical inbox engine through the Windows system-directory API
+and launches `System32\WindowsPowerShell\v1.0\powershell.exe` directly with
+`-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass`. The bypass applies
+only to the protected installed worker bootstrap; PowerShell execution policy is
+not an authorization boundary, and AppLocker/WDAC policy still applies. The agent
+never searches `PATH` or silently falls back to another engine. The worker
+validates a 64-bit `Desktop` engine at startup and uses the native LocalSystem
+module discovery environment.
+The Windows contract test requires the inbox `CimCmdlets` module to load through
+`Get-CimInstance` before accepting the worker.
 
 Local execution timeouts range from 100 ms to 60 minutes and must be selected by
 the caller on each `execute`. The agent enforces that runtime limit locally,
@@ -118,8 +125,10 @@ dotnet src/EndpointAgent/bin/Release/net8.0/EndpointAgent.dll --agent wss://loca
 
 ## Recorded verification and limitations
 
-On 2026-09-21 the Mac wrapper ran the actual binaries on the existing Windows 11
-VM with .NET SDK 8.0.425 and hosted PowerShell 7.4.13. All three scenarios passed:
+On 2026-09-22 the independent Windows GitHub Actions peer ran the native worker
+contract against 64-bit Windows PowerShell 5.1. It confirmed the `Desktop`
+engine, inbox `CimCmdlets` auto-loading through `Get-CimInstance`, and all three
+external-behavior scenarios:
 
 - Invocation and persistent session: stdout/stderr output frames and
   correlation, terminal result metadata without duplicated output previews,
@@ -136,16 +145,15 @@ VM with .NET SDK 8.0.425 and hosted PowerShell 7.4.13. All three scenarios passe
   gone, no reuse of retired workers, and abrupt worker exit recorded as
   `outcome_unknown`.
 
-The manual harmless/error smoke also ran in that suite (about 157 ms and 16 ms
-of measured invocation time in the recorded run). These are invocation timings,
-not a cross-network latency claim. The same external-behavior suite runs in the
-Windows GitHub Actions job.
+The same run built and uploaded the unsigned trial MSI after the contract passed.
+Invocation timings are local worker measurements, not a cross-network latency
+claim.
 
 There is no reconnect/replay protocol or durable execution history in this slice.
 In-memory replay protection is bounded to 1,000 execution IDs and 100 session IDs
 per agent connection; the peer must stop when that allowance is exhausted.
-Inbound frames are limited to 80,000 bytes, scripts to 32,768 code units, connect
-waiting to 15 seconds, and idle frame waiting to two minutes. Timeout/cancellation
+Inbound frames are limited to 80,000 bytes, scripts to 32,768 code units, native
+worker startup to 60 seconds, and idle frame waiting to two minutes. Timeout/cancellation
 and worker-loss results conservatively disclose possible capture loss. Outbound
 output frames are chunked before transport. Success output is string rendered
 from PowerShell objects; debug/verbose/progress streams are drained but not

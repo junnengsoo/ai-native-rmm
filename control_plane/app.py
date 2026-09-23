@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from .connections import endpoint_agents
@@ -22,10 +22,15 @@ from .database import (
     append_execution_output,
     claim_execution, create_caller, create_or_get_execution, create_starting_session,
     digest, fail_device_investigations, finish_execution,
-    get_execution_output_page, get_execution_output_preview, get_workspace_execution, get_workspace_session, increment_rate_limit,
+    get_execution_output_page, get_execution_output_preview, get_live_device_session,
+    get_workspace_device, get_workspace_execution, get_workspace_session, increment_rate_limit,
     initialize, list_workspace_devices, mark_execution_failed_to_start, mark_execution_unknown,
+    mark_device_revocation_cleanup_unknown,
     mark_queued_execution_cancelled, mark_session_cleanup_unknown, mark_session_closed,
-    mark_session_endpoint_closed, mark_session_failed, mark_session_ready, record_heartbeat, recover_interrupted_work,
+    mark_session_endpoint_closed, mark_session_failed, mark_session_ready, range_execution_output,
+    record_heartbeat, recover_device, recover_interrupted_work, rename_workspace_device,
+    revoke_workspace_device,
+    search_execution_output, tail_execution_output,
 )
 from .reachability import classify_reachability
 
@@ -105,16 +110,88 @@ def list_devices(authorization: str | None = Header(default=None), after: uuid.U
     observed_at = datetime.now(timezone.utc)
     devices = list_workspace_devices(caller["workspace_id"], after, limit + 1)
     page = [
-        {"id": device["id"], "approved_at": device["approved_at"], "last_seen": device["last_seen"],
-         "reachability": classify_reachability(device["last_seen"], device["activate_before"], observed_at)}
+        {"id": device["id"], "device_name": device["device_name"],
+         "approved_at": device["approved_at"], "last_seen": device["last_seen"],
+         "reachability": classify_reachability(device["last_seen"], device["activate_before"], observed_at),
+         "authorization_status": device["authorization_status"], "revoked_at": device["revoked_at"],
+         "revoked_by": device["revoked_by"]}
         for device in devices[:limit]
     ]
     return {"devices": page, "next_cursor": str(devices[limit - 1]["id"]) if len(devices) > limit else None}
 
 
-class Approval(BaseModel):
+@app.post("/devices/{device_id}/revoke")
+async def revoke_device(device_id: uuid.UUID, authorization: str | None = Header(default=None)):
+    admin = authenticated_caller(authorization, "admin")
+    revoked = await asyncio.to_thread(
+        revoke_workspace_device, admin["workspace_id"], admin["id"], device_id)
+    if revoked is None:
+        raise HTTPException(404, "device_not_found")
+    device, changed = revoked
+    cleanup = "not_required"
+
+    # A repeated request must stay safe and idempotent. The first successful
+    # transaction owns best-effort cleanup; every request still tears down any
+    # channel that raced with the durable authorization change.
+    try:
+        if changed:
+            session = await asyncio.to_thread(
+                get_live_device_session, admin["workspace_id"], device_id)
+            channel = await endpoint_agents.get_connected_channel(str(device_id))
+            if session is not None and session["state"] == "active" and channel is not None:
+                closing = await asyncio.to_thread(
+                    begin_session_close, admin["workspace_id"], session["id"])
+                if closing is not None:
+                    closed = channel.expect("session_closed", str(session["id"]))
+                    try:
+                        await channel.send({"type": "close_session", "deviceId": str(device_id),
+                                            "sessionId": str(session["id"])})
+                        await asyncio.wait_for(closed, CLEANUP_GRACE_SECONDS)
+                        await asyncio.to_thread(mark_session_closed, session["id"])
+                        cleanup = "confirmed"
+                    except Exception:
+                        cleanup = "unconfirmed"
+            elif session is not None:
+                cleanup = "unconfirmed"
+
+            if cleanup == "unconfirmed":
+                execution_ids = await asyncio.to_thread(
+                    mark_device_revocation_cleanup_unknown, device_id)
+                for execution_id in execution_ids:
+                    await notify_terminal(execution_id)
+        else:
+            cleanup = "already_revoked"
+    finally:
+        await endpoint_agents.disconnect(str(device_id))
+    return {"device_id": str(device["id"]),
+            "authorization_status": device["authorization_status"],
+            "revoked_at": device["revoked_at"], "revoked_by": str(device["revoked_by"]),
+            "cleanup": cleanup}
+
+
+class NamedDevice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    device_name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("device_name")
+    @classmethod
+    def normalize_device_name(cls, value: str) -> str:
+        if not (normalized := value.strip()):
+            raise ValueError()
+        return normalized
+
+
+class Approval(NamedDevice):
+    code: str = Field(pattern=r"^[A-Z2-7]{12}$")
+
+
+class RecoveryApproval(BaseModel):
     model_config = ConfigDict(extra="forbid")
     code: str = Field(pattern=r"^[A-Z2-7]{12}$")
+
+
+class DeviceRename(NamedDevice):
+    pass
 
 
 class CallerCreation(BaseModel):
@@ -141,10 +218,54 @@ def approve(body: Approval, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "admin")
     workspace = caller["workspace_id"]
     enforce_rate_limit("approval:" + str(workspace), 10)
-    device = approve_pairing(digest(body.code), workspace)
+    try:
+        device = approve_pairing(digest(body.code), workspace, caller["id"], body.device_name)
+    except Exception as error:
+        if "devices_workspace_name_key" in str(error):
+            raise HTTPException(409, "device_name_conflict") from None
+        raise
     if device is None:
         raise HTTPException(409, "invalid_or_consumed_code")
     return {"device_id": str(device), "state": "approved"}
+
+
+@app.post("/devices/{device_id}/recover")
+async def recover(device_id: uuid.UUID, body: RecoveryApproval,
+                  authorization: str | None = Header(default=None)):
+    admin = authenticated_caller(authorization, "admin")
+    enforce_rate_limit("recovery:" + str(admin["workspace_id"]), 10)
+    outcome, device = await asyncio.to_thread(
+        recover_device, digest(body.code), admin["workspace_id"], admin["id"], device_id)
+    if outcome == "not_found":
+        raise HTTPException(404, "device_not_found")
+    if outcome == "revoked":
+        raise HTTPException(409, "device_revoked")
+    if outcome == "device_busy":
+        raise HTTPException(409, "device_busy")
+    if outcome == "recovery_pending":
+        raise HTTPException(409, "recovery_pending")
+    if outcome == "invalid_code":
+        raise HTTPException(409, "invalid_or_consumed_code")
+    if outcome != "pending" or device is None:
+        raise RuntimeError("unexpected_recovery_outcome")
+    return {"device_id": str(device["id"]), "device_name": device["device_name"],
+            "state": "awaiting_activation"}
+
+
+@app.patch("/devices/{device_id}")
+async def rename_device(device_id: uuid.UUID, body: DeviceRename,
+                        authorization: str | None = Header(default=None)):
+    admin = authenticated_caller(authorization, "admin")
+    try:
+        device = await asyncio.to_thread(
+            rename_workspace_device, admin["workspace_id"], device_id, body.device_name)
+    except Exception as error:
+        if "devices_workspace_name_key" in str(error):
+            raise HTTPException(409, "device_name_conflict") from None
+        raise
+    if device is None:
+        raise HTTPException(404, "device_not_found")
+    return {"device_id": str(device["id"]), "device_name": device["device_name"]}
 
 
 def verify_proof(message, nonce):
@@ -278,6 +399,22 @@ def unicode_contract():
     return {"encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "cursored event text"}
 
 
+def retained_investigation_contract():
+    return {"encoding": "utf-8", "ordering": "per-stream insertion order", "unit": "utf-8 byte offsets"}
+
+
+def validate_output_stream(stream: str) -> None:
+    if stream not in {"stdout", "stderr"}:
+        raise HTTPException(404, "stream_not_found")
+
+
+async def workspace_execution_or_404(workspace_id: uuid.UUID, execution_id: uuid.UUID):
+    row = await asyncio.to_thread(get_workspace_execution, workspace_id, execution_id)
+    if row is None:
+        raise HTTPException(404, "execution_not_found")
+    return row
+
+
 async def notify_terminal(execution_id: uuid.UUID | str) -> None:
     async with terminal_waiters_lock:
         waiter = terminal_waiters.get(str(execution_id))
@@ -337,6 +474,11 @@ async def fail_device_investigations_and_notify(device_id: uuid.UUID | str) -> N
 @app.post("/sessions", status_code=201)
 async def create_session(body: SessionCreation, authorization: str | None = Header(default=None)):
     caller = authenticated_caller(authorization, "operator")
+    device = await asyncio.to_thread(get_workspace_device, caller["workspace_id"], body.device_id)
+    if device is None:
+        raise HTTPException(404, "device_not_found")
+    if device["authorization_status"] == "revoked":
+        raise HTTPException(409, "device_revoked")
     channel = await endpoint_agents.get_connected_channel(str(body.device_id))
     if channel is None:
         raise HTTPException(409, "device_offline")
@@ -451,17 +593,61 @@ async def get_execution_output(execution_id: uuid.UUID, stream: str,
                                authorization: str | None = Header(default=None),
                                after: str = "0",
                                limit_bytes: int = Query(default=65536, ge=8192, le=65536)):
-    if stream not in {"stdout", "stderr"}:
-        raise HTTPException(404, "stream_not_found")
+    validate_output_stream(stream)
     caller = authenticated_caller(authorization, "operator")
-    row = await asyncio.to_thread(get_workspace_execution, caller["workspace_id"], execution_id)
-    if row is None:
-        raise HTTPException(404, "execution_not_found")
+    row = await workspace_execution_or_404(caller["workspace_id"], execution_id)
     cursor = parse_output_cursor(after)
     page = await asyncio.to_thread(get_execution_output_page, execution_id, stream, cursor, limit_bytes)
     capture_lost = bool(row["capture_truncated"])
     return {**page, "more_available": page["has_more"],
             "capture_lost": capture_lost, "gap": output_gap(), "unicode": unicode_contract()}
+
+
+@app.get("/executions/{execution_id}/output/{stream}/search")
+async def search_execution_output_endpoint(execution_id: uuid.UUID, stream: str,
+                                           authorization: str | None = Header(default=None),
+                                           query: str = Query(min_length=1, max_length=1024),
+                                           case_sensitive: bool = False,
+                                           context_lines: int = Query(default=0, ge=0, le=5),
+                                           limit_matches: int = Query(default=20, ge=1, le=50),
+                                           after_byte: int = Query(default=0, ge=0)):
+    validate_output_stream(stream)
+    if query == "":
+        raise HTTPException(422, "empty_query")
+    caller = authenticated_caller(authorization, "operator")
+    row = await workspace_execution_or_404(caller["workspace_id"], execution_id)
+    result = await asyncio.to_thread(search_execution_output, execution_id, stream, query,
+                                     case_sensitive=case_sensitive, context_lines=context_lines,
+                                     limit_matches=limit_matches, after_byte=after_byte)
+    return {**result, "stream": stream, "capture_lost": bool(row["capture_truncated"]),
+            "gap": output_gap(), "unicode": retained_investigation_contract()}
+
+
+@app.get("/executions/{execution_id}/output/{stream}/tail")
+async def tail_execution_output_endpoint(execution_id: uuid.UUID, stream: str,
+                                         authorization: str | None = Header(default=None),
+                                         lines: int = Query(default=50, ge=1, le=200)):
+    validate_output_stream(stream)
+    caller = authenticated_caller(authorization, "operator")
+    row = await workspace_execution_or_404(caller["workspace_id"], execution_id)
+    result = await asyncio.to_thread(tail_execution_output, execution_id, stream, lines)
+    return {**result, "stream": stream, "capture_lost": bool(row["capture_truncated"]),
+            "gap": output_gap(), "unicode": retained_investigation_contract()}
+
+
+@app.get("/executions/{execution_id}/output/{stream}/range")
+async def range_execution_output_endpoint(execution_id: uuid.UUID, stream: str,
+                                          authorization: str | None = Header(default=None),
+                                          start_byte: int = Query(ge=0),
+                                          end_byte: int = Query(ge=0)):
+    validate_output_stream(stream)
+    if end_byte <= start_byte:
+        raise HTTPException(422, "invalid_range")
+    caller = authenticated_caller(authorization, "operator")
+    row = await workspace_execution_or_404(caller["workspace_id"], execution_id)
+    result = await asyncio.to_thread(range_execution_output, execution_id, stream, start_byte, end_byte)
+    return {**result, "stream": stream, "capture_lost": bool(row["capture_truncated"]),
+            "gap": output_gap(), "unicode": retained_investigation_contract()}
 
 
 @app.post("/executions/{execution_id}/cancel", status_code=202)
@@ -531,7 +717,11 @@ async def endpoint_agent(socket: WebSocket):
         proof = await asyncio.wait_for(receive(socket), 10)
         public_key = verify_proof(proof, nonce)
         status = await asyncio.to_thread(authenticate_key, public_key)
-        await socket.send_json(status)
+        public_status = {key: value for key, value in status.items()
+                         if key not in {"credential_id", "replaced"}}
+        if status.get("replaced"):
+            await endpoint_agents.disconnect(status["device_id"])
+        await socket.send_json(public_status)
         if status["state"] != "online":
             await close(socket)
             return
@@ -544,7 +734,11 @@ async def endpoint_agent(socket: WebSocket):
                     if time.monotonic() - last_heartbeat < 1:
                         raise ValueError()
                     last_heartbeat = time.monotonic()
-                    await asyncio.to_thread(record_heartbeat, status["device_id"])
+                    active = await asyncio.to_thread(
+                        record_heartbeat, status["device_id"], status["credential_id"])
+                    if not active:
+                        await channel.send({"state": "denied"})
+                        break
                     await channel.send({"type": "heartbeat_ack"})
                     continue
                 validate_endpoint_agent_message(message)

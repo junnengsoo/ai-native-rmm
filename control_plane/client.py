@@ -14,7 +14,10 @@ def main():
         if sys.argv[1:] == ["list"]:
             response = client.get("/devices")
         elif sys.argv[1:] == ["approve"]:
-            response = client.post("/pairings/approve", json={"code": getpass.getpass("Code observed on Windows: ")})
+            response = client.post("/pairings/approve", json={
+                "code": getpass.getpass("Code observed on Windows: "),
+                "device_name": input("Device name: ").strip(),
+            })
         else:
             raise ValueError()
     if not response.is_success:
