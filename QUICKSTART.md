@@ -73,7 +73,7 @@ placeholder with the `RMM_ENDPOINT` printed by `demo start`, then install:
 
 ```powershell
 $MsiPath = "$env:USERPROFILE\Desktop\SquashEndpointAgent.msi"
-$Endpoint = 'wss://YOUR-TUNNEL.trycloudflare.com/agent'
+$Endpoint = 'wss://{YOUR_END_POINT}/agent'
 $LogPath = "$env:TEMP\SquashEndpointAgent-install.log"
 
 $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
