@@ -39,10 +39,12 @@ It prints the API and OpenAPI URLs. PostgreSQL is never published.
 
 Get `SquashEndpointAgent.msi` onto the Windows machine using any file-transfer
 method available in that environment. File transfer is deliberately outside
-this demo bundle.
+this demo bundle; you do not need to copy any of this repository's scripts to
+Windows.
 
-On Windows, open PowerShell as Administrator and run the MSI directly with the
-`RMM_ENDPOINT` printed by `demo start`:
+From the Windows desktop (including an Azure Bastion or RDP session), open
+PowerShell as Administrator. Replace both placeholders below, then run the MSI
+directly with the `RMM_ENDPOINT` printed by `demo start`:
 
 ```powershell
 msiexec.exe /i 'C:\path\to\SquashEndpointAgent.msi' /qn /norestart `
