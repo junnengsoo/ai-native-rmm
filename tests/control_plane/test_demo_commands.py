@@ -38,9 +38,30 @@ def test_macos_azure_transfer_help_is_available_without_azure_login():
     assert "It does not install" in result.stdout
 
 
+def test_macos_azure_transfer_uses_bounded_deletable_managed_command():
+    script = (ROOT / "scripts/mac/transfer-msi-to-azure.sh").read_text()
+
+    assert "az vm run-command create" in script
+    assert "--timeout-in-seconds 180" in script
+    assert "--protected-parameters \"downloadUrl=$download_url\"" in script
+    assert "az vm run-command delete" in script
+    assert "trap cleanup EXIT" in script
+    assert "az vm run-command invoke" not in script
+
+
 def test_macos_azure_install_help_is_available_without_azure_login():
     result = run("scripts/mac/install-msi-on-azure.sh", "--help")
 
     assert result.returncode == 0
     assert "previously transferred" in result.stdout
     assert "prints the pairing code" in result.stdout
+
+
+def test_macos_azure_install_uses_bounded_deletable_managed_command():
+    script = (ROOT / "scripts/mac/install-msi-on-azure.sh").read_text()
+
+    assert "az vm run-command create" in script
+    assert "--timeout-in-seconds 300" in script
+    assert "az vm run-command delete" in script
+    assert "trap cleanup EXIT" in script
+    assert "az vm run-command invoke" not in script

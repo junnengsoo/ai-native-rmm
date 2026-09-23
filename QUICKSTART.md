@@ -75,8 +75,11 @@ URL.
 
 If the directory contains multiple MSI files, add `--msi FILE_NAME`. The helper
 creates private temporary Azure Blob storage, invokes a hash-verifying download
-through Azure Run Command, places the MSI under
+through a temporary Managed Run Command with a three-minute timeout, places the MSI under
 `C:\ProgramData\AI-Native-RMM\staging`, and deletes the temporary Storage account.
+The Managed Run Command is also deleted after success, failure, or interruption,
+so cancelling the local command does not leave a non-cancellable action command
+holding the VM operation queue.
 After transfer, install it from macOS without RDP or a public IP:
 
 ```sh
@@ -87,10 +90,11 @@ After transfer, install it from macOS without RDP or a public IP:
   --msi SquashEndpointAgent.msi
 ```
 
-The Azure command runs the same Windows wrapper through Azure Run Command and
-prints the pairing code. It embeds the wrapper from the macOS checkout, so you
-do not need to copy any scripts to Windows. It expects only the MSI under the
-staging directory created by the transfer command.
+The Azure command runs the same Windows wrapper through a temporary Managed Run
+Command with a five-minute timeout and prints the pairing code. It embeds the
+wrapper from the macOS checkout, so you do not need to copy any scripts to
+Windows. It expects only the MSI under the staging directory created by the
+transfer command and deletes its Managed Run Command during cleanup.
 
 ## 3. Approve the endpoint
 

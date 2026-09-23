@@ -15,9 +15,11 @@ Usage:
 
 The script creates a private temporary Azure Storage account in the VM's region,
 uses a 20-minute read-only HTTPS SAS to transfer the MSI, verifies SHA-256 on the
-VM, and deletes the temporary storage account afterward. It does not install the
-MSI. Azure CLI must already be signed in with permission to manage the target VM
-and create/delete a Storage account in its resource group. The VM needs outbound
+VM, and deletes the temporary storage account afterward. A uniquely named
+Managed Run Command enforces a three-minute execution timeout and is deleted on
+success, failure, or interruption. It does not install the MSI. Azure CLI must
+already be signed in with permission to manage the target VM and
+create/delete a Storage account in its resource group. The VM needs outbound
 HTTPS access to Azure Blob storage.
 EOF
 }
@@ -124,12 +126,28 @@ fi
 
 expected_hash=$(shasum -a 256 "$msi_path" | awk '{print toupper($1)}')
 storage_account="rmm$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-18)"
+run_command_name="rmm-transfer-$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-16)"
 container=installer
 blob_name=$msi_name
 storage_created=false
+run_command_created=false
 
 cleanup() {
+  original_status=$?
+  set +e
   unset AZURE_STORAGE_KEY AZURE_STORAGE_ACCOUNT 2>/dev/null || true
+  if [[ $run_command_created == true ]]; then
+    printf '%s\n' 'Removing temporary Azure Managed Run Command...'
+    if ! az vm run-command delete \
+      --resource-group "$resource_group" \
+      --vm-name "$vm_name" \
+      --name "$run_command_name" \
+      --yes \
+      --no-wait \
+      --output none; then
+      printf 'WARNING: could not remove temporary Managed Run Command %s.\n' "$run_command_name" >&2
+    fi
+  fi
   if [[ $storage_created == true ]]; then
     printf '%s\n' 'Removing temporary Azure Storage account...'
     if ! az storage account delete --resource-group "$resource_group" --name "$storage_account" --yes --output none; then
@@ -137,6 +155,7 @@ cleanup() {
         "$storage_account" "$resource_group" >&2
     fi
   fi
+  return "$original_status"
 }
 trap cleanup EXIT
 
@@ -188,20 +207,73 @@ unset AZURE_STORAGE_KEY AZURE_STORAGE_ACCOUNT
 [[ -n $download_url ]] || { printf '%s\n' 'Could not create the temporary MSI download URL.' >&2; exit 1; }
 
 printf 'Transferring MSI to Azure VM %s...\n' "$vm_name"
-run_output=$(az vm run-command invoke \
+remote_script_content=$(<"$remote_script")
+run_command_created=true
+az vm run-command create \
   --resource-group "$resource_group" \
-  --name "$vm_name" \
-  --command-id RunPowerShellScript \
-  --scripts @"$remote_script" \
+  --vm-name "$vm_name" \
+  --name "$run_command_name" \
+  --location "$location" \
+  --script "$remote_script_content" \
+  --async-execution false \
+  --timeout-in-seconds 180 \
+  --protected-parameters "downloadUrl=$download_url" \
   --parameters \
-    "downloadUrl=$download_url" \
     "expectedHash=$expected_hash" \
     "fileName=$msi_name" \
     "destinationDirectory=$destination" \
-  --query 'value[].message' \
-  --output tsv)
+  --tags purpose=ai-native-rmm-demo-transfer \
+  --no-wait \
+  --output none
 download_url=
 
+execution_state=
+for _ in {1..48}; do
+  execution_state=$(az vm run-command show \
+    --resource-group "$resource_group" \
+    --vm-name "$vm_name" \
+    --name "$run_command_name" \
+    --instance-view \
+    --query instanceView.executionState \
+    --output tsv 2>/dev/null || true)
+  case "$execution_state" in
+    Succeeded|Failed|Canceled|TimedOut) break ;;
+    *) sleep 5 ;;
+  esac
+done
+
+if [[ $execution_state != Succeeded ]]; then
+  run_error=$(az vm run-command show \
+    --resource-group "$resource_group" \
+    --vm-name "$vm_name" \
+    --name "$run_command_name" \
+    --instance-view \
+    --query instanceView.error \
+    --output tsv 2>/dev/null || true)
+  printf 'Managed Run Command did not succeed; state: %s\n' "${execution_state:-local_timeout}" >&2
+  [[ -z $run_error ]] || printf '%s\n' "$run_error" >&2
+  exit 1
+fi
+
+exit_code=$(az vm run-command show \
+  --resource-group "$resource_group" \
+  --vm-name "$vm_name" \
+  --name "$run_command_name" \
+  --instance-view \
+  --query instanceView.exitCode \
+  --output tsv)
+run_output=$(az vm run-command show \
+  --resource-group "$resource_group" \
+  --vm-name "$vm_name" \
+  --name "$run_command_name" \
+  --instance-view \
+  --query instanceView.output \
+  --output tsv)
+
+if [[ $exit_code != 0 ]]; then
+  printf 'Managed Run Command failed with exit code %s.\n' "$exit_code" >&2
+  exit 1
+fi
 if [[ $run_output != *"MSI_TRANSFERRED $destination\\$msi_name"* ]]; then
   printf '%s\n' 'Azure Run Command did not report a completed MSI transfer.' >&2
   printf '%s\n' "$run_output" >&2
