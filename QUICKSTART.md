@@ -35,24 +35,14 @@ The command starts PostgreSQL and the API, creates separate admin and operator
 credentials, and writes the ignored local file `.demo/demo-connection.json`.
 It prints the API and OpenAPI URLs. PostgreSQL is never published.
 
-## 2. Transfer and install the Windows MSI
+## 2. Install the Windows MSI
 
-If you copy the extracted ZIP to Windows, open PowerShell as Administrator from
-the ZIP's root directory and use the included wrapper with the `RMM_ENDPOINT`
-printed by `demo start`:
+Get `SquashEndpointAgent.msi` onto the Windows machine using any file-transfer
+method available in that environment. File transfer is deliberately outside
+this demo bundle.
 
-```powershell
-.\scripts\windows\Install-Agent.ps1 `
-  -MsiPath 'C:\path\to\SquashEndpointAgent.msi' `
-  -Endpoint 'wss://YOUR-TUNNEL.trycloudflare.com/agent'
-```
-
-The wrapper installs silently, waits for the automatic `SquashEndpointAgent`
-service and local status file, then prints the pairing code. Its MSI log is
-written to `%TEMP%\SquashEndpointAgent-install.log`.
-
-If you transfer only the MSI, no script is required on Windows. Run the
-underlying command directly from an elevated PowerShell console:
+On Windows, open PowerShell as Administrator and run the MSI directly with the
+`RMM_ENDPOINT` printed by `demo start`:
 
 ```powershell
 msiexec.exe /i 'C:\path\to\SquashEndpointAgent.msi' /qn /norestart `
@@ -60,41 +50,22 @@ msiexec.exe /i 'C:\path\to\SquashEndpointAgent.msi' /qn /norestart `
   RMM_ENDPOINT='wss://YOUR-TUNNEL.trycloudflare.com/agent'
 ```
 
-For an existing Azure Windows VM, a macOS helper can transfer exactly one MSI
-without adding a public IP or SSH. The VM still needs outbound HTTPS egress,
-normally through an Azure NAT Gateway or an existing managed egress path. That
-egress is also required for the installed agent to reach the control-plane WSS
-URL.
+Accept exit code `0` or `3010`. The command installs and starts the automatic
+`SquashEndpointAgent` Windows service. Confirm it is running:
 
-```sh
-./scripts/mac/transfer-msi-to-azure.sh \
-  --resource-group YOUR_RESOURCE_GROUP \
-  --vm YOUR_VM_NAME \
-  --local-directory /absolute/path/to/windows-endpoint
+```powershell
+Get-Service SquashEndpointAgent
 ```
 
-If the directory contains multiple MSI files, add `--msi FILE_NAME`. The helper
-creates private temporary Azure Blob storage, invokes a hash-verifying download
-through a temporary Managed Run Command with a three-minute timeout, places the MSI under
-`C:\ProgramData\AI-Native-RMM\staging`, and deletes the temporary Storage account.
-The Managed Run Command is also deleted after success, failure, or interruption,
-so cancelling the local command does not leave a non-cancellable action command
-holding the VM operation queue.
-After transfer, install it from macOS without RDP or a public IP:
+Then display the local enrollment status and pairing code:
 
-```sh
-./scripts/mac/install-msi-on-azure.sh \
-  --resource-group YOUR_RESOURCE_GROUP \
-  --vm YOUR_VM_NAME \
-  --endpoint wss://YOUR-TUNNEL.trycloudflare.com/agent \
-  --msi SquashEndpointAgent.msi
+```powershell
+Get-Content 'C:\ProgramData\Prosper\AiNativeRmm\status.json' -Raw
 ```
 
-The Azure command runs the same Windows wrapper through a temporary Managed Run
-Command with a five-minute timeout and prints the pairing code. It embeds the
-wrapper from the macOS checkout, so you do not need to copy any scripts to
-Windows. It expects only the MSI under the staging directory created by the
-transfer command and deletes its Managed Run Command during cleanup.
+If the status file has not appeared yet, wait a few seconds and run the last
+command again. Continue only when it reports `state: "pending"` and includes a
+`pairing_code`.
 
 ## 3. Approve the endpoint
 
