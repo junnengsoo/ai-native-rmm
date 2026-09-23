@@ -37,9 +37,9 @@ It prints the API and OpenAPI URLs. PostgreSQL is never published.
 
 ## 2. Transfer and install the Windows MSI
 
-The default path is to copy `SquashEndpointAgent.msi` to Windows using your
-normal file-transfer method. Open PowerShell as Administrator on Windows and
-install it using the `RMM_ENDPOINT` printed by `demo start`:
+If you copy the extracted ZIP to Windows, open PowerShell as Administrator from
+the ZIP's root directory and use the included wrapper with the `RMM_ENDPOINT`
+printed by `demo start`:
 
 ```powershell
 .\scripts\windows\Install-Agent.ps1 `
@@ -49,7 +49,10 @@ install it using the `RMM_ENDPOINT` printed by `demo start`:
 
 The wrapper installs silently, waits for the automatic `SquashEndpointAgent`
 service and local status file, then prints the pairing code. Its MSI log is
-written to `%TEMP%\SquashEndpointAgent-install.log`. It runs the equivalent of:
+written to `%TEMP%\SquashEndpointAgent-install.log`.
+
+If you transfer only the MSI, no script is required on Windows. Run the
+underlying command directly from an elevated PowerShell console:
 
 ```powershell
 msiexec.exe /i 'C:\path\to\SquashEndpointAgent.msi' /qn /norestart `
@@ -85,8 +88,9 @@ After transfer, install it from macOS without RDP or a public IP:
 ```
 
 The Azure command runs the same Windows wrapper through Azure Run Command and
-prints the pairing code. It expects the MSI under the staging directory created
-by the transfer command.
+prints the pairing code. It embeds the wrapper from the macOS checkout, so you
+do not need to copy any scripts to Windows. It expects only the MSI under the
+staging directory created by the transfer command.
 
 ## 3. Approve the endpoint
 
