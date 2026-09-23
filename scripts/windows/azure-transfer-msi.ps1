@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
 $destination = Join-Path $destinationDirectory $fileName
 $temporary = "$destination.partial-$([Guid]::NewGuid().ToString('N'))"
 try {
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $temporary -UseBasicParsing
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $temporary -UseBasicParsing -TimeoutSec 120
     $actualHash = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash
     if ($actualHash -ne $expectedHash) {
         throw 'msi_hash_mismatch'

@@ -36,3 +36,11 @@ def test_macos_azure_transfer_help_is_available_without_azure_login():
     assert result.returncode == 0
     assert "local macOS directory" in result.stdout
     assert "It does not install" in result.stdout
+
+
+def test_macos_azure_install_help_is_available_without_azure_login():
+    result = run("scripts/mac/install-msi-on-azure.sh", "--help")
+
+    assert result.returncode == 0
+    assert "previously transferred" in result.stdout
+    assert "prints the pairing code" in result.stdout

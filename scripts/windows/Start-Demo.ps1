@@ -102,6 +102,7 @@ Write-Host "Caller configuration: $(Join-Path $demoDir 'demo-connection.json')"
 if ($deviceId) {
     Write-Host "Device ID: $deviceId"
 } else {
-    Write-Host "`nInstall the bundled MSI on Windows with CONTROL_PLANE_URL=$PublicUrl"
+    $endpointUrl = ($PublicUrl -replace '^http', 'ws') + '/agent'
+    Write-Host "`nInstall the bundled MSI on Windows with RMM_ENDPOINT=$endpointUrl"
     Write-Host 'Then run .\Demo.ps1 approve on this machine.'
 }

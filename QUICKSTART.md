@@ -37,13 +37,31 @@ It prints the API and OpenAPI URLs. PostgreSQL is never published.
 
 ## 2. Transfer and install the Windows MSI
 
-The default path is to copy the directory containing the MSI to Windows using
-your normal file-transfer method, then run that installer's documented silent
-installation command with the URL printed by `demo start`. The MSI/service build
-and its local pairing-status command are owned by issue #6.
+The default path is to copy `SquashEndpointAgent.msi` to Windows using your
+normal file-transfer method. Open PowerShell as Administrator on Windows and
+install it using the `RMM_ENDPOINT` printed by `demo start`:
+
+```powershell
+.\scripts\windows\Install-Agent.ps1 `
+  -MsiPath 'C:\path\to\SquashEndpointAgent.msi' `
+  -Endpoint 'wss://YOUR-TUNNEL.trycloudflare.com/agent'
+```
+
+The wrapper installs silently, waits for the automatic `SquashEndpointAgent`
+service and local status file, then prints the pairing code. Its MSI log is
+written to `%TEMP%\SquashEndpointAgent-install.log`. It runs the equivalent of:
+
+```powershell
+msiexec.exe /i 'C:\path\to\SquashEndpointAgent.msi' /qn /norestart `
+  /l*v "$env:TEMP\SquashEndpointAgent-install.log" `
+  RMM_ENDPOINT='wss://YOUR-TUNNEL.trycloudflare.com/agent'
+```
 
 For an existing Azure Windows VM, a macOS helper can transfer exactly one MSI
-without adding a public IP or SSH:
+without adding a public IP or SSH. The VM still needs outbound HTTPS egress,
+normally through an Azure NAT Gateway or an existing managed egress path. That
+egress is also required for the installed agent to reach the control-plane WSS
+URL.
 
 ```sh
 ./scripts/mac/transfer-msi-to-azure.sh \
@@ -56,8 +74,19 @@ If the directory contains multiple MSI files, add `--msi FILE_NAME`. The helper
 creates private temporary Azure Blob storage, invokes a hash-verifying download
 through Azure Run Command, places the MSI under
 `C:\ProgramData\AI-Native-RMM\staging`, and deletes the temporary Storage account.
-It transfers but does not install until issue #6's final MSI properties and local
-status command are available.
+After transfer, install it from macOS without RDP or a public IP:
+
+```sh
+./scripts/mac/install-msi-on-azure.sh \
+  --resource-group YOUR_RESOURCE_GROUP \
+  --vm YOUR_VM_NAME \
+  --endpoint wss://YOUR-TUNNEL.trycloudflare.com/agent \
+  --msi SquashEndpointAgent.msi
+```
+
+The Azure command runs the same Windows wrapper through Azure Run Command and
+prints the pairing code. It expects the MSI under the staging directory created
+by the transfer command.
 
 ## 3. Approve the endpoint
 

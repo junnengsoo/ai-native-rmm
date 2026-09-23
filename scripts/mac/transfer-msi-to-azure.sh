@@ -17,7 +17,8 @@ The script creates a private temporary Azure Storage account in the VM's region,
 uses a 20-minute read-only HTTPS SAS to transfer the MSI, verifies SHA-256 on the
 VM, and deletes the temporary storage account afterward. It does not install the
 MSI. Azure CLI must already be signed in with permission to manage the target VM
-and create/delete a Storage account in its resource group.
+and create/delete a Storage account in its resource group. The VM needs outbound
+HTTPS access to Azure Blob storage.
 EOF
 }
 

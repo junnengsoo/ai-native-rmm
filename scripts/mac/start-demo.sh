@@ -106,7 +106,8 @@ printf 'API URL:  %s\n' "$public_url"
 printf 'OpenAPI:  %s/docs\n' "$public_url"
 printf 'Caller configuration: %s\n' "$demo_dir/demo-connection.json"
 if [[ -z $device_id ]]; then
-  printf '\nInstall the bundled MSI on Windows with CONTROL_PLANE_URL=%s\n' "$public_url"
+  endpoint_url=${public_url/http:/ws:}/agent
+  printf '\nInstall the bundled MSI on Windows with RMM_ENDPOINT=%s\n' "$endpoint_url"
   printf 'Then run ./demo.sh approve on this machine.\n'
 else
   printf 'Device ID: %s\n' "$device_id"
