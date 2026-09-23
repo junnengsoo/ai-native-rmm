@@ -394,7 +394,7 @@ async Task RejectIdentity(string thumbprint, string pin) {
     try {
         await Task.Delay(TimeSpan.FromSeconds(5));
         Require(!invalid.HasExited && Volatile.Read(ref acceptedSockets) == acceptedBefore,
-            "wrong client identity/server pin cannot establish a dispatch channel");
+            "wrong endpoint identity/server pin cannot establish a dispatch channel");
     } finally {
         if (!invalid.HasExited) {
             invalid.Kill(true);

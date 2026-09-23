@@ -135,7 +135,7 @@ with .NET SDK 8.0.425 and the previous hosted PowerShell 7.4.13 worker:
   0, no stale LASTEXITCODE, variables/functions/directory persistence, printed
   fake lifecycle kept as data, disclosed capture truncation, explicit exit 23
   and 0, and fresh state after replacement.
-- Authentication, validation, and ledger transport: wrong client key and server
+- Authentication, validation, and ledger transport: wrong endpoint key and server
   pin rejected, nonexportable endpoint key, dummy secret/configuration excluded
   from worker, altered hash, wrong device/session, unknown fields, invalid
   timeout field and malformed JSON rejected, duplicate dispatch did not repeat its

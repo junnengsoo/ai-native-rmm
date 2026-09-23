@@ -242,7 +242,7 @@ def submit(operator, session, script, key):
     )
 
 
-def test_timeout_is_optional_and_offline_submission_fails_to_start():
+def test_timeout_is_optional_and_unreachable_submission_fails_to_start():
     admin = bootstrap_admin()
     operator, _ = create_operator(admin, "deadline-agent")
     key, public, device = enroll(admin)
@@ -262,11 +262,11 @@ def test_timeout_is_optional_and_offline_submission_fails_to_start():
         result = wait_for_execution(operator, submitted.json()["execution_id"])
         assert result["status"] == "completed"
 
-    offline = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
-        **operator, "Idempotency-Key": "offline",
+    unreachable = httpx.post(BASE + f"/sessions/{session['session_id']}/executions", headers={
+        **operator, "Idempotency-Key": "unreachable",
     }, json={"script": "'must-not-run'", "timeout_ms": 5000})
-    assert offline.status_code == 202
-    result = wait_for_execution(operator, offline.json()["execution_id"])
+    assert unreachable.status_code == 202
+    result = wait_for_execution(operator, unreachable.json()["execution_id"])
     assert result["status"] == "failed_to_start"
     assert result["outcome_reason"] == "device_offline_before_dispatch"
     assert result["last_confirmed_status"] == "queued"
@@ -496,7 +496,7 @@ def test_execution_output_preview_pages_and_terminal_wait_are_bounded_and_scoped
         assert wait_for_execution(operator, hanging_id)["status"] == "cancelled"
 
 
-def test_retained_output_search_tail_and_range_work_while_endpoint_offline():
+def test_retained_output_search_tail_and_range_work_while_endpoint_unreachable():
     admin = bootstrap_admin()
     other_admin = bootstrap_admin()
     operator, _ = create_operator(admin, "output-investigator")
@@ -564,11 +564,11 @@ def test_retained_output_search_tail_and_range_work_while_endpoint_offline():
         params={"start_byte": 10, "end_byte": 5},
     ).status_code == 422
 
-    offline_submission = submit(operator, session, "MARK_ONCE", "offline-proof-no-read-dispatch")
-    assert offline_submission.status_code == 202
-    offline_result = wait_for_execution(operator, offline_submission.json()["execution_id"])
-    assert offline_result["status"] == "failed_to_start"
-    assert offline_result["outcome_reason"] == "device_offline_before_dispatch"
+    unreachable_submission = submit(operator, session, "MARK_ONCE", "unreachable-proof-no-read-dispatch")
+    assert unreachable_submission.status_code == 202
+    unreachable_result = wait_for_execution(operator, unreachable_submission.json()["execution_id"])
+    assert unreachable_result["status"] == "failed_to_start"
+    assert unreachable_result["outcome_reason"] == "device_offline_before_dispatch"
 
 
 def test_operator_cannot_admin_and_resources_are_workspace_scoped():

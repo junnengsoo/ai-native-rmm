@@ -55,7 +55,8 @@ directory must be treated as gone.
 
 Execution statuses are `queued`, `running`, `completed`, `failed_to_start`,
 `timed_out`, `cancelled`, and `outcome_unknown`. `failed_to_start` is used for
-known non-execution, including submission while the endpoint is offline.
+known non-execution, including submission while the endpoint has no authenticated
+connection.
 `timed_out` and `cancelled` are used only when the endpoint confirms that the
 worker and owned children stopped. Unknown outcomes retain null values for
 evidence that was not observed and report a reason plus the last confirmed
@@ -166,10 +167,11 @@ same requests with an HTTP client:
    ```
 
    Use the `start_byte` and `end_byte` from the search match for the range
-   request. All three reads must work while the endpoint is offline. Submit a
-   new execution to the same session while offline; the old session should no
-   longer be active, proving retained-output reads did not create or dispatch
-   endpoint work. Also verify a search for absent text returns `matches: []`,
+   request. All three reads must work while device reachability is stale. Submit
+   a new execution to the same session while the endpoint is unreachable; the
+   old session should no longer be active, proving retained-output reads did not
+   create or dispatch endpoint work. Also verify a search for absent text
+   returns `matches: []`,
    unauthorized workspace reads return `404`, an empty query returns `422`, and
    an inverted range returns `422`.
 8. Submit `$global:trialValue = 41`, then `$global:trialValue + 1` under a new
@@ -192,9 +194,10 @@ same requests with an HTTP client:
 12. Repeat with caller cancellation: submit a long-running execution, call
    `POST /executions/EXECUTION_ID/cancel`, and poll until it returns `cancelled`,
    `invocation_outcome: stopped`, and null exit-code fields.
-13. For offline behavior, create a session while the device is online, stop the
-   endpoint agent, then submit an execution to that old session. The request may
-   create a truthful `failed_to_start` execution if no endpoint connection can
+13. For unreachable-device behavior, create a session while the device is
+   reachable, stop the endpoint agent, then submit an execution to that old
+   session. The request may create a truthful `failed_to_start` execution if no
+   endpoint connection can
    accept it; it must not invent output, an exit code, or a replacement dispatch.
 14. For active reconnect reconciliation, create a session and submit a script
    that writes durable marker 1, waits, then writes durable marker 2. Interrupt
@@ -217,7 +220,8 @@ pages, Unicode, empty streams, output imitating control messages, wait timeouts
 that leave execution running, and workspace-scoped denial. The opt-in
 `tests/control_plane/test_windows.py` automates the persistent investigation path
 against the authorized Azure Windows VM. It additionally stops the endpoint,
-observes an offline terminal execution record, waits for staleness, restarts it,
+observes a failed-to-start terminal execution after endpoint disconnection, waits
+for stale reachability, restarts it,
 and verifies the stable device identity.
 
 ## Boundaries
@@ -228,8 +232,19 @@ normal execution results, output-loss markers, and genuinely unknown outcomes
 remain in PostgreSQL. The ledger is intentionally scoped to one generation, one
 active debugging session, and one active execution at a time; it is not a general
 event-sourcing system. The prototype does not include multiple concurrent
-executions, high-availability control-plane routing, offline command queueing,
+executions, high-availability control-plane routing, disconnected command queueing,
 automatic rerun of unknown work, indefinite endpoint retention after
 acknowledgement, full caller revocation, installer/service lifecycle, or
 configurable execution profiles. Nothing in this slice claims that arbitrary
 scripts are sandboxed from the managed Windows host.
+
+## Future improvements
+
+- Compact fully acknowledged ledger segments during a long-lived active session.
+  The current prototype waits for a worker or session to close before those
+  segments become pruneable, so acknowledged bytes can still contribute to the
+  configured endpoint capacity during an unusually long investigation.
+- Persist the ledger generation ID in every record as well as in the transport
+  envelope and acknowledgement checkpoint. The current single-generation design
+  cannot independently identify old segment records if the checkpoint is lost or
+  corrupt and a replacement generation ID is created.
