@@ -81,7 +81,11 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         try {
             await writer.WriteLineAsync(JsonSerializer.Serialize(new { script }).AsMemory(), stopSignal.Token);
             while (true) {
-                string line = await reader.ReadLineAsync(stopSignal.Token) ?? throw new EndOfStreamException();
+                var read = reader.ReadLineAsync();
+                var cancelled = Task.Delay(Timeout.InfiniteTimeSpan, stopSignal.Token);
+                if (await Task.WhenAny(read, cancelled) != read)
+                    throw new OperationCanceledException(stopSignal.Token);
+                string line = await read ?? throw new EndOfStreamException();
                 using var message = JsonDocument.Parse(line);
                 if (message.RootElement.TryGetProperty("kind", out var kind) && kind.GetString() == "output") {
                     var stream = message.RootElement.GetProperty("stream").GetString() == "stdout" ? "stdout" : "stderr";
