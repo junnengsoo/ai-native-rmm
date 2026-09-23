@@ -37,7 +37,9 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase))
             start.ArgumentList.Add(typeof(WorkerProcess).Assembly.Location);
         start.ArgumentList.Add("--worker"); start.ArgumentList.Add(name);
-        var allowed = new[] { "SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT", "ComSpec", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)", "ProgramData" };
+        var allowed = new[] { "SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT", "ComSpec", "SystemDrive",
+            "ProgramFiles", "ProgramFiles(x86)", "ProgramData", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
+            "LOCALAPPDATA", "PSModulePath" };
         var environment = allowed.ToDictionary(key => key, Environment.GetEnvironmentVariable);
         start.Environment.Clear();
         foreach (var (key, value) in environment) if (value is not null) start.Environment[key] = value;
@@ -52,7 +54,7 @@ internal sealed class WorkerProcess : IAsyncDisposable {
         _ = Drain(process.StandardError);
         WorkerProcess? worker = null;
         try {
-            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
             await pipe.WaitForConnectionAsync(deadline.Token);
             worker = new WorkerProcess(pipe, process, job);
             string? ready = await worker.reader.ReadLineAsync(deadline.Token);
