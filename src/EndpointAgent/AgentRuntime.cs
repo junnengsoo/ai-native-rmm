@@ -98,6 +98,7 @@ internal static class AgentRuntime {
         using var stopped = new CancellationTokenSource();
         var transport = new LedgerTransport();
         Task heartbeats = sendHeartbeats ? Heartbeats(socket, transport.SendLock, stopped.Token) : Task.CompletedTask;
+        ledger.DurableRecordsAvailable += transport.Wake;
         Task sender = transport.RunSender(socket, ledger, device, stopped.Token);
         try {
             while (socket.State == WebSocketState.Open) {
@@ -144,6 +145,7 @@ internal static class AgentRuntime {
                 }
             }
         } finally {
+            ledger.DurableRecordsAvailable -= transport.Wake;
             stopped.Cancel();
             try { await heartbeats; }
             catch (Exception error) when (error is OperationCanceledException or WebSocketException) { }
@@ -155,11 +157,6 @@ internal static class AgentRuntime {
     private static async Task HandleMessage(WebSocket socket, LedgerTransport transport, EndpointLedger ledger,
                                             string device, JsonElement message, RuntimeFrame frame,
                                             AgentRuntimeState state) {
-        string observedType = message.TryGetProperty("type", out var observedTypeElement)
-            && observedTypeElement.ValueKind == JsonValueKind.String
-            ? observedTypeElement.GetString() ?? "<null>"
-            : "<missing>";
-        Console.Error.WriteLine($"[DEBUG-close] received={observedType} invocation={frame.Invocation is not null}");
         if (TryApplyAck(ledger, transport, message)) return;
         if (message.TryGetProperty("type", out var typeElement)
             && typeElement.ValueKind == JsonValueKind.String
@@ -168,7 +165,6 @@ internal static class AgentRuntime {
         Dispatch? request;
         try { request = Dispatch.Parse(message, device); }
         catch (JsonException) { request = null; }
-        Console.Error.WriteLine($"[DEBUG-close] parsed={request?.Type ?? "<invalid>"} session_match={request?.SessionId == frame.Session}");
         if (request is null) {
             await Reject(socket, transport.SendLock, device, "invalid_request");
             return;
@@ -196,7 +192,6 @@ internal static class AgentRuntime {
             state.SessionDeadline = null;
             transport.Wake();
         } else if (request.Type == "close_session" && request.SessionId == frame.Session && frame.Invocation is not null) {
-            Console.Error.WriteLine("[DEBUG-close] active_close_received");
             frame.CloseAfterInvocation = true;
             frame.InvocationStopReason = "cancelled";
             frame.InvocationStop?.Cancel();

@@ -55,6 +55,8 @@ internal sealed class EndpointLedger {
     private DateTimeOffset lastOutputFlush = DateTimeOffset.UtcNow;
     private Timer? flushTimer;
 
+    public event Action? DurableRecordsAvailable;
+
     public EndpointLedger(string deviceId) {
         this.deviceId = deviceId;
         string name = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(deviceId))).ToLowerInvariant();
@@ -329,6 +331,7 @@ internal sealed class EndpointLedger {
     }
 
     private void FlushBufferedOutput() {
+        bool advanced = false;
         lock (gate) {
             if (pendingFlushThrough <= durableThrough) return;
             try {
@@ -337,10 +340,12 @@ internal sealed class EndpointLedger {
                 pendingFlushThrough = 0;
                 bufferedOutputBytes = 0;
                 lastOutputFlush = DateTimeOffset.UtcNow;
+                advanced = true;
             } catch (Exception error) when (error is IOException or UnauthorizedAccessException) {
                 ScheduleFlushLocked();
             }
         }
+        if (advanced) DurableRecordsAvailable?.Invoke();
     }
 
     private void FlushDirtySegmentsLocked(string includePath) {

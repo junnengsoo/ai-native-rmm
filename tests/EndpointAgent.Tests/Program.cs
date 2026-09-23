@@ -7,6 +7,7 @@ Environment.SetEnvironmentVariable("RMM_ENDPOINT_DATA_DIR", root);
 try {
     Directory.CreateDirectory(root);
     RetransmitsUnacknowledgedTerminalBatch();
+    await BufferedOutputBecomesSendableWithoutTerminalRecord();
     await PrunesAcknowledgedClosedRecordsFromMemoryAndStartup();
     await ReconnectDoesNotRefreshExistingSessionDeadline();
     await WorkerProcessStartsNativeWorkerOnWindows();
@@ -16,6 +17,28 @@ try {
     try { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
     catch (IOException) { }
     catch (UnauthorizedAccessException) { }
+}
+
+static async Task BufferedOutputBecomesSendableWithoutTerminalRecord() {
+    var ledger = new EndpointLedger("test-device-live-output");
+    string session = Guid.NewGuid().ToString();
+    string execution = Guid.NewGuid().ToString();
+    string scriptHash = new string('b', 64);
+    ledger.SessionStarted(session);
+    Assert(ledger.TryExecutionAccepted(session, execution, scriptHash), "live-output execution accepted");
+    ledger.ExecutionStarted(session, execution, scriptHash);
+    var initial = ledger.PendingBatch();
+    ledger.Acknowledge(ledger.LedgerId, initial[^1].Sequence);
+
+    var flushed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    ledger.DurableRecordsAvailable += () => flushed.TrySetResult();
+    ledger.OutputChunk(session, execution, scriptHash, "stdout", "child-id\n");
+    Assert(ledger.PendingBatch().Count == 0, "small output begins buffered");
+
+    await flushed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+    var available = ledger.PendingBatch();
+    Assert(available.Count == 1 && available[0].RecordType == "output_chunk",
+        "timer-flushed output becomes sendable before execution finishes");
 }
 
 static void RetransmitsUnacknowledgedTerminalBatch() {

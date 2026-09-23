@@ -84,7 +84,6 @@ internal sealed class WorkerProcess : IAsyncDisposable {
                 var read = reader.ReadLineAsync();
                 var cancelled = Task.Delay(Timeout.InfiniteTimeSpan, stopSignal.Token);
                 if (await Task.WhenAny(read, cancelled) != read) {
-                    Console.Error.WriteLine("[DEBUG-close] worker_cancellation_observed");
                     throw new OperationCanceledException(stopSignal.Token);
                 }
                 string line = await read ?? throw new EndOfStreamException();
