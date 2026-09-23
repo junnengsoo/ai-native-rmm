@@ -111,7 +111,11 @@ internal static class AgentRuntime {
                 if (frame.Invocation is not null) {
                     incoming ??= Receive(socket, ReceiveWait(frame));
                     var ready = await Task.WhenAny(incoming, frame.Invocation);
-                    if (ready == frame.Invocation) {
+                    // When the invocation and a newly received command become ready
+                    // together, finalize the invocation first. The receive task stays
+                    // buffered for the next loop iteration, after CurrentExecution is
+                    // cleared and the worker/session transition has completed.
+                    if (frame.Invocation.IsCompleted) {
                         var completed = await frame.Invocation;
                         await FinalizeCompletedInvocation(ledger, completed, frame, state);
                         transport.Wake();

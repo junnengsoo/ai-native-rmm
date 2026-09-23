@@ -140,6 +140,7 @@ try {
         "execution timeout stops the invocation at its requested deadline");
     await Rejected(Request("'must-not-run'"), "timed-out worker is retired");
     await OpenReplacementSession();
+    Console.WriteLine("PASS per-execution timeout scenario");
 
     string reconnectExecution = Guid.NewGuid().ToString();
     string reconnectScript = "$global:lateEvidence=1; Start-Sleep -Seconds 3; $global:lateEvidence=2";
