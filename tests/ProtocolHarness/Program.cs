@@ -147,6 +147,37 @@ try {
     var reconnectState = await ExecuteWithOutput("$global:lateEvidence", 5000);
     Require(reconnectState.Stdout.Trim() == "2", "reconnected invocation ran exactly once to completion");
 
+    string drainExecution = Guid.NewGuid().ToString();
+    var drainDuringReconnect = Request("1..25 | ForEach-Object { \"drain $_\"; Start-Sleep -Milliseconds 40 }; $global:drainComplete=25");
+    drainDuringReconnect["executionId"] = drainExecution;
+    await Send(socket, drainDuringReconnect);
+    await WaitRecord(record => IsRecord(record, "execution_started", drainExecution));
+    int acceptedBeforeDrainReconnect = Volatile.Read(ref acceptedSockets);
+    socket.Abort();
+    socket = await NextSocketAfter(acceptedBeforeDrainReconnect);
+    var drainHello = await Receive(socket);
+    Require(drainHello.GetProperty("type").GetString() == "hello"
+        && drainHello.GetProperty("deviceId").GetString() == device, "agent reconnects while draining output");
+    var drainedOutput = new StringBuilder();
+    while (true) {
+        var record = await WaitRecord(value => {
+            if (!value.TryGetProperty("data", out var data)
+                || !data.TryGetProperty("executionId", out var id)
+                || id.GetString() != drainExecution) return false;
+            string? type = value.GetProperty("recordType").GetString();
+            return type is "output_chunk" or "execution_finished";
+        });
+        if (record.GetProperty("recordType").GetString() == "execution_finished") {
+            Require(record.GetProperty("data").GetProperty("state").GetString() == "completed",
+                "chatty disconnected invocation reaches terminal state");
+            break;
+        }
+        drainedOutput.Append(record.GetProperty("data").GetProperty("text").GetString());
+    }
+    Require(drainedOutput.ToString().Contains("drain 25"), "worker output draining does not wait for socket delivery");
+    var drainState = await ExecuteWithOutput("$global:drainComplete", 5000);
+    Require(drainState.Stdout.Trim() == "25", "chatty disconnected invocation keeps the worker reusable");
+
     string retransmitExecution = Guid.NewGuid().ToString();
     var retransmit = Request("$global:ackDropCounter++; $global:ackDropCounter");
     retransmit["executionId"] = retransmitExecution;
@@ -358,12 +389,18 @@ try {
 await EnrollmentScenario.Run(args[0], serverCert);
 
 async Task RejectIdentity(string thumbprint, string pin) {
+    int acceptedBefore = Volatile.Read(ref acceptedSockets);
     using var invalid = StartAgent(thumbprint, pin);
     try {
-        await invalid.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(20));
-        Require(invalid.ExitCode != 0 && Volatile.Read(ref acceptedSockets) == 0,
+        await Task.Delay(TimeSpan.FromSeconds(5));
+        Require(!invalid.HasExited && Volatile.Read(ref acceptedSockets) == acceptedBefore,
             "wrong client identity/server pin cannot establish a dispatch channel");
-    } finally { if (!invalid.HasExited) invalid.Kill(true); }
+    } finally {
+        if (!invalid.HasExited) {
+            invalid.Kill(true);
+            await invalid.WaitForExitAsync();
+        }
+    }
 }
 
 Process StartAgent(string thumbprint, string? pin = null) => Process.Start(new ProcessStartInfo("dotnet") {

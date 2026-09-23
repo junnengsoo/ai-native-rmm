@@ -22,8 +22,10 @@ internal static class AgentRuntime {
 
     private sealed class LedgerTransport {
         private readonly SemaphoreSlim sendLock = new(1, 1);
+        private readonly SemaphoreSlim wakeups = new(0);
         private readonly object gate = new();
         private long inFlightThrough;
+        private int wakeupQueued;
 
         public SemaphoreSlim SendLock => sendLock;
 
@@ -56,6 +58,27 @@ internal static class AgentRuntime {
             lock (gate) {
                 if (inFlightThrough <= ledger.AcknowledgedThrough) inFlightThrough = 0;
             }
+            Wake();
+        }
+
+        public void Wake() {
+            if (Interlocked.Exchange(ref wakeupQueued, 1) == 0) wakeups.Release();
+        }
+
+        public async Task RunSender(WebSocket socket, EndpointLedger ledger, string device,
+                                    CancellationToken stopped) {
+            Wake();
+            while (true) {
+                await wakeups.WaitAsync(stopped);
+                Interlocked.Exchange(ref wakeupQueued, 0);
+                try {
+                    await SendPending(socket, ledger, device);
+                } catch (Exception error) when (error is WebSocketException or IOException
+                    or OperationCanceledException or ObjectDisposedException) {
+                    socket.Abort();
+                    return;
+                }
+            }
         }
     }
 
@@ -75,10 +98,10 @@ internal static class AgentRuntime {
         using var stopped = new CancellationTokenSource();
         var transport = new LedgerTransport();
         Task heartbeats = sendHeartbeats ? Heartbeats(socket, transport.SendLock, stopped.Token) : Task.CompletedTask;
+        Task sender = transport.RunSender(socket, ledger, device, stopped.Token);
         try {
-            await TrySendPendingLedger(socket, transport, ledger, device);
             while (socket.State == WebSocketState.Open) {
-                await TrySendPendingLedger(socket, transport, ledger, device);
+                transport.Wake();
                 if (SessionExpired(frame)) {
                     await ExpireSession(socket, transport, ledger, device, frame, state);
                     incoming = null;
@@ -90,7 +113,7 @@ internal static class AgentRuntime {
                     if (ready == frame.Invocation) {
                         var completed = await frame.Invocation;
                         await FinalizeCompletedInvocation(ledger, completed, frame, state);
-                        await TrySendPendingLedger(socket, transport, ledger, device);
+                        transport.Wake();
                     } else {
                         try {
                             var message = await incoming;
@@ -124,6 +147,8 @@ internal static class AgentRuntime {
             stopped.Cancel();
             try { await heartbeats; }
             catch (Exception error) when (error is OperationCanceledException or WebSocketException) { }
+            try { await sender; }
+            catch (Exception error) when (error is OperationCanceledException or WebSocketException) { }
         }
     }
 
@@ -153,7 +178,7 @@ internal static class AgentRuntime {
             frame.Session = request.SessionId;
             ledger.SessionStarted(frame.Session);
             RefreshSessionDeadline(frame, state);
-            await TrySendPendingLedger(socket, transport, ledger, device);
+            transport.Wake();
         } else if (request.Type == "close_session" && request.SessionId == frame.Session && frame.Invocation is null) {
             bool cleaned = await Cleanup(frame.Worker);
             if (cleaned) ledger.SessionClosed(request.SessionId);
@@ -163,7 +188,7 @@ internal static class AgentRuntime {
             frame.Session = null;
             frame.SessionDeadline = null;
             state.SessionDeadline = null;
-            await TrySendPendingLedger(socket, transport, ledger, device);
+            transport.Wake();
         } else if (request.Type == "close_session" && request.SessionId == frame.Session && frame.Invocation is not null) {
             frame.CloseAfterInvocation = true;
             frame.InvocationStopReason = "cancelled";
@@ -187,11 +212,11 @@ internal static class AgentRuntime {
             frame.Invocation = CompleteAndLedger(socket, transport, ledger, device, frame.Worker, frame.Session!, execution,
                 scriptHash, request.Script!, frame.InvocationStop.Token, () => CancellationState(frame));
             state.Invocation = frame.Invocation;
-            await TrySendPendingLedger(socket, transport, ledger, device);
+            transport.Wake();
         } else if (request.Type == "cancel_execution" && request.SessionId == frame.Session
                    && request.ExecutionId == frame.CurrentExecution && frame.CurrentScriptHash is not null) {
             ledger.CancellationRequested(request.SessionId, request.ExecutionId!, frame.CurrentScriptHash);
-            await TrySendPendingLedger(socket, transport, ledger, device);
+            transport.Wake();
             frame.InvocationStopReason = "cancelled";
             frame.InvocationStop?.Cancel();
         } else {
@@ -204,10 +229,11 @@ internal static class AgentRuntime {
         string session, string execution, string scriptSha256, string script, CancellationToken cancellation,
         Func<string> cancellationState) {
         ledger.ExecutionStarted(session, execution, scriptSha256);
-        await TrySendPendingLedger(socket, transport, ledger, device);
-        var result = await worker.Execute(script, async (stream, text) => {
+        transport.Wake();
+        var result = await worker.Execute(script, (stream, text) => {
             ledger.OutputChunk(session, execution, scriptSha256, stream, text);
-            await TrySendPendingLedger(socket, transport, ledger, device);
+            transport.Wake();
+            return Task.CompletedTask;
         }, cancellation, cancellationState);
         if (result.State == "outcome_unknown")
             ledger.WorkerStopped(session, execution, scriptSha256, "worker_result_unknown",
@@ -218,6 +244,7 @@ internal static class AgentRuntime {
                 ledger.WorkerStopped(session, execution, scriptSha256, WorkerStopReason(result),
                     result.CleanupConfirmed is true, result.CaptureTruncated);
         }
+        transport.Wake();
         return (session, execution, scriptSha256, result);
     }
 
@@ -231,12 +258,6 @@ internal static class AgentRuntime {
         ledger.Acknowledge(ledgerId, ack.GetInt64());
         transport.ObserveAck(ledger);
         return true;
-    }
-
-    private static async Task TrySendPendingLedger(WebSocket socket, LedgerTransport transport,
-                                                   EndpointLedger ledger, string device) {
-        try { await transport.SendPending(socket, ledger, device); }
-        catch (Exception error) when (error is WebSocketException or OperationCanceledException or ObjectDisposedException) { }
     }
 
     private static async Task<bool> Cleanup(WorkerProcess? worker) {
@@ -317,7 +338,7 @@ internal static class AgentRuntime {
             state.SessionDeadline = null;
             frame.CloseAfterInvocation = false;
         }
-        await TrySendPendingLedger(socket, transport, ledger, device);
+        transport.Wake();
     }
 
     private static void EnsureSessionDeadline(RuntimeFrame frame, AgentRuntimeState state) {

@@ -124,11 +124,13 @@ internal static class EnrollmentScenario {
                             }
                             Require(type == "ledger_batch", "expected enrolled ledger batch");
                             await AckLedgerBatch(socket, message);
+                            JsonElement? matched = null;
                             foreach (var record in message.GetProperty("records").EnumerateArray()) {
                                 JsonElement clone = record.Clone();
-                                if (predicate(clone)) return clone;
-                                queuedRecords.Enqueue(clone);
+                                if (matched is null && predicate(clone)) matched = clone;
+                                else queuedRecords.Enqueue(clone);
                             }
+                            if (matched is not null) return matched.Value;
                         }
                     }
 
