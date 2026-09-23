@@ -208,9 +208,9 @@ internal static class AgentRuntime {
             frame.CurrentExecution = execution;
             frame.CurrentScriptHash = scriptHash;
             frame.CloseAfterInvocation = false;
-            frame.InvocationStopReason = "cancelled";
+            frame.InvocationStopReason = "timed_out";
             RefreshSessionDeadline(frame, state);
-            ArmInvocationDeadline(frame);
+            ArmInvocationDeadline(frame, request.TimeoutMs);
             frame.Invocation = CompleteAndLedger(socket, transport, ledger, device, frame.Worker, frame.Session!, execution,
                 scriptHash, request.Script!, frame.InvocationStop.Token, () => CancellationState(frame));
             state.Invocation = frame.Invocation;
@@ -357,9 +357,11 @@ internal static class AgentRuntime {
         state.SessionDeadline = frame.SessionDeadline;
     }
 
-    private static void ArmInvocationDeadline(RuntimeFrame frame) {
+    private static void ArmInvocationDeadline(RuntimeFrame frame, int timeoutMs) {
         if (frame.InvocationStop is null || frame.SessionDeadline is not { } deadline) return;
-        var remaining = deadline - DateTimeOffset.UtcNow;
+        var remaining = TimeSpan.FromMilliseconds(timeoutMs);
+        var sessionRemaining = deadline - DateTimeOffset.UtcNow;
+        if (sessionRemaining < remaining) remaining = sessionRemaining;
         if (remaining <= TimeSpan.Zero) frame.InvocationStop.Cancel();
         else frame.InvocationStop.CancelAfter(remaining);
     }

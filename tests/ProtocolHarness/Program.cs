@@ -129,6 +129,18 @@ try {
     Require((await ExecuteWithOutput("$global:duplicateCounter", 5000)).Stdout.Trim() == "1",
         "rejected duplicate does not repeat its side effect");
 
+    var timeoutWatch = Stopwatch.StartNew();
+    var timedOut = await ExecuteWithOutput("'started'; Start-Sleep -Seconds 10; 'finished'", 500);
+    timeoutWatch.Stop();
+    Require(timedOut.Result.GetProperty("state").GetString() == "timed_out"
+        && timedOut.Result.GetProperty("invocationOutcome").GetString() == "stopped"
+        && timedOut.Result.GetProperty("exitCode").ValueKind == JsonValueKind.Null
+        && timedOut.Stdout.Contains("started") && !timedOut.Stdout.Contains("finished")
+        && timeoutWatch.Elapsed < TimeSpan.FromSeconds(5),
+        "execution timeout stops the invocation at its requested deadline");
+    await Rejected(Request("'must-not-run'"), "timed-out worker is retired");
+    await OpenReplacementSession();
+
     string reconnectExecution = Guid.NewGuid().ToString();
     string reconnectScript = "$global:lateEvidence=1; Start-Sleep -Seconds 3; $global:lateEvidence=2";
     var reconnect = Request(reconnectScript);
